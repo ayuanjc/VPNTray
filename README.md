@@ -66,7 +66,29 @@ Windows 托盘工具：内嵌 [mihomo](https://github.com/MetaCubeX/mihomo) 内�
 
 检测过程中按钮会转圈并禁用，地图下方显示 `纯净度检测 37/74 · 50%` 的进度条。
 
-**纯净度 0–100 怎么算的**（数据来自 `ipapi.is`，失败时回退 `ip-api.com`）：
+**纯净度 0–100 怎么算的**
+
+分两步：先拿到出口 IP 画像，再折算成分数。
+
+1. **画像来源**：优先走 [One-IP](https://github.com/zhihui-hu/one-ip)（数据源 `ip.net.coffee`）。
+   它给的是**综合信任分 + 判定标记**，比自己拿几个标志位扣分准得多。它挂了才回退
+   `ipapi.is`，再不行回退 `ip-api.com`。当前用的哪一家会显示在分数后面，
+   比如 `纯净度 62（One-IP）· 一般`。
+2. **折算**：One-IP 给 `trust_score` 就直接当分数用，只在发现**落地国家 ≠ 节点标称**时
+   再按本条扣分（这是 One-IP 看不到、但实际最影响使用的一点）。回退到 ipapi.is / ip-api
+   时用下面的老算法。
+
+从 One-IP 额外拿到了这些原本没有的信息，会显示在标签里：
+
+| 字段 | 用途 |
+|---|---|
+| `trust_score` | 0–100 综合信任分，直接当纯净度 |
+| `is_residential` / `company_type` | 判断住宅还是机房，比只看 `is_datacenter` 细 |
+| `is_datacenter` / `is_vpn` / `is_proxy` / `is_tor` / `is_abuser` | 五类风险标记，命中就进标签 |
+| `ai_verdict` | 该 IP 访问 AI 服务（ChatGPT/Claude 等）会被怎么对待 |
+| `reddit_blocked` | 是否已被 Reddit 拉黑（风控严的站点会参考） |
+
+回退到 ipapi.is / ip-api 时的老算法：
 
 ```
 起评 100 分

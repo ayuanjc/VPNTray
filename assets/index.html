@@ -777,7 +777,7 @@
 const $ = s => document.querySelector(s);
 let STATE = null;
 // 页面自带的版本号；后端 build_state 也会返回 ui，两边不一致就强制刷新一次
-const UI_VER = '1.8.1';
+const UI_VER = '1.9.0';
 // 额度长条用的绿色梯度：第一条最亮，往后越来越深
 const GREEN_SHADES = ['#4ade80', '#37c96e', '#2aa95a', '#218a49', '#196c39', '#12522b', '#0c3b1f', '#082b16'];
 document.getElementById('uiVer').textContent = 'v' + UI_VER;
@@ -946,7 +946,11 @@ function render(){
     const bits = [`${curNode.flag} ${curNode.region}`, curNode.type || 'proxy', delayText(curNode.delay)];
     if (curNode.mbps) bits.push(curNode.mbps + ' Mbps');
     if (curNode.purity !== null && curNode.purity !== undefined) {
-      bits.push(`纯净度 ${curNode.purity} · ${curNode.purity_grade || ''}`);
+      // 分数后面带一句来源，免得用户以为这是哪个官方口径
+      const srcTag = curNode.purity_src === 'one-ip' ? '（One-IP）'
+        : curNode.purity_src === 'ipapi.is' ? '（ipapi.is）'
+        : curNode.purity_src === 'ip-api' ? '（ip-api）' : '';
+      bits.push(`纯净度 ${curNode.purity}${srcTag} · ${curNode.purity_grade || ''}`);
     }
     if (curNode.city) bits.push(cityZh(curNode.city));
     if (curNode.purity_ip) bits.push(curNode.purity_ip);
@@ -1840,11 +1844,15 @@ function renderAI(){
 }
 
 /* 节点行里那些「检测完之后才会变」的小字段，两处渲染共用 */
+function puritySrcName(src){
+  return src === 'one-ip' ? 'One-IP' : src === 'ipapi.is' ? 'ipapi.is' : src === 'ip-api' ? 'ip-api' : '';
+}
 function nodeTip(n){
   const tags = (n.purity_tags || []).join(' · ');
+  const src = puritySrcName(n.purity_src);
   return n.purity === null || n.purity === undefined
     ? '未检测纯净度'
-    : `${n.purity_grade || ''}${tags ? ' · ' + tags : ''}${n.purity_ip ? ' · ' + n.purity_ip : ''}`;
+    : `${n.purity_grade || ''}${src ? ' · 来源 ' + src : ''}${tags ? ' · ' + tags : ''}${n.purity_ip ? ' · ' + n.purity_ip : ''}`;
 }
 function nodeLocHtml(n){
   if (!(n.city || n.purity_ip)) return '';

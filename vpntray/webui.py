@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.8.1"
+UI_VER = "1.9.0"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -153,6 +153,10 @@ def build_state(app) -> dict[str, Any]:
             "purity_color": pu.get("color"),
             "purity_tags": pu.get("tags") or [],
             "purity_ip": pu.get("ip"),
+            # 纯净度是谁给的：one-ip / ipapi.is / ip-api。
+            # 前端据此在分数后面标来源，用户能一眼看出这个数是第三方评分还是本地自算的。
+            "purity_src": pu.get("src") or "",
+            "purity_trust": pu.get("trust"),
             "lat": pu.get("lat"),
             "lon": pu.get("lon"),
             "city": pu.get("city"),

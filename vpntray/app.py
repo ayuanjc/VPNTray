@@ -859,22 +859,31 @@ class App:
             pool = sorted(alive, key=lambda n: delays[n]) if alive else pool
         return pool[:limit] if limit and limit > 0 else pool
 
-    def _wait_idle(self, timeout: float = 25.0) -> bool:
+    def _wait_idle(self, self_task: str = "", timeout: float = 25.0) -> bool:
         """等检测类长任务（纯净度/测速）结束。
 
         判据必须是真实旗标，不能是 state["busy"]：那只是一句给人看的文案，
         任何任务收尾都会把它清空 —— 包括不是自己的。两个任务同时拿它当锁，
         就会双双判「现在没人占」然后一起切节点，测出来的出口 IP 记到错节点上。
+
+        self_task 传自己的名字。调用方在进来之前已经把自己那个旗标置 True 了，
+        不排掉就会自己等自己，一路等到超时，任务永远发不出去。
         """
+        running = {"purity": self._purity_running, "speed": self._speed_running}
+        running.pop(self_task, None)
         end = time.time() + timeout
         while time.time() < end:
             if self._stop.is_set():
                 return False
-            if not (self._purity_running or self._speed_running):
+            if not any(running.values()):
                 return True
+            # 期间别的任务可能刚好收尾，重新读一次，别拿进函数时的旧值死等
+            running["purity"] = self._purity_running
+            running["speed"] = self._speed_running
+            running.pop(self_task, None)
             time.sleep(0.4)
-        log.warning("等待空闲超时（纯净度=%s 测速=%s）",
-                    self._purity_running, self._speed_running)
+        log.warning("等待空闲超时（纯净度=%s 测速=%s 自己=%s）",
+                    self._purity_running, self._speed_running, self_task or "-")
         return False
 
     def check_purity(self, names: list[str] | None = None, limit: int = 0,
@@ -897,7 +906,7 @@ class App:
             self.notify("没有可检测的节点")
             return 0
 
-        if not self._wait_idle():
+        if not self._wait_idle("purity"):
             self._purity_running = False
             self.notify("当前有任务在运行，稍后再试")
             return 0
@@ -978,7 +987,7 @@ class App:
             self.notify("没有可测速的节点")
             return 0
 
-        if not self._wait_idle():
+        if not self._wait_idle("speed"):
             self._speed_running = False
             self.notify("当前有任务在运行，稍后再试")
             return 0
