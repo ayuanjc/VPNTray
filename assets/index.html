@@ -1,0 +1,2627 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>VPN Tray 控制台</title>
+<script src="/world_map.js"></script>
+<script src="/local_map.js"></script>
+<style>
+  :root{
+    --bg:#0a0e15; --bg2:#0e141d; --card:#121a26; --card2:#161f2d;
+    --line:#1f2a3a; --txt:#e6edf6; --dim:#7f8ea6; --dim2:#55627a;
+    --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --acc:#3b82f6; --purple:#8b5cf6;
+    --r:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:
+      radial-gradient(1100px 500px at 8% -10%, #10243d 0%, transparent 60%),
+      radial-gradient(900px 420px at 100% 0%, #16223a 0%, transparent 55%),
+      var(--bg);
+    color:var(--txt);
+    font:14px/1.5 -apple-system,"Segoe UI Variable","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:22px 20px 60px}
+
+  /* —— 底部使用须知 —— */
+  .legal{max-width:1180px;margin:0 auto;padding:0 20px 46px}
+  .legal-in{border-top:1px solid var(--line);padding-top:16px;
+    font-size:12.5px;line-height:1.9;color:var(--dim)}
+  .legal-in .t{color:var(--txt);font-size:12px;font-weight:700;letter-spacing:.4px;margin-bottom:8px}
+  .legal-in p{margin:5px 0 0}
+  .legal-in em{color:var(--txt);font-style:normal}
+  .legal-in .dim{color:var(--dim2)}
+
+  /* ── 顶栏 ── */
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+  .logo{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;
+    background:linear-gradient(160deg,#1c8a4e,#22c55e);box-shadow:0 6px 20px -8px #22c55e88;font-weight:800;font-size:19px;color:#04170c}
+  h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
+  .sub{color:var(--dim);font-size:12px;margin-top:1px;font-variant-numeric:tabular-nums}
+  /* 左上角订阅概况：名字 + 剩余流量 + 到期 */
+  .subline{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-left:6px;
+    padding:6px 12px;border-radius:11px;background:var(--card);border:1px solid var(--line);font-size:12px}
+  .subline .sb-name{color:#9fb3cc;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .subline .sb-traffic{font-weight:650;font-variant-numeric:tabular-nums;color:#86efac}
+  .subline .sb-traffic.warn{color:var(--warn)}
+  .subline .sb-traffic.bad{color:var(--bad)}
+  .subline .sb-expire{color:var(--dim2);font-variant-numeric:tabular-nums}
+  .subline .sb-expire.warn{color:var(--warn)}
+  /* 额度长条：合并模式下是「按余额切段」的堆叠条，单订阅就是一条进度条 */
+  .sb-bar{display:flex;width:132px;height:9px;border-radius:999px;overflow:hidden;
+    background:#0b131c;border:1px solid #1b2735;flex:none}
+  .sb-bar i{display:block;height:100%;min-width:2px;transition:flex-grow .3s}
+  .sb-bar i + i{box-shadow:inset 1px 0 0 #0b131c}
+  /* 界面版本号：页面和内核不一致时自动刷一次，避免看到旧前端 */
+  h1 .ver{font-size:10.5px;font-weight:500;color:var(--dim2);margin-left:4px;
+    letter-spacing:0;text-transform:none;font-variant-numeric:tabular-nums}
+  .pill{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;
+    background:var(--card);border:1px solid var(--line);font-size:12.5px;font-weight:600}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--dim2);flex:none}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 4px #22c55e22}
+  .dot.busy{background:var(--warn);box-shadow:0 0 0 4px #f59e0b22;animation:pulse 1.2s infinite}
+  .dot.err{background:var(--bad);box-shadow:0 0 0 4px #ef444422}
+  @keyframes pulse{50%{opacity:.35}}
+  .spacer{flex:1}
+
+  /* ── 布局 ── */
+  .grid{display:grid;grid-template-columns:380px minmax(0,1fr);gap:16px;align-items:start}
+  @media (max-width:1160px){.grid{grid-template-columns:1fr}}
+
+  .card{background:linear-gradient(180deg,var(--card),var(--bg2));border:1px solid var(--line);
+    border-radius:var(--r);padding:16px}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);
+    margin:0 0 12px;font-weight:700;display:flex;align-items:center;gap:6px}
+
+  /* ── 当前节点卡 ── */
+  .now{position:relative;overflow:hidden}
+  .now::after{content:"";position:absolute;inset:0;background:radial-gradient(400px 120px at 100% 0%,#22c55e14,transparent 70%);pointer-events:none}
+  .now-name{font-size:16px;font-weight:700;word-break:break-all;line-height:1.35}
+  .now-meta{color:var(--dim);font-size:12px;margin-top:5px;font-variant-numeric:tabular-nums}
+  /* AI 专用通道单独一行，和主节点不同时显示，避免「我切了怎么上面没变」 */
+  .now-ai{margin-top:7px;padding:6px 9px;border-radius:8px;background:#121b26;border:1px solid #1d2937;
+    font-size:11.5px;color:#9fb3cc;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .now-ai b{color:#7dd3fc;font-weight:600}
+  .now-ai .tag{font-size:10px;padding:1px 6px;border-radius:999px;background:#0d2b3a;color:#7dd3fc;flex:none}
+  .stat-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}
+  .stat{background:#0b121b;border:1px solid var(--line);border-radius:10px;padding:9px 11px}
+  .stat b{display:block;font-size:15px;font-variant-numeric:tabular-nums;font-weight:700}
+  .stat span{color:var(--dim);font-size:11px}
+
+  /* ── 流量图 ── */
+  .chart-wrap{margin-top:14px;position:relative}
+  canvas{width:100%;height:78px;display:block;border-radius:10px;background:#0b121b;border:1px solid var(--line)}
+  .legend{display:flex;gap:14px;margin-top:8px;font-size:11.5px;color:var(--dim)}
+  .legend i{display:inline-block;width:18px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
+
+  /* ── 开关 ── */
+  .row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px dashed #1b2533}
+  .row:last-child{border-bottom:0}
+  .row .lbl{font-size:13px}
+  .row .hint{color:var(--dim2);font-size:11px;margin-top:2px}
+  .switch{position:relative;width:44px;height:25px;border-radius:999px;background:#22303f;
+    border:1px solid var(--line);cursor:pointer;flex:none;transition:.18s}
+  .switch::after{content:"";position:absolute;top:2.5px;left:3px;width:17px;height:17px;border-radius:50%;
+    background:#8b9bb4;transition:.18s}
+  .switch.on{background:#14532d;border-color:#1d7a44}
+  .switch.on::after{left:22px;background:var(--ok)}
+  .switch.dis{opacity:.45;pointer-events:none}
+
+  /* ── 分段控件 ── */
+  .seg{display:flex;background:#0b121b;border:1px solid var(--line);border-radius:10px;padding:3px;gap:3px}
+  .seg button{flex:1;border:0;background:transparent;color:var(--dim);padding:7px 4px;border-radius:8px;
+    font-size:12.5px;font-weight:600;cursor:pointer;transition:.15s;font-family:inherit}
+  .seg button:hover{color:var(--txt)}
+  .seg button.act{background:#1d2b3d;color:#fff;box-shadow:0 1px 0 #ffffff0d inset}
+
+  /* ── 工具栏 ── */
+  .toolbar{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  input[type=search]{flex:1;min-width:150px;background:#0b121b;border:1px solid var(--line);
+    color:var(--txt);border-radius:10px;padding:9px 12px;font-size:13px;font-family:inherit;outline:none}
+  input[type=search]:focus{border-color:#31517a;box-shadow:0 0 0 3px #3b82f61f}
+  .sel{background:#0b121b;border:1px solid var(--line);color:var(--txt);border-radius:10px;
+    padding:9px 10px;font-size:12.5px;font-family:inherit;outline:none;cursor:pointer}
+  .sel:hover{border-color:#2f4258}
+  .btn{background:#182231;border:1px solid var(--line);color:var(--txt);border-radius:10px;
+    padding:9px 13px;font-size:12.5px;font-weight:600;cursor:pointer;transition:.15s;font-family:inherit;white-space:nowrap}
+  .btn:hover{background:#1f2c3e}
+  .btn:hover{border-color:#2f4258}
+  .btn.primary{background:linear-gradient(180deg,#1f8a4c,#17703d);border-color:#1d7a44;color:#eafff3}
+  .btn.primary:hover{filter:brightness(1.08)}
+  .btn.danger:hover{background:#3a1618;border-color:#7f2d31;color:#ffb4b4}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+
+  /* ── 节点列表 ── */
+  .nodes{max-height:60vh;overflow:auto;padding-right:4px}
+  .nodes::-webkit-scrollbar{width:9px}
+  .nodes::-webkit-scrollbar-thumb{background:#22303f;border-radius:9px;border:2px solid transparent;background-clip:content-box}
+  .region{margin-bottom:6px}
+  .region-head{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:10px;cursor:pointer;
+    user-select:none;transition:.12s}
+  .region-head:hover{background:#141d29}
+  .region-head .fl{font-size:15px}
+  .region-head .nm{font-weight:700;font-size:13px}
+  .region-head .cnt{color:var(--dim2);font-size:11.5px}
+  .region-head .best{margin-left:auto;font-size:11.5px;font-variant-numeric:tabular-nums}
+  .chev{color:var(--dim2);transition:.18s;font-size:11px}
+  .region.collapsed .chev{transform:rotate(-90deg)}
+  .region.collapsed .node-list{display:none}
+  .node-list{display:flex;flex-direction:column;gap:4px;padding:2px 0 6px 4px}
+
+  .node{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:10px;cursor:pointer;
+    border:1px solid transparent;transition:.12s;background:#0d141d}
+  .node:hover{background:#141e2b;border-color:#22303f}
+  .node.cur{background:linear-gradient(90deg,#0f2b1c,#0d1a24);border-color:#1d7a4466;
+    box-shadow:inset 3px 0 0 var(--ok)}
+  .node .nm{flex:1;font-size:12.8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    min-width:0}
+  .node .loc{flex:0 0 auto;max-width:34%;display:flex;flex-direction:column;align-items:flex-end;
+    gap:1px;line-height:1.25;overflow:hidden}
+  .node .loc .ct{font-size:10.5px;color:#8fa3bd;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;max-width:100%}
+  .node .loc .ip{font-size:10px;color:#5a6a80;font-variant-numeric:tabular-nums;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+  .node.cur .loc .ct{color:#a7f3c0}
+  .node.cur .loc .ip{color:#6ba883}
+  .node .idx{width:19px;height:19px;border-radius:5px;background:#182231;border:1px solid #253248;
+    color:#8fa3bd;font-size:10.5px;font-weight:600;display:none;align-items:center;
+    justify-content:center;flex:0 0 auto;margin-right:1px;font-variant-numeric:tabular-nums}
+  .node .idx.on{display:inline-flex}
+  .node.cur .idx{background:#14532d;border-color:#22c55e;color:#bbf7d0}
+  .node.cur .nm{font-weight:700}
+  .node .ty{color:var(--dim2);font-size:10.5px;text-transform:uppercase;letter-spacing:.4px}
+  .badge{font-variant-numeric:tabular-nums;font-size:11.5px;font-weight:700;padding:3px 8px;
+    border-radius:7px;min-width:52px;text-align:right;flex:none}
+  .b-ok{background:#0f2b1c;color:#4ade80}
+  .b-mid{background:#2a2413;color:#fbbf24}
+  .b-slow{background:#2c1c10;color:#fb923c}
+  .b-dead{background:#25161a;color:#f87171}
+  .b-none{background:#151d28;color:#5a6a80}
+  .purity{font-variant-numeric:tabular-nums;font-size:11px;font-weight:700;padding:3px 7px;
+    border-radius:7px;min-width:46px;text-align:center;flex:none}
+  .p-ok{background:#0f2b1c;color:#4ade80}
+  .p-good{background:#16301f;color:#86efac}
+  .p-mid{background:#2a2413;color:#fbbf24}
+  .p-bad{background:#2c1517;color:#f87171}
+  .p-none{background:#131b25;color:#45526580}
+  .mbps{font-size:11px;color:#7dd3fc;font-variant-numeric:tabular-nums;min-width:48px;
+    text-align:right;flex:none}
+  .cur-tag{font-size:10px;background:#14532d;color:#86efac;padding:2px 6px;border-radius:5px;font-weight:700;flex:none}
+
+  /* ── 底部 ── */
+  .foot{margin-top:14px;display:flex;gap:9px;flex-wrap:wrap}
+  .sub-edit{display:flex;gap:8px;margin-bottom:10px}
+  /* 订阅列表：一行一条，剩余流量用颜色区分多寡 */
+  .sub-list{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}
+
+  /* ── 关于 / 自动更新 ── */
+  .upd-row{display:flex;align-items:center;gap:10px}
+  .upd-l{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+  .upd-l b{font-size:12.5px;font-weight:600;color:var(--txt)}
+  .upd-l span{font-size:10.5px;color:var(--dim2);line-height:1.5;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .upd-box{margin-top:12px;border-top:1px solid var(--line);padding-top:12px}
+  .upd-head{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
+  .upd-head b{font-size:13px;color:var(--txt)}
+  .upd-date{font-size:10.5px;color:var(--dim2)}
+  .upd-notes{max-height:190px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+    font-size:11.5px;line-height:1.75;color:var(--dim);margin:0;
+    background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:10px 12px;
+    font-family:ui-monospace,Consolas,"Microsoft YaHei",monospace}
+  .upd-bar{height:4px;border-radius:2px;background:var(--line);overflow:hidden;margin-top:11px}
+  .upd-fill{height:100%;width:0;background:var(--acc);border-radius:2px;
+    transition:width .35s ease}
+  .upd-fill.bad{background:var(--bad)}
+  .upd-fill.ok{background:var(--ok)}
+  .sub-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:10px;
+    background:#101823;border:1px solid #1c2735;font-size:12px;transition:.15s}
+  .sub-item:hover{border-color:#2a3a4e}
+  .sub-item.on{background:#0f2a1c;border-color:#1f6b45}
+  .sub-item.dead{opacity:.55}
+  .sub-item .nm{color:#c7d6e8;font-weight:600;max-width:96px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;flex:none}
+  .sub-item .tf{font-variant-numeric:tabular-nums;font-weight:650;color:#86efac;flex:none}
+  .sub-item .tf.warn{color:var(--warn)}
+  .sub-item .tf.bad{color:var(--bad)}
+  .sub-item .ex{color:var(--dim2);font-variant-numeric:tabular-nums;flex:none}
+  .sub-item .ex.warn{color:var(--warn)}
+  .sub-item .nc{margin-left:auto;color:var(--dim2);flex:none}
+  .sub-item .op{flex:none;display:flex;gap:4px}
+  .sub-item .op button{font-size:11px;padding:2px 7px;border-radius:6px;border:1px solid #24303f;
+    background:#131c28;color:#9fb3cc;cursor:pointer}
+  .sub-item .op button:hover{background:#1b2634;color:#e6eefb}
+  .sub-item .op button.del:hover{background:#3a1618;border-color:#5c2222;color:#fca5a5}
+  .h2r{font-size:11.5px;font-weight:500;color:var(--dim2);margin-left:auto}
+  .sub-tip{font-size:11px;color:var(--dim2);line-height:1.5;padding:2px 2px 0}
+  /* 合并模式开关（做成小按钮，点一下切） */
+  .btn.tiny{font-size:10.5px;padding:2px 8px;border-radius:6px;letter-spacing:.3px;
+    text-transform:none;font-weight:600;flex:none}
+  .btn.tiny.on{background:#0f3a24;border-color:#1f6b45;color:#6ee7a8}
+  .sub-item .ex.bad{color:var(--bad)}
+  /* 每条订阅自己的额度长条 */
+  .sub-item .sbar{width:40px;height:6px;border-radius:999px;background:#0b131c;overflow:hidden;
+    flex:none;border:1px solid #1b2735}
+  .sub-item .sbar i{display:block;height:100%;transition:width .3s}
+  .sub-edit input{flex:1;min-width:0;background:#0b121b;border:1px solid var(--line);
+    color:var(--txt);border-radius:10px;padding:9px 12px;font-size:12.5px;font-family:inherit;outline:none}
+  .sub-edit input:focus{border-color:#31517a;box-shadow:0 0 0 3px #3b82f61f}
+  .sub-edit input::placeholder{color:#4d5b70}
+  .card.urgent{border-color:#7f2d31;box-shadow:0 0 0 3px #ef44441a}
+
+  /* ── 世界地图（矢量 SVG，可缩放拖拽） ── */
+  .map-card h2{display:flex;align-items:center;gap:6px;margin-bottom:10px}
+  .seg.mini{padding:2px;gap:2px;margin-left:auto}
+  .seg.mini button{padding:4px 9px;font-size:11.5px;border-radius:6px}
+  .map-refresh{width:28px;height:26px;border-radius:8px;border:1px solid #2c4257;background:#101a25;
+    color:#b9cbe0;cursor:pointer;font-size:15px;display:grid;place-items:center;
+    transition:.15s;font-family:inherit;line-height:1;flex:none}
+  .map-refresh:hover{background:#1b2c3f;color:#fff;border-color:#4a7096}
+  .map-refresh:disabled{opacity:.55;cursor:not-allowed}
+  .map-refresh.busy{color:#fbbf24;border-color:#7c6a2f;animation:spin 1.1s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .map-prog{display:none;align-items:center;gap:10px;margin-top:10px}
+  .map-prog.on{display:flex}
+  .map-prog .bar{flex:1;height:6px;border-radius:3px;background:#16202c;overflow:hidden;position:relative}
+  .map-prog .bar i{display:block;height:100%;width:0;border-radius:3px;
+    background:linear-gradient(90deg,#22c55e,#3b82f6);transition:width .35s ease}
+  .map-prog .bar.indet i{width:35%;animation:slide 1.15s linear infinite}
+  .map-prog span{font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums;
+    min-width:112px;text-align:right;flex:none}
+  .map-wrap{position:relative;width:100%;max-width:980px;margin:0 auto;aspect-ratio:1012/588;
+    user-select:none;overflow:hidden;border-radius:11px;border:1px solid var(--line);
+    background:radial-gradient(120% 100% at 50% 0%, #0d1620 0%, #070b11 70%);
+    cursor:grab;touch-action:none}
+  .map-wrap.dragging{cursor:grabbing}
+  #localMap{position:absolute;inset:0;width:100%;height:100%}
+  .lregion{fill:#18293a;stroke:#3b5470;stroke-width:.9;transition:.15s}
+  .lregion:hover{fill:#21384e;stroke:#5b7d9e}
+  .local-back{position:absolute;left:10px;top:10px;z-index:6;padding:5px 11px;border-radius:8px;
+    background:#0f1a26cc;border:1px solid #2a3b50;color:#c8d6e6;font-size:12px;cursor:pointer;
+    backdrop-filter:blur(6px)}
+  .local-back:hover{background:#16273a;border-color:#3d5670;color:#e6edf6}
+  #map{width:100%;height:100%;display:block}
+  .map-region{fill:#131c27;stroke:#0a1219;stroke-width:.7;stroke-linejoin:round;transition:fill .2s}
+  .map-region.has{cursor:pointer;stroke:#0d1a24}  .map-region.has:hover{filter:brightness(1.55)}
+  .map-region.cur{stroke:#4ade80;stroke-width:2}
+  .map-region.sel{stroke:#22c55e;stroke-width:2.4;filter:brightness(1.4)}
+  .pins{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+  .pin{position:absolute;transform:translate(-50%,-50%);height:21px;min-width:21px;
+    padding:0 5px;border-radius:11px;background:#101a25;border:1.5px solid #365b7a;
+    color:#dbeafe;font-size:10.5px;font-weight:700;display:flex;align-items:center;
+    justify-content:center;cursor:pointer;pointer-events:auto;transition:border-color .14s,background .14s;
+    line-height:1;font-variant-numeric:tabular-nums;box-shadow:0 2px 8px #000a;z-index:2}
+  .pin:hover{border-color:#7cb4e8;background:#17293b;scale:1.14;z-index:6}
+  .pin.multi{border-color:#7c6a2f;color:#fde68a;background:#1e1a0e}
+  .pin.multi:hover{border-color:#d4b44a;background:#2a2410}
+  .pin.sel{background:#14532d;border-color:#22c55e;color:#bbf7d0;box-shadow:0 0 0 3px #22c55e30}
+  .pin.cur{border-color:#4ade80;box-shadow:0 0 0 2px #4ade8040}
+  /* 选中某国后展开的「逐节点编号」小标签 */
+  .pin.num{height:19px;min-width:19px;padding:0 4px;font-size:10.5px;font-weight:600;
+    border-color:#2b3a52;background:#0e1723e0;color:#a9bdd6;
+    font-variant-numeric:tabular-nums;backdrop-filter:blur(2px)}
+  .pin.num:hover{border-color:#7cb4e8;background:#17293b;color:#e6edf6}
+  .pin.num.cur{background:#14532d;border-color:#22c55e;color:#bbf7d0;box-shadow:0 0 0 2px #22c55e40}
+  .pin.num.dk{border-color:#3d7a4a;color:#9fe0b0}
+  .pin.num.dm{border-color:#8a7a35;color:#e8d9a0}
+  .pin.num.ds{border-color:#8a5a2f;color:#f0c090}
+  .pin.num.dx{border-color:#8a3a3a;color:#f0a0a0}
+  .pin.num.nodata{border-color:#2b4258;color:#6b83a0;border-style:dashed}
+  .pin.num.away{border-color:#f59e0b;color:#fcd34d;border-style:dashed;
+    box-shadow:0 0 0 2px #f59e0b28}
+  .map-ctrl{position:absolute;right:9px;bottom:9px;display:flex;flex-direction:column;gap:5px;z-index:4}
+  .map-ctrl button{width:27px;height:27px;border-radius:8px;border:1px solid #2c4257;
+    background:#101a25cc;color:#b9cbe0;font-size:13px;font-weight:700;cursor:pointer;
+    display:grid;place-items:center;backdrop-filter:blur(4px);transition:.13s;font-family:inherit;line-height:1}
+  .map-ctrl button:hover{background:#1b2c3f;color:#fff;border-color:#4a7096}
+  .map-hint{margin-top:9px;font-size:11.5px;color:var(--dim);text-align:center;min-height:16px}
+  .map-hint b{color:#86efac}
+  /* ── 链路拓扑（无色彩地图）── */
+  .map-wrap.mono #mapRegions path{fill:#0e161e !important;stroke:#27384a}
+  .topo-glow{fill:none;stroke-width:5;opacity:.13;stroke-linecap:round}
+  .topo-link{fill:none;stroke-width:1.7;stroke-linecap:round;opacity:.92}
+  .topo-flow{stroke-dasharray:4 10;animation:flowLine 1.15s linear infinite}
+  /* 没实测出口时那段用虚线，示意「位置是推断的」 */
+  .topo-est{stroke-dasharray:2.5 7;opacity:.72;animation:flowLine 1.7s linear infinite}
+  /* AI 专用通道：出口 → 各家总部，细虚线，走各自的品牌色 */
+  .topo-ai{stroke-dasharray:1.6 5;stroke-width:1.35;opacity:.8;animation:flowLine 1.5s linear infinite}
+  @keyframes flowLine{to{stroke-dashoffset:-14}}
+  .topo-dot .ring{fill:none;stroke-width:1.1;animation:ringPulse 2.2s ease-out infinite}
+  @keyframes ringPulse{0%{r:5;opacity:.8}70%{r:16;opacity:0}100%{opacity:0}}
+  .topo-label{font-weight:600;fill:#e2ecf6;paint-order:stroke;stroke:#080d13;stroke-linejoin:round}
+  .topo-sub{font-weight:500;fill:#93a8bd;paint-order:stroke;stroke:#080d13;stroke-linejoin:round}
+
+  /* ── AI 专项卡片 ── */
+  .hint-inline{font-size:10.5px;color:var(--dim2);font-weight:500;text-transform:none;
+    letter-spacing:0;margin-left:5px}
+  .ai-warn{display:none;margin-top:9px;font-size:11.5px;color:#fbbf24;background:#2a2413;
+    border:1px solid #6b5518;border-radius:8px;padding:7px 9px;line-height:1.55}
+  .ai-warn.on{display:block}
+  .ai-tz{font-size:11.5px;color:#8fb6d9;margin:6px 0 2px;font-variant-numeric:tabular-nums}.ai-ok{display:none;margin-top:9px;font-size:11.5px;color:#86efac;background:#12251a;
+    border:1px solid #1d5c3a;border-radius:8px;padding:7px 9px;line-height:1.55}
+  .ai-ok.on{display:block}
+  .fp-box{display:none;margin-top:11px;border-top:1px dashed #1f2a3a;padding-top:11px;
+    font-size:11.5px;line-height:1.75;color:var(--dim)}
+  .fp-box.on{display:block}
+  .fp-score{font-size:22px;font-weight:800;color:#e6edf6;font-variant-numeric:tabular-nums}
+  .fp-hit{display:flex;gap:7px;margin-top:6px;align-items:flex-start}
+  .fp-hit b{color:#fbbf24;font-variant-numeric:tabular-nums;flex:none;min-width:30px;text-align:right}
+  .fp-hit span{flex:1}
+  .fp-hit i{color:var(--dim2);font-style:normal;display:block;font-size:11px}
+  #aiSelect{flex:1;min-width:0;font-size:12px}
+  .map-legend{display:flex;gap:9px;justify-content:center;margin-top:7px;font-size:10.5px;
+    color:var(--dim2);flex-wrap:wrap}
+  .map-legend span{display:inline-flex;align-items:center;gap:4px}
+  .map-legend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+
+  /* 聚簇弹层 */
+  .cluster{position:fixed;z-index:80;background:linear-gradient(180deg,#172130,#111a25);
+    border:1px solid #2c4257;border-radius:11px;padding:6px;min-width:150px;
+    box-shadow:0 16px 40px -12px #000d;display:none}
+  .cluster.on{display:block}
+  .cluster .it{display:flex;align-items:center;gap:7px;padding:7px 9px;border-radius:8px;
+    cursor:pointer;font-size:12.5px;transition:.12s;white-space:nowrap}
+  .cluster .it:hover{background:#1e3348}
+  .cluster .it.cur{background:#123a26;color:#bbf7d0}
+  .cluster .it .c{margin-left:auto;color:#7f8ea6;font-size:11px;font-variant-numeric:tabular-nums}
+  .banner{border-radius:12px;padding:11px 14px;margin-bottom:14px;font-size:13px;display:none}
+  .banner.err{display:block;background:#2a1113;border:1px solid #6d2226;color:#fca5a5}
+  .banner.busy{display:block;background:#251f0d;border:1px solid #6b5518;color:#fcd34d}
+  .meter{height:3px;border-radius:3px;background:#1a2432;overflow:hidden;margin-top:10px;display:none}
+  .meter.on{display:block}
+  .meter i{display:block;height:100%;width:35%;background:linear-gradient(90deg,#22c55e,#3b82f6);
+    animation:slide 1.1s linear infinite}
+  @keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(330%)}}
+
+  /* ── 日志弹层 ── */
+  .modal{position:fixed;inset:0;background:#04070bcc;backdrop-filter:blur(6px);display:none;
+    align-items:center;justify-content:center;padding:20px;z-index:50}
+  .modal.on{display:flex}
+  .modal .box{background:var(--card);border:1px solid var(--line);border-radius:16px;
+    width:min(860px,100%);max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
+  .modal .hd{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--line)}
+  .modal pre{margin:0;padding:14px 16px;overflow:auto;font:12px/1.6 ui-monospace,Consolas,monospace;
+    color:#a8b7cc;white-space:pre-wrap;word-break:break-all}
+  .toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);background:#16202e;
+    border:1px solid var(--line);color:var(--txt);padding:10px 16px;border-radius:11px;font-size:13px;
+    opacity:0;pointer-events:none;transition:.2s;z-index:60;box-shadow:0 12px 30px -12px #000}
+  .toast.on{opacity:1;transform:translate(-50%,0)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">V</div>
+    <div>
+      <h1>VPN Tray 控制台 <span class="ver" id="uiVer"></span></h1>
+      <div class="sub" id="portLine">—</div>
+    </div>
+    <div class="subline" id="subHead">
+      <span class="sb-name" id="sbName">—</span>
+      <span class="sb-bar" id="sbBar" title=""><i></i></span>
+      <span class="sb-traffic" id="sbTraffic">—</span>
+      <span class="sb-expire" id="sbExpire"></span>
+    </div>
+    <div class="spacer"></div>
+    <div class="pill"><span class="dot" id="statDot"></span><span id="statText">连接中…</span></div>
+  </header>
+
+  <div class="banner" id="banner"></div>
+  <div class="meter" id="meter"><i></i></div>
+
+  <div class="grid">
+    <!-- 左栏 -->
+    <div>
+      <div class="card now">
+        <h2>当前节点</h2>
+        <div class="now-name" id="nowName">—</div>
+        <div class="now-meta" id="nowMeta">—</div>
+        <div class="now-ai" id="nowAI" style="display:none"></div>
+        <div class="stat-row">
+          <div class="stat"><b id="upSpeed">0 B/s</b><span>上传</span></div>
+          <div class="stat"><b id="downSpeed">0 B/s</b><span>下载</span></div>
+        </div>
+        <div class="stat-row">
+          <div class="stat"><b id="totalDown">0 B</b><span>累计下行</span></div>
+          <div class="stat"><b id="connCount">0</b><span>活动连接</span></div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="chart" width="640" height="156"></canvas>
+          <div class="legend">
+            <span><i style="background:#22c55e"></i>下行</span>
+            <span><i style="background:#3b82f6"></i>上行</span>
+            <span style="margin-left:auto">近 2 分钟</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <h2>模式</h2>
+        <div class="seg" id="modeSeg">
+          <button data-mode="rule">规则分流</button>
+          <button data-mode="global">全局代理</button>
+          <button data-mode="direct">全部直连</button>
+        </div>
+
+        <div style="margin-top:14px">
+          <div class="row">
+            <div><div class="lbl">系统代理</div><div class="hint">接管浏览器与桌面软件</div></div>
+            <div class="switch" id="swSysproxy"></div>
+          </div>
+          <div class="row">
+            <div><div class="lbl">开机自启</div><div class="hint">登录后自动运行</div></div>
+            <div class="switch" id="swAutostart"></div>
+          </div>
+          <div class="row">
+            <div><div class="lbl">自动优选</div><div class="hint">每 30 分钟切到最快可用节点</div></div>
+            <div class="switch" id="swAutoBest"></div>
+          </div>
+          <div class="row">
+            <div><div class="lbl">节点自愈</div><div class="hint">当前节点挂了自动换</div></div>
+            <div class="switch" id="swHeal"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px" id="aiCard">
+        <h2>AI 专项<span class="hint-inline">Claude Code / Codex</span></h2>
+        <div class="row" style="border-bottom:0;padding-bottom:0">
+          <div>
+            <div class="lbl">AI 专用通道</div>
+            <div class="hint">这些域名钉死一个节点，不自动切换</div>
+          </div>
+          <div class="switch" id="swAi"></div>
+        </div>
+        <div style="margin-top:12px">
+          <div class="now-name" id="aiNode" style="font-size:13.5px">—</div>
+          <div class="now-meta" id="aiMeta">—</div>
+        </div>
+        <div class="ai-tz" id="aiTz"></div>
+        <div class="ai-warn" id="aiWarn"></div>
+        <div class="ai-ok" id="aiOk"></div>
+        <div class="sub-edit" style="margin-top:10px">
+          <select class="sel" id="aiSelect"></select>
+          <button class="btn" id="btnAiSet">切换</button>
+        </div>
+        <div class="foot">
+          <button class="btn" id="btnAiProbe">测出口 IP</button>
+          <button class="btn" id="btnAiFp">指纹自检</button>
+          <button class="btn" id="btnAiAlign">时区对齐</button>
+          <button class="btn" id="btnAiRestore">还原时区</button>
+          <button class="btn" id="btnAiLauncher">生成启动脚本</button>
+        </div>
+        <div class="fp-box" id="aiFpBox"></div>
+      </div>
+
+      <div class="card" style="margin-top:14px" id="subCard">
+        <h2>订阅 <span class="h2r" id="subCount"></span>
+          <button class="btn tiny" id="btnMerge"
+                  title="同一个机场的多个账号：共用同一套节点名，一个账号没流量了自动换下一个">合并</button>
+        </h2>
+        <div class="sub-list" id="subList"></div>
+        <div class="sub-edit">
+          <input type="text" id="subName" placeholder="备注名" spellcheck="false" style="max-width:110px">
+          <input type="text" id="subUrl" placeholder="粘贴订阅链接（https://…）" spellcheck="false">
+          <button class="btn primary" id="btnSaveSub">添加</button>
+        </div>
+        <div class="now-meta" id="subLine">—</div>
+        <div class="foot">
+          <button class="btn" id="btnSub">更新订阅</button>
+          <button class="btn" id="btnRestart">重启内核</button>
+          <button class="btn" id="btnLog">日志</button>
+          <button class="btn danger" id="btnQuit">退出程序</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px" id="aboutCard">
+        <h2>关于 <span class="h2r" id="verNow"></span></h2>
+        <div class="upd-row">
+          <div class="upd-l">
+            <b id="updTitle">检查更新</b>
+            <span id="updSub">启动后自动查一次，有新版才提示</span>
+          </div>
+          <button class="btn" id="btnCheckUpd">检查</button>
+        </div>
+        <div class="upd-box" id="updBox" hidden>
+          <div class="upd-head">
+            <b id="updVer"></b>
+            <span class="upd-date" id="updDate"></span>
+          </div>
+          <pre class="upd-notes" id="updNotes"></pre>
+          <div class="foot" style="margin-top:8px">
+            <button class="btn primary" id="btnApplyUpd">下载并安装</button>
+            <button class="btn" id="btnOpenPage">打开发布页</button>
+          </div>
+        </div>
+        <div class="upd-bar" id="updBar" hidden>
+          <div class="upd-fill" id="updFill"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右栏：地图 + 节点 -->
+    <div>
+      <div class="card map-card">
+        <h2>
+          <div class="seg mini" id="mapView">
+            <button data-v="ppl" class="act">节点分布</button>
+            <button data-v="topo">链路拓扑</button>
+          </div>
+          <div class="seg mini" id="mapMode">
+            <button data-m="delay" class="act">延迟</button>
+            <button data-m="purity">纯净度</button>
+          </div>
+          <button class="map-refresh" id="mapRefresh" title="刷新延迟">↻</button>
+        </h2>
+        <div class="map-wrap" id="mapWrap">
+          <svg id="map" preserveAspectRatio="xMidYMid meet" viewBox="0 0 1012 588">
+            <g id="mapRegions"></g>
+            <g id="topoLayer" style="display:none"></g>
+          </svg>
+          <svg id="localMap" preserveAspectRatio="xMidYMid meet" style="display:none">
+            <g id="localRegions"></g>
+          </svg>
+          <button class="local-back" id="localBack" style="display:none">← 返回世界地图</button>
+          <div class="pins" id="mapPins"></div>
+          <div class="map-ctrl">
+            <button id="zoomIn" title="放大（滚轮也可以）">＋</button>
+            <button id="zoomOut" title="缩小">－</button>
+            <button id="zoomReset" title="复位">⤢</button>
+          </div>
+        </div>
+        <div class="map-prog" id="mapProg">
+          <div class="bar" id="mapProgBarBox"><i id="mapProgBar"></i></div>
+          <span id="mapProgText"></span>
+        </div>
+        <div class="map-hint" id="mapHint">点国家筛选节点</div>
+        <div class="map-legend" id="mapLegend"></div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="toolbar">
+          <input type="search" id="search" placeholder="搜索节点 / 地区，如 香港、IEPL、家宽…">
+          <select class="sel" id="sortBy" title="排序方式">
+            <option value="delay">按延迟</option>
+            <option value="purity">按纯净度</option>
+            <option value="mbps">按带宽</option>
+            <option value="name">按名称</option>
+          </select>
+        </div>
+        <div class="toolbar">
+          <button class="btn primary" id="btnBest">自动优选</button>
+          <button class="btn" id="btnPurityCur">测当前纯净度</button>
+          <button class="btn" id="btnSpeed">带宽测速</button>
+        </div>
+        <div class="now-meta" id="listHint" style="margin-bottom:10px">—</div>
+        <div class="nodes" id="nodes"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer class="legal" id="legal">
+  <div class="legal-in">
+    <div class="t">使用须知 · 免责声明</div>
+    <p>本软件为个人<em>学习与研究</em>网络协议、代理与分流技术的本地工具，<em>不提供</em>任何代理服务、节点、线路或订阅内容，
+       亦不运营任何服务器。界面中出现的全部节点、流量与订阅信息，均来自使用者自行配置的第三方订阅，与本软件作者无关。</p>
+    <p>请在遵守<em>所在地法律法规</em>及你所使用服务商条款的前提下使用。因使用本软件产生的一切后果
+       ——包括但不限于服务中断、账号受限、数据丢失、订阅或付费纠纷、行政与法律责任——均由使用者自行承担。
+       本软件按「现状」提供，作者不作任何明示或默示的担保，亦不承担任何直接或间接责任。</p>
+    <p class="dim">请勿将本软件用于商业用途、非法用途或侵犯他人合法权益的行为。
+       如你不同意上述条款，请立即停止使用并删除本软件。</p>
+  </div>
+</footer>
+
+<div class="modal" id="modal">
+  <div class="box">
+    <div class="hd"><b>运行日志</b><button class="btn" id="btnCloseLog">关闭</button></div>
+    <pre id="logBox">加载中…</pre>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<div class="cluster" id="clusterBox"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let STATE = null;
+// 页面自带的版本号；后端 build_state 也会返回 ui，两边不一致就强制刷新一次
+const UI_VER = '1.8.0';
+// 额度长条用的绿色梯度：第一条最亮，往后越来越深
+const GREEN_SHADES = ['#4ade80', '#37c96e', '#2aa95a', '#218a49', '#196c39', '#12522b', '#0c3b1f', '#082b16'];
+document.getElementById('uiVer').textContent = 'v' + UI_VER;
+// localStorage 在隐私模式/被策略禁用时直接抛 SecurityError，
+// 而这一行在函数定义与 poll 启动之前 —— 抛出去整页就是白的。
+let collapsed = new Set();
+try {
+  const raw = JSON.parse(localStorage.getItem('vpn_collapsed') || '[]');
+  if (Array.isArray(raw)) collapsed = new Set(raw);
+} catch (e) { console.warn('读取折叠状态失败', e); }
+const hist = { up: [], down: [] };
+const HIST_MAX = 60;
+
+function fmt(n){
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  const u = ['KB','MB','GB','TB']; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n < 10 ? 2 : 1) + ' ' + u[i];
+}
+function fmtAge(ts){
+  if (!ts) return '从未';
+  const d = Math.max(0, Math.floor(Date.now()/1000 - ts));
+  if (d < 60) return d + ' 秒前';
+  if (d < 3600) return Math.floor(d/60) + ' 分钟前';
+  if (d < 86400) return Math.floor(d/3600) + ' 小时前';
+  return Math.floor(d/86400) + ' 天前';
+}
+function toast(msg){
+  const t = $('#toast'); t.textContent = msg; t.classList.add('on');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('on'), 1800);
+}
+function delayClass(d){
+  if (d === null || d === undefined || d === 0) return 'b-none';
+  if (d < 120) return 'b-ok';
+  if (d < 250) return 'b-mid';
+  if (d < 500) return 'b-slow';
+  return 'b-dead';
+}
+function delayText(d){
+  if (d === null || d === undefined || d === 0) return '—';
+  return d + 'ms';
+}
+function pClass(v){
+  if (v === null || v === undefined) return 'p-none';
+  if (v >= 85) return 'p-ok';
+  if (v >= 70) return 'p-good';
+  if (v >= 50) return 'p-mid';
+  return 'p-bad';
+}
+
+async function api(path, body){
+  // 控制 API 卡死时 fetch 会一直挂着：加超时，并显式检查 HTTP 状态，
+  // 否则调用方等的是一个永远不 resolve 的 Promise（按钮永久 disabled）。
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body || {}),
+      signal: ctl.signal,
+    });
+    let j = null;
+    try { j = await r.json(); } catch(e) { j = null; }
+    if (!j) return { ok: false, error: 'HTTP ' + r.status + '（返回不是 JSON）' };
+    if (!r.ok && j.ok !== false) j.ok = false;
+    return j;
+  } catch(e) {
+    return { ok: false, error: e && e.name === 'AbortError' ? '请求超时' : '连接失败' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function poll(){
+  try{
+    const r = await fetch('/api/state', {cache:'no-store'});
+    const j = await r.json();
+    if (j.ok) {
+      // 后端界面版本和页面不一致（换了新包/浏览器留了旧页面）→ 自动刷一次
+      const sv = (j.state && j.state.ui) || '';
+      if (sv && sv !== UI_VER && !sessionStorage.getItem('uiReloaded')) {
+        sessionStorage.setItem('uiReloaded', '1');
+        location.replace('/?v=' + sv);
+        return;
+      }
+      STATE = j.state;
+      render();
+    }
+  }catch(e){ /* 服务器重启中 */ }
+}
+
+/* ───────── 渲染 ───────── */
+function render(){
+  const s = STATE;
+  if (!s) return;                     // 首帧 STATE 还没到，任何字段访问都会抛
+  // 后端字段可能缺失（老包/降级 JSON），这里补齐一份，避免每 1.5s 抛一次 TypeError
+  const ports = s.ports || (s.ports = {});
+  if (s.sub == null) s.sub = {};
+  if (!Array.isArray(s.info)) s.info = [];
+  if (!Array.isArray(s.nodes)) s.nodes = [];
+  if (!Array.isArray(s.group_list)) s.group_list = [];
+  if (s.traffic == null) s.traffic = {};
+  if (s.progress == null) s.progress = { kind: '', done: 0, total: 0, text: '' };
+  $('#portLine').textContent =
+    `代理 :${ports.proxy ?? '—'}  ·  控制 API :${ports.api ?? '—'}  ·  组：${s.group || '—'}`;
+
+  const dot = $('#statDot'), txt = $('#statText');
+  dot.className = 'dot';
+  // 切了节点就重新定位链路
+  if (mapView === 'topo' && s.current && s.current !== TOPO_NODE) {
+    TOPO_NODE = s.current;
+    TOPO = null;
+    loadTopo(true);
+  }
+  if (s.error) { dot.classList.add('err'); txt.textContent = '异常'; }
+  else if (s.busy) { dot.classList.add('busy'); txt.textContent = s.busy; }
+  else if (s.kernel_ok) { dot.classList.add('on'); txt.textContent = '运行中'; }
+  else { txt.textContent = '未连接'; }
+
+  const banner = $('#banner');
+  const needSub = !s.sub.url;
+  if (needSub) {
+    banner.className = 'banner err';
+    banner.textContent = '⚠ 还没有订阅：把机场给的 Clash 订阅链接粘贴到左下角「订阅」里，点「保存并连接」即可开始。';
+    $('#subCard').classList.add('urgent');
+  } else if (s.error) {
+    banner.className = 'banner err'; banner.textContent = '⚠ ' + s.error;
+    $('#subCard').classList.remove('urgent');
+  } else if (!s.kernel_ok) {
+    banner.className = 'banner err'; banner.textContent = '内核未运行，正在重连…';
+    $('#subCard').classList.remove('urgent');
+  } else {
+    banner.className = 'banner';
+    $('#subCard').classList.remove('urgent');
+  }
+  $('#meter').className = 'meter' + (s.busy ? ' on' : '');
+
+  // 订阅输入框（不打断用户输入）
+  const inp = $('#subUrl');
+  if (document.activeElement !== inp) inp.value = s.sub.url || '';
+
+  $('#nowName').textContent = s.current || '未选择';
+  const curNode = (s.nodes || []).find(n => n.current);
+  if (curNode) {
+    const bits = [`${curNode.flag} ${curNode.region}`, curNode.type || 'proxy', delayText(curNode.delay)];
+    if (curNode.mbps) bits.push(curNode.mbps + ' Mbps');
+    if (curNode.purity !== null && curNode.purity !== undefined) {
+      bits.push(`纯净度 ${curNode.purity} · ${curNode.purity_grade || ''}`);
+    }
+    if (curNode.city) bits.push(cityZh(curNode.city));
+    if (curNode.purity_ip) bits.push(curNode.purity_ip);
+    $('#nowMeta').textContent = bits.join(' · ');
+    $('#nowMeta').title = (curNode.purity_tags || []).join(' · ') + (curNode.purity_ip ? ' · ' + curNode.purity_ip : '');
+  } else {
+    $('#nowMeta').textContent = '—';
+  }
+
+  // AI 专用通道：和主节点不同时才单独显示一行，切了就同步
+  const aiBox = $('#nowAI');
+  const ai = s.ai || {};
+  if (ai.enabled && ai.node && ai.node !== s.current) {
+    const an = (s.nodes || []).find(n => n.name === ai.node) || {};
+    const bits = [`<span class="tag">AI 专用</span>`];
+    if (an.flag) bits.push(`${an.flag} ${an.region || ''}`);
+    if (an.delay != null) bits.push(`${an.delay}ms`);
+    if (an.purity != null) bits.push(`纯度 ${an.purity}`);
+    if (an.city) bits.push(cityZh(an.city));
+    aiBox.innerHTML = `<b>${esc(ai.node)}</b>` + bits.join(' · ');
+    aiBox.style.display = '';
+  } else if (ai.enabled && ai.node) {
+    aiBox.innerHTML = '<span class="tag">AI 专用</span>与上方主节点为同一个节点';
+    aiBox.style.display = '';
+  } else {
+    aiBox.style.display = 'none';
+  }
+
+  const t = s.traffic || {};
+  $('#upSpeed').textContent = fmt(t.up_speed) + '/s';
+  $('#downSpeed').textContent = fmt(t.down_speed) + '/s';
+  $('#totalDown').textContent = fmt(t.down);
+  $('#connCount').textContent = s.connections ?? 0;
+
+  // 流量曲线：一个非数值混进去就会让 Math.max 变 NaN，整条曲线消失
+  const nUp = Number(t.up_speed), nDown = Number(t.down_speed);
+  hist.up.push(Number.isFinite(nUp) ? nUp : 0);
+  hist.down.push(Number.isFinite(nDown) ? nDown : 0);
+  while (hist.up.length > HIST_MAX) { hist.up.shift(); hist.down.shift(); }
+  drawChart();
+
+  // 模式
+  [...$('#modeSeg').children].forEach(b => b.classList.toggle('act', b.dataset.mode === s.mode));
+
+  // 开关
+  const sw = (el, on, disabled) => {
+    el.classList.toggle('on', !!on);
+    el.classList.toggle('dis', !!disabled);
+  };
+  sw($('#swSysproxy'), s.sysproxy, !s.kernel_ok);
+  sw($('#swAutostart'), s.autostart);
+  sw($('#swAutoBest'), s.auto_best);
+  sw($('#swHeal'), s.heal);
+
+  $('#subLine').textContent = s.sub.error
+    ? `订阅异常：${s.sub.error}`
+    : (s.sub.url
+        ? `${s.sub.count} 个节点 · 上次更新 ${fmtAge(s.sub.last_ok)}`
+          + (s.info.length ? ` · ${s.info[0]}` : '')
+        : '尚未配置订阅');
+  renderSubs(s.sub);
+  renderSubHead(s.sub);
+  renderUpdate();
+
+  renderNodes();
+  drawMap();
+  renderProgress();
+  renderAI();
+}
+
+/* ───────── 世界地图（矢量 SVG，可缩放拖拽） ───────── */
+const VB0 = (window.WORLD_VIEWBOX || '0 0 1012 741').split(' ').map(Number);
+const BASE = {x: VB0[0] || 0, y: VB0[1] || 0, w: VB0[2] || 1012, h: VB0[3] || 741};
+const RATIO = BASE.h / BASE.w;
+const MIN_W = BASE.w * 0.022;  // 最大放大 ~45 倍（港澳这类小地方也能拉到眼前）
+
+let vb = {x: BASE.x, y: BASE.y, w: BASE.w, h: BASE.h};
+let mapFilter = localStorage.getItem('vpn_map_cc') || null;
+let mapMode = localStorage.getItem('vpn_map_mode') || 'delay';
+let mapBuilt = false;
+let mapSig = '';
+let mapClusters = [];
+let MAP_LIST = [];        // 当前列表顺序（带 idx），地图编号跟它对齐
+let MAP_AWAY = 0;         // 有真实坐标但落地不在本国的节点数
+
+const svgEl = () => document.getElementById('map');
+const wrapEl = () => document.getElementById('mapWrap');
+
+const colorDelay = d => d == null ? null : d < 120 ? '#1d5c3a' : d < 250 ? '#3f5720' : d < 500 ? '#5c3f1b' : '#5c2222';
+const colorPurity = p => p == null ? null : p >= 85 ? '#1d5c3a' : p >= 70 ? '#2c5a26' : p >= 50 ? '#4d5520' : '#5c2222';
+
+function ccStats(){
+  if (!STATE || !STATE.nodes) return;
+  const m = {};
+  if (!STATE) return m;          // 首次加载时 setMapView 会先跑一次，还没数据
+  for (const r of (STATE.regions || [])) {
+    if (!r.cc) continue;
+    const o = m[r.cc] || (m[r.cc] = {count:0, best:null, purity:null, region:r.region, flag:r.flag});
+    o.count += r.count;
+    if (r.best != null && (o.best === null || r.best < o.best)) o.best = r.best;
+    if (r.best_purity != null && (o.purity === null || r.best_purity > o.purity)) o.purity = r.best_purity;
+  }
+  return m;
+}
+
+function buildMap(){
+  if (mapBuilt) return;
+  const g = document.getElementById('mapRegions');
+  let html = '';
+  for (const [cc, d] of Object.entries(window.WORLD_GEO || {})) {
+    html += `<path class="map-region" data-cc="${cc}" d="${d}"></path>`;
+  }
+  g.innerHTML = html;
+  mapBuilt = true;
+}
+
+/* —— 视野（viewBox）控制 —— */
+function clampVB(){
+  vb.w = Math.max(MIN_W, Math.min(BASE.w, vb.w));
+  vb.h = vb.w * RATIO;
+  vb.x = Math.max(BASE.x, Math.min(BASE.x + BASE.w - vb.w, vb.x));
+  vb.y = Math.max(BASE.y, Math.min(BASE.y + BASE.h - vb.h, vb.y));
+}
+
+function applyVB(){
+  const s = svgEl();
+  if (s) s.setAttribute('viewBox',
+    `${vb.x.toFixed(2)} ${vb.y.toFixed(2)} ${vb.w.toFixed(2)} ${vb.h.toFixed(2)}`);
+  layoutPins();
+  rescaleTopo();
+}
+
+/* 字和描边在屏幕上保持稳定大小（otherwise 放大后标签会糊成一片） */
+function rescaleTopo(){
+  const k = vb.w / BASE.w;
+  document.querySelectorAll('#topoLayer .topo-label').forEach(t => {
+    t.style.fontSize = (15 * k).toFixed(2) + 'px';
+    t.style.strokeWidth = (3.2 * k).toFixed(2) + 'px';
+  });
+  document.querySelectorAll('#topoLayer .topo-sub').forEach(t => {
+    t.style.fontSize = (12 * k).toFixed(2) + 'px';
+    t.style.strokeWidth = (2.8 * k).toFixed(2) + 'px';
+  });
+}
+
+function pxPerUnit(){
+  const rect = wrapEl().getBoundingClientRect();
+  return rect.width ? rect.width / vb.w : BASE.w / vb.w;
+}
+
+function zoomAt(factor, clientX, clientY){
+  const rect = wrapEl().getBoundingClientRect();
+  if (!rect.width) return;
+  const fx = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+  const fy = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
+  const sx = vb.x + fx * vb.w, sy = vb.y + fy * vb.h;
+  vb.w *= factor;
+  vb.h = vb.w * RATIO;
+  vb.x = sx - fx * vb.w;
+  vb.y = sy - fy * vb.h;
+  clampVB();
+  redrawPins();
+  applyVB();
+}
+
+function zoomCenter(factor){
+  const rect = wrapEl().getBoundingClientRect();
+  zoomAt(factor, rect.left + rect.width / 2, rect.top + rect.height / 2);
+}
+
+function resetVB(){
+  vb = {x: BASE.x, y: BASE.y, w: BASE.w, h: BASE.h};
+  redrawPins();
+  applyVB();
+}
+
+function focusLL(latlon, padPct){
+  if (!latlon || !latlon.length) return;
+  const xy = latlon.map(p => projectLL(p[0], p[1]));
+  const xs = xy.map(p => p[0]), ys = xy.map(p => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const pad = padPct == null ? 0.8 : padPct;
+  const AR = BASE.w / BASE.h;
+  let w = Math.max(x1 - x0, 26) * (1 + pad * 2);
+  let h = Math.max(y1 - y0, 18) * (1 + pad * 2);
+  if (w / h < AR) w = h * AR; else h = w / AR;
+  if (w < MIN_W) { w = MIN_W; h = w * RATIO; }
+  vb.w = w; vb.h = h;
+  vb.x = (x0 + x1) / 2 - w / 2;
+  vb.y = (y0 + y1) / 2 - h / 2;
+  clampVB();
+  applyVB();
+}
+
+function focusCC(cc, spread){
+  const c = (window.WORLD_CENTER || {})[cc];
+  if (!c) return;
+  const w = BASE.w * (spread || 0.22);
+  vb.w = w; vb.h = w * RATIO;
+  vb.x = c[0] - vb.w / 2;
+  vb.y = c[1] - vb.h / 2;
+  clampVB();
+  redrawPins();
+  applyVB();
+}
+
+/* —— 聚簇（阈值按屏幕上 26px 换算，缩放后自动散开） —— */
+function clusterStats(stats, th){
+  const items = [];
+  for (const [cc, st] of Object.entries(stats)) {
+    const c = (window.WORLD_CENTER || {})[cc];
+    if (!c) continue;
+    items.push({cc, st, x: c[0], y: c[1]});
+  }
+  items.sort((a, b) => b.st.count - a.st.count);
+  const clusters = [];
+  for (const it of items) {
+    const hit = clusters.find(cl => Math.hypot(cl.x - it.x, cl.y - it.y) < th);
+    if (hit) {
+      hit.items.push(it);
+      hit.x = hit.items.reduce((a, b) => a + b.x, 0) / hit.items.length;
+      hit.y = hit.items.reduce((a, b) => a + b.y, 0) / hit.items.length;
+    } else {
+      clusters.push({x: it.x, y: it.y, items: [it]});
+    }
+  }
+  return clusters;
+}
+
+/* —— pin 定位：用 SVG 矩阵把世界坐标换算成屏幕像素 —— */
+function layoutPins(){
+  const wrap = wrapEl();
+  const s = LOCAL_ACTIVE ? document.getElementById('localMap') : svgEl();
+  if (!wrap || !s) return;
+  const rect = wrap.getBoundingClientRect();
+  const ctm = s.getScreenCTM();
+  if (!ctm || !rect.width) return;
+  const pt = s.createSVGPoint();
+  document.querySelectorAll('#mapPins .pin').forEach(el => {
+    pt.x = Number(el.dataset.sx);
+    pt.y = Number(el.dataset.sy);
+    const sp = pt.matrixTransform(ctm);
+    const x = sp.x - rect.left, y = sp.y - rect.top;
+    const vis = x > -26 && x < rect.width + 26 && y > -26 && y < rect.height + 26;
+    el.style.display = vis ? 'flex' : 'none';
+    el.style.left = x.toFixed(1) + 'px';
+    el.style.top = y.toFixed(1) + 'px';
+  });
+}
+
+function redrawPins(){
+  if (!STATE || !STATE.nodes) return;
+  const box = document.getElementById('mapPins');
+  if (!box) return;
+  const stats = ccStats();
+  const curCC = ((STATE.nodes || []).find(n => n.current) || {}).cc || '';
+  const curName = ((STATE.nodes || []).find(n => n.current) || {}).name || '';
+
+  // 签名没变就别重绘：100 个编号点每 1.5 秒重建一次要跑上千次 isPointInFill
+  const sig = [
+    mapFilter || '', curCC, curName, pxPerUnit().toFixed(4),
+    Object.keys(stats).sort().map(cc => cc + ':' + stats[cc].count + ':' + (stats[cc].best || '') + ':' + (stats[cc].purity ?? '')).join(','),
+    mapFilter ? MAP_LIST.map(n => n.name + n.idx + (n.delay || '') + (n.purity ?? '')).join('|') : '',
+  ].join('~');
+  if (box.dataset.sig === sig && box.childElementCount) return;
+
+  // 已选中某国 → 逐节点编号落点（有 IP 坐标用真坐标，没有的在国内散开）
+  if (mapFilter && MAP_LIST.length) {
+    const {spots, away: awayFlags} = spreadSpots(mapFilter, MAP_LIST);
+    let html = '';
+    let away = 0;
+    MAP_LIST.forEach((n, i) => {
+      const [x, y] = spots[i];
+      const off = !!awayFlags[i];
+      if (off) away++;
+      const cls = 'pin num ' + delayDotClass(n.delay) + (n.current ? ' cur' : '') + (off ? ' away' : '');
+      const tip = `#${n.idx} ${n.name}`
+        + (n.delay ? ` · ${n.delay}ms` : ' · 无延迟数据')
+        + (n.purity != null ? ` · 纯净度 ${n.purity}` : '')
+        + (n.city ? ` · ${n.city}` : '')
+        + (off ? ' · 落地不在本国' : '')
+        + (n.purity_ip ? ` · ${n.purity_ip}` : '');
+      html += `<div class="${cls}" data-node="${esc(n.name)}"
+        data-sx="${x.toFixed(2)}" data-sy="${y.toFixed(2)}" title="${esc(tip)}">${n.idx}</div>`;
+    });
+    MAP_AWAY = away;
+    box.innerHTML = html;
+    box.dataset.sig = sig;
+    mapClusters = [];
+    layoutPins();
+    return;
+  }
+  MAP_AWAY = 0;
+
+  const th = 26 / Math.max(0.02, pxPerUnit());
+  mapClusters = clusterStats(stats, th);
+
+  let html = '';
+  mapClusters.forEach((cl, i) => {
+    const cnt = cl.items.reduce((a, b) => a + b.st.count, 0);
+    const multi = cl.items.length > 1;
+    const sel = cl.items.some(x => x.cc === mapFilter);
+    const cur = cl.items.some(x => x.cc === curCC);
+    const cls = 'pin' + (multi ? ' multi' : '') + (sel ? ' sel' : '') + (cur ? ' cur' : '');
+    const label = multi ? cnt : (cnt > 20 ? '20+' : cnt);
+    const tip = multi
+      ? cl.items.map(x => `${x.st.region} ${x.st.count}`).join(' · ')
+      : `${cl.items[0].st.region} · ${cl.items[0].st.count} 个节点`
+        + (cl.items[0].st.best ? ` · 最快 ${cl.items[0].st.best}ms` : '')
+        + (cl.items[0].st.purity != null ? ` · 纯净度 ${cl.items[0].st.purity}` : '');
+    const attr = multi ? `data-cl="${i}"` : `data-cc="${cl.items[0].cc}"`;
+    html += `<div class="${cls}" ${attr} data-sx="${cl.x}" data-sy="${cl.y}"
+      title="${esc(tip)}">${label}</div>`;
+  });
+  box.innerHTML = html;
+  box.dataset.sig = sig;
+  layoutPins();
+}
+
+function delayDotClass(d){
+  if (d == null) return 'nodata';
+  if (d < 120) return 'dk';
+  if (d < 250) return 'dm';
+  if (d < 500) return 'ds';
+  return 'dx';
+}
+
+/* 判断某个世界坐标是不是落在该国国土里 */
+function ccInFill(cc, x, y){
+  const p = document.querySelector(`.map-region[data-cc="${cc}"]`);
+  if (!p || typeof p.isPointInFill !== 'function') return true;
+  try { return p.isPointInFill(new DOMPoint(x, y)); } catch (e) { return true; }
+}
+
+/* 确定性伪随机：同一个国家每次算出来的落点必须一样，否则编号点每帧乱跳 */
+function hashStr(s){
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function seededRand(seed){
+  let s = (seed >>> 0) || 1;
+  return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; };
+}
+
+/* 展开某国节点：有 IP 经纬度的按真实位置，没有的在国土范围内螺旋散开 */
+function spreadSpots(cc, list){
+  const rnd = seededRand(hashStr(String(cc) + '#' + list.length));
+  const L = LOCAL_ACTIVE ? (window.LOCAL_MAPS || {})[LOCAL_ACTIVE] : null;
+  const c = L ? [L.w / 2, L.h / 2] : ((window.WORLD_CENTER || {})[cc] || [GEO_W / 2, GEO_H / 2]);
+  let bw = 42, bh = 30, bx = c[0] - 21, by = c[1] - 15;   // 港澳新这类没有独立轮廓的默认范围
+  const p = L ? null : document.querySelector(`.map-region[data-cc="${cc}"]`);
+  if (L) {
+    bw = L.w * 0.78; bh = L.h * 0.72;
+    bx = c[0] - bw / 2; by = c[1] - bh / 2;
+  } else if (p) {
+    try {
+      const b = p.getBBox();
+      if (b.width > 0) { bw = b.width; bh = b.height; bx = b.x; by = b.y; }
+    } catch (e) { /* noop */ }
+  }
+  const minR = 30 / Math.max(0.02, pxPerUnit());     // 屏幕上至少 30px 才点得开
+  const rx = Math.max(bw * 0.46, minR * 1.8);
+  const ry = Math.max(bh * 0.46, minR * 1.3);
+  // 港澳新这种国土装不下十几个点的，允许散到国土外；大块国土就都留在境内
+  const tiny = (bw < 26 || bh < 26) && !L;
+  // 局部地图里按真实区边界判定，点尽量落在陆地上
+  const localPaths = L ? [...document.querySelectorAll('#localRegions .lregion')] : [];
+  const inFill = L
+    ? ((x, y) => {
+        if (x < 2 || x > L.w - 2 || y < 2 || y > L.h - 2) return false;
+        for (const el of localPaths) {
+          try { if (el.isPointInFill(new DOMPoint(x, y))) return true; } catch (e) { /* noop */ }
+        }
+        return localPaths.length === 0;
+      })
+    : ((x, y) => {
+        if (tiny || !p || typeof p.isPointInFill !== 'function') return true;
+        try { return p.isPointInFill(new DOMPoint(x, y)); } catch (e) { return true; }
+      });
+  const clampIn = (x, y) => (L
+    ? [Math.min(L.w - 5, Math.max(5, x)), Math.min(L.h - 5, Math.max(5, y))]
+    : [x, y]);
+
+  // 先给有坐标的定位（同城多节点要互相让开，否则几个点完全重合）
+  const out = new Array(list.length);
+  const away = new Array(list.length).fill(false);   // 真实落地不在本国
+  const free = [];
+  list.forEach((n, i) => {
+    if (typeof n.lat === 'number' && typeof n.lon === 'number') {
+      let [x, y] = projectLL(n.lat, n.lon);
+      away[i] = !tiny && !inFill(x, y);              // 用原始坐标判定，避免避让后被误判
+      for (let step = 0; step < 8; step++) {
+        const close = out.some(o => o && Math.hypot(o[0] - x, o[1] - y) < minR * 0.9);
+        if (!close) break;
+        const a = step * 2.39996;
+        const nx = x + minR * 0.95 * Math.cos(a);
+        const ny = y + minR * 0.95 * Math.sin(a);
+        // 能留在国土内就往那个方向挪；实在挤不下（或本来就落地在境外）就自由挪
+        if (away[i] || tiny || inFill(nx, ny)) { x = nx; y = ny; }
+      }
+      out[i] = clampIn(x, y);
+    } else {
+      free.push(i);
+    }
+  });
+
+  // 其余沿黄金角铺开，尽量填满国土
+  const total = free.length;
+  free.forEach((i, k) => {
+    const ang = k * 2.39996 - 1.1;
+    const t = Math.sqrt((k + 1) / (total + 0.8));
+    let x = c[0] + Math.cos(ang) * rx * t;
+    let y = c[1] + Math.sin(ang) * ry * t;
+
+    // 不在国土内：先朝中心收缩，还不行就在 bbox 里随机采样找陆地
+    if (!inFill(x, y)) {
+      let fixed = false;
+      for (let s = 0.86; s > 0.1; s -= 0.12) {
+        const tx = c[0] + (x - c[0]) * s, ty = c[1] + (y - c[1]) * s;
+        if (inFill(tx, ty)) { x = tx; y = ty; fixed = true; break; }
+      }
+      if (!fixed) {
+        for (let n = 0; n < 90; n++) {
+          const sx = bx + rnd() * bw, sy = by + rnd() * bh;
+          if (inFill(sx, sy)) { x = sx; y = sy; fixed = true; break; }
+        }
+      }
+    }
+    // 别跟已有的点挤在一起（轻微重叠可接受，优先保证还在国土内）
+    for (let step = 0; step < 3; step++) {
+      const close = out.some(o => o && Math.hypot(o[0] - x, o[1] - y) < minR * 0.85);
+      if (!close) break;
+      const nx = x + minR * 0.95 * Math.cos(ang + step * 1.7);
+      const ny = y + minR * 0.95 * Math.sin(ang + step * 1.7);
+      if (inFill(nx, ny)) { x = nx; y = ny; } else break;
+    }
+    out[i] = clampIn(x, y);
+  });
+  return {spots: out, away};
+}
+
+function drawMap(){
+  if (mapView === 'topo' || LOCAL_ACTIVE) return;   // 拓扑/局部地图视图下别覆盖
+  if (!STATE) return;                               // 首帧还没有数据
+  const stats = ccStats();
+  const curCC = ((STATE.nodes || []).find(n => n.current) || {}).cc || '';
+  const sig = JSON.stringify([mapFilter, mapMode, curCC,
+    Object.entries(stats).map(([k, v]) => [k, v.count, v.best, v.purity])]);
+
+  if (sig !== mapSig) {
+    mapSig = sig;
+    document.querySelectorAll('.map-region').forEach(p => {
+      const st = stats[p.dataset.cc];
+      p.classList.toggle('has', !!st);
+      p.classList.toggle('sel', p.dataset.cc === mapFilter);
+      p.classList.toggle('cur', p.dataset.cc === curCC);
+      p.style.fill = st
+        ? ((mapMode === 'delay' ? colorDelay(st.best) : colorPurity(st.purity)) || '#20415c')
+        : '';
+    });
+  }
+  redrawPins();
+
+  const hint = document.getElementById('mapHint');
+  if (mapFilter) {
+    const st = stats[mapFilter];
+    const located = MAP_LIST.filter(n => typeof n.lat === 'number').length;
+    hint.innerHTML = `已选中 <b>${esc(st ? st.region : mapFilter)}</b> · ${MAP_LIST.length} 个节点`
+      + (located ? ` · <b>${located}</b> 个按 IP 真实位置` : '')
+      + (MAP_AWAY ? ` · <b style="color:#fcd34d">${MAP_AWAY}</b> 个落地在境外` : '')
+      + ` —— 点 <b>↻</b> 按 IP 精确定位 · 点数字切换`;
+  } else {
+    hint.textContent = `点国家/地区筛选 · 点海洋取消 · 滚轮缩放 · 拖动平移 · 共 ${Object.keys(stats).length} 个地区有节点`;
+  }
+
+  document.getElementById('mapLegend').innerHTML = mapMode === 'delay'
+    ? `<span><i style="background:#1d5c3a"></i>&lt;120ms</span>
+       <span><i style="background:#3f5720"></i>&lt;250ms</span>
+       <span><i style="background:#5c3f1b"></i>&lt;500ms</span>
+       <span><i style="background:#5c2222"></i>更慢/超时</span>
+       <span><i style="background:#20415c"></i>无数据</span>`
+    : `<span><i style="background:#1d5c3a"></i>85+ 极洁净</span>
+       <span><i style="background:#2c5a26"></i>70–84 良好</span>
+       <span><i style="background:#4d5520"></i>50–69 一般</span>
+       <span><i style="background:#5c2222"></i>&lt;50 较差</span>
+       <span><i style="background:#20415c"></i>未检测</span>`;
+}
+
+/* ══════════ 链路拓扑：用户端 → 代理入口 → 落地出口 ══════════ */
+const GEO_PAD = 6, GEO_W = 1000;
+const GEO_YTOP = 1.25 * Math.log(Math.tan(Math.PI / 4 + 0.4 * 89.9 * Math.PI / 180));
+const GEO_H = GEO_W * (2 * GEO_YTOP) / (2 * Math.PI) + GEO_PAD * 2;
+function millerY(lat){ return 1.25 * Math.log(Math.tan(Math.PI / 4 + 0.4 * lat * Math.PI / 180)); }
+function projectLL(lat, lon){
+  if (LOCAL_ACTIVE) return localProject(lat, lon);
+  // 坐标脏了（字符串 / 超范围 / 极点附近）会让 log 出 NaN，一路传染到 viewBox 变空白，
+  // 所以在这一层就夹住，别指望下游每题都判
+  let la = Number(lat), lo = Number(lon);
+  if (!Number.isFinite(la)) la = 0;
+  if (!Number.isFinite(lo)) lo = 0;
+  la = Math.max(-84, Math.min(84, la));
+  lo = Math.max(-180, Math.min(180, lo));
+  return [
+    (lo + 180) / 360 * GEO_W + GEO_PAD,
+    (GEO_YTOP - millerY(la)) / (2 * GEO_YTOP) * (GEO_H - 2 * GEO_PAD) + GEO_PAD
+  ];
+}
+
+let mapView = localStorage.getItem('vpntray.mapView') || 'ppl';
+let TOPO = null;
+let TOPO_NODE = '';
+let TOPO_EXIT_LABEL = '落地出口';
+
+function arcPath(a, b, k){
+  const [x1, y1] = a, [x2, y2] = b;
+  const dist = Math.hypot(x2 - x1, y2 - y1) || 1;
+  const mx = (x1 + x2) / 2, my = (y1 + y2) / 2 - dist * (k == null ? 0.17 : k);
+  return `M${x1.toFixed(1)},${y1.toFixed(1)} Q${mx.toFixed(1)},${my.toFixed(1)} ${x2.toFixed(1)},${y2.toFixed(1)}`;
+}
+
+function drawTopo(t){
+  const layer = document.getElementById('topoLayer');
+  const P = (t && t.points) || {};
+  // 没有实测落地出口时，第三条线画到节点 IP / 服务器所在地（虚线示意）
+  const kind = (t && t.exit_kind) || 'exit';
+  const exitLabel = kind === 'node_ip' ? '节点 IP 位置'
+                  : kind === 'entry_ip' ? '节点服务器' : '落地出口';
+  TOPO_EXIT_LABEL = exitLabel;
+  const estExit = !!(P.exit && P.exit.estimated);
+  // 主链路统一走绿色渐变；AI 专用通道的三条支线用各家品牌色
+  const marks = [
+    ['local', P.local, '#4ade80', '用户端'],
+    ['entry', P.entry, '#22c55e', '代理入口'],
+    ['exit',  P.exit,  '#16a34a', exitLabel],
+  ];
+  const aiOn = !!(STATE && STATE.ai && STATE.ai.enabled);
+  const AI_HQ = [
+    ['claude', { lat: 37.815, lon: -122.440, city: '旧金山', country: '美国', isp: 'Anthropic' }, '#D97757', 'Claude'],
+    ['codex',  { lat: 37.745, lon: -122.355, city: '旧金山', country: '美国', isp: 'OpenAI' },   '#10A37F', 'Codex'],
+    ['gemini', { lat: 37.422, lon: -122.084, city: '山景城', country: '美国', isp: 'Google' },   '#4285F4', 'Gemini'],
+  ];
+  if (aiOn) marks.push(...AI_HQ);
+  const pts = {};
+  marks.forEach(([k, p]) => {
+    if (p && p.lat != null && p.lon != null) pts[k] = projectLL(p.lat, p.lon);
+  });
+
+  const buf = [];
+  // 连线 + 沿线跑的光点
+  const chain = ['local', 'entry', 'exit'];
+  for (let i = 0; i < chain.length - 1; i++) {
+    const a = pts[chain[i]], b = pts[chain[i + 1]];
+    if (!a || !b) continue;
+    const d = arcPath(a, b);
+    const color = marks.find(m => m[0] === chain[i + 1])[2];
+    const dash = chain[i + 1] === 'exit' && estExit;
+    buf.push(`<path class="topo-glow" d="${d}" stroke="${color}" vector-effect="non-scaling-stroke"></path>`);
+    buf.push(`<path class="topo-link ${dash ? 'topo-est' : 'topo-flow'}" d="${d}" stroke="${color}" vector-effect="non-scaling-stroke"></path>`);
+    buf.push(`<circle r="2.7" fill="${color}"><animateMotion dur="2.6s" repeatCount="indefinite" path="${d}"/></circle>`);
+  }
+  // AI 专用通道：从落地出口再分出去三条，一条一家总部
+  if (aiOn && pts.exit) {
+    AI_HQ.forEach(([k, , color], idx) => {
+      const b = pts[k];
+      if (!b) return;
+      // 三条弧线各自不同的弯曲度，免得叠成一条
+      const d = arcPath(pts.exit, b, 0.10 + idx * 0.055);
+      buf.push(`<path class="topo-glow" d="${d}" stroke="${color}" opacity=".42" vector-effect="non-scaling-stroke"></path>`);
+      buf.push(`<path class="topo-link topo-ai" d="${d}" stroke="${color}" vector-effect="non-scaling-stroke"></path>`);
+      buf.push(`<circle r="2.3" fill="${color}"><animateMotion dur="${3.2 + idx * 0.5}s" repeatCount="indefinite" path="${d}"/></circle>`);
+    });
+  }
+  // 三个点 + 标签（近邻点自动上下避让，否则标签会叠在一起）
+  const placed = [];
+  // 三家总部在全球视角下几乎同一个像素，靠标签纵向错开才能分清
+  const AI_SHIFT = { claude: -14, codex: 0, gemini: 14 };
+  marks.forEach(([k, p, color, label]) => {
+    const xy = pts[k];
+    if (!xy) return;
+    const [x, y] = xy;
+    const rightSide = x < 860;
+    const dx = rightSide ? 9 : -9;
+    const anchor = rightSide ? 'start' : 'end';
+    let ly = y + 4 + (AI_SHIFT[k] || 0);
+    placed.forEach(o => {
+      if (Math.abs(o.x - x) < 110 && Math.abs(o.ly - ly) < 15) ly = o.ly + 15;
+    });
+    placed.push({x, ly});
+    const sy = ly + 11;
+    const sub = p.city || p.country || p.cc || '';
+    const tip = [label, p.city, p.country, p.ip, p.isp].filter(Boolean).join(' · ');
+    buf.push(`<g class="topo-dot">
+      <title>${esc(tip)}</title>
+      <circle class="ring" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="6" stroke="${color}"></circle>
+      <circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4.2" fill="${color}"></circle>
+      <line x1="${(x + (rightSide ? 5 : -5)).toFixed(1)}" y1="${y.toFixed(1)}"
+            x2="${(x + dx * 0.8).toFixed(1)}" y2="${(ly - 3).toFixed(1)}" stroke="${color}" opacity=".45"></line>
+      <text class="topo-label" x="${(x + dx).toFixed(1)}" y="${ly.toFixed(1)}" text-anchor="${anchor}">${esc(label)}</text>
+      <text class="topo-sub" x="${(x + dx).toFixed(1)}" y="${sy.toFixed(1)}" text-anchor="${anchor}">${esc(sub)}</text>
+    </g>`);
+  });
+  layer.innerHTML = buf.join('');
+
+  // 自动把视野收到链路范围上，否则三个点会挤成一团
+  const lls = marks.filter(m => pts[m[0]]).map(m => [m[1].lat, m[1].lon]);
+  if (lls.length >= 2) focusLL(lls);
+  else if (lls.length === 1) focusLL(lls, 2.2);
+}
+
+async function loadTopo(force){
+  if (mapView !== 'topo') return;
+  if (!force && TOPO && Date.now() - TOPO.at < 90000) { drawTopo(TOPO); return; }
+  const hint = document.getElementById('mapHint');
+  hint.textContent = '正在定位链路节点…';
+  const r = await api('/api/topo', {});
+  if (!r || !r.ok) { hint.textContent = '链路数据获取失败，点右上角重试'; return; }
+  TOPO = Object.assign({ at: Date.now() }, r.topo);
+  drawTopo(TOPO);
+  const p = TOPO.points || {};
+  const seq = [p.local, p.entry, p.exit].filter(x => x && (x.city || x.cc))
+    .map(x => x.city || x.cc).join(' → ');
+  if (TOPO.node && seq) {
+    hint.innerHTML = `<b>${esc(TOPO.node)}</b>${TOPO.delay != null ? ' · ' + TOPO.delay + 'ms' : ''} · ${esc(seq)}`
+      + (STATE && STATE.ai && STATE.ai.enabled
+        ? `<span style="color:#7f93a8"> · AI 支线 → Claude / Codex / Gemini</span>` : '')
+      + (TOPO.hint ? `<span style="color:var(--warn)"> · ${esc(TOPO.hint)}</span>` : '');
+  } else {
+    hint.textContent = TOPO.hint || '缺少链路位置数据';
+  }
+  document.getElementById('mapLegend').innerHTML =
+    `<span><i style="background:#4ade80"></i>用户端</span>
+     <span><i style="background:#22c55e"></i>代理入口</span>
+     <span><i style="background:#16a34a"></i>${TOPO_EXIT_LABEL}</span>`
+    + (STATE && STATE.ai && STATE.ai.enabled
+      ? `<span><i style="background:#D97757"></i>Claude</span>
+         <span><i style="background:#10A37F"></i>Codex</span>
+         <span><i style="background:#4285F4"></i>Gemini</span>`
+      : '');
+}
+
+function setMapView(v){
+  mapView = (v === 'topo') ? 'topo' : 'ppl';
+  localStorage.setItem('vpntray.mapView', mapView);
+  [...document.getElementById('mapView').children]
+    .forEach(b => b.classList.toggle('act', b.dataset.v === mapView));
+  const topo = mapView === 'topo';
+  if (topo && LOCAL_ACTIVE) closeLocal(true);        // 局部地图只属于「节点分布」
+  document.getElementById('mapWrap').classList.toggle('mono', topo);
+  document.getElementById('topoLayer').style.display = topo ? '' : 'none';
+  document.getElementById('mapPins').style.display = topo ? 'none' : '';
+  document.getElementById('mapMode').style.display = topo ? 'none' : '';
+  if (topo) { hideCluster(); loadTopo(true); }
+  else if (mapFilter && (window.LOCAL_MAPS || {})[mapFilter]) openLocal(mapFilter);
+  else { resetVB(); mapSig = ''; drawMap(); }
+}
+
+let _clusterAnchor = null;
+
+// 弹层是 position:fixed，只按 pin 的屏幕坐标算一次就固定在那儿了；
+// 页面一滚、窗口一缩，它就飘到别处去。所以每次滚动/缩放都重算，
+// pin 滚出视口就干脆收起来。
+function placeCluster(){
+  const box = $('#clusterBox');
+  if (!_clusterAnchor || !box.classList.contains('on')) return;
+  const r = _clusterAnchor.getBoundingClientRect();
+  const vis = r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
+  if (!vis) { hideCluster(); return; }
+  box.style.left = Math.max(8, Math.min(r.left - 20, window.innerWidth - 210)) + 'px';
+  box.style.top = Math.min(r.bottom + 6, window.innerHeight - 200) + 'px';
+}
+
+function showCluster(idx, anchor){
+  const cl = mapClusters[idx];
+  if (!cl || !STATE) return;
+  const box = $('#clusterBox');
+  const curCC = ((STATE.nodes || []).find(n => n.current) || {}).cc;
+  const items = cl.items.slice().sort((a, b) => b.st.count - a.st.count);
+  box.innerHTML = items.map(it => `
+    <div class="it${it.cc === curCC ? ' cur' : ''}" data-cc="${esc(it.cc)}">
+      <span>${esc(it.st.flag || '')}</span><span>${esc(it.st.region)}</span>
+      <span class="c">${it.st.count}${it.st.best ? ' · ' + it.st.best + 'ms' : ''}</span>
+    </div>`).join('');
+  _clusterAnchor = anchor;
+  box.classList.add('on');
+  placeCluster();
+}
+
+function hideCluster(){
+  _clusterAnchor = null;
+  $('#clusterBox').classList.remove('on');
+}
+
+window.addEventListener('scroll', () => placeCluster(), {passive: true});
+window.addEventListener('resize', () => placeCluster());
+
+function pickCC(cc){
+  mapFilter = (cc && cc !== mapFilter) ? cc : null;
+  localStorage.setItem('vpn_map_cc', mapFilter || '');
+  mapSig = '';
+  renderNodes();          // 先刷新列表，地图编号要跟列表顺序对齐
+  // 港澳这种世界地图上画不出来的，换一张单独的局部地图
+  if (mapFilter && (window.LOCAL_MAPS || {})[mapFilter]) {
+    openLocal(mapFilter);
+    hideCluster();
+    return;
+  }
+  if (LOCAL_ACTIVE) closeLocal(true);
+  drawMap();
+  hideCluster();
+  // 选中就自动放大到该区域（节点逐个展开），取消则回到全球视角
+  if (mapFilter) {
+    let sp = 0.085;
+    const p = document.querySelector(`.map-region[data-cc="${mapFilter}"]`);
+    if (p) {
+      try {
+        const b = p.getBBox();
+        const big = Math.max(b.width, b.height);
+        if (big > 0) sp = Math.max(0.05, Math.min(0.16, big / Math.max(1, BASE.w) / 0.65));
+      } catch (e) { /* noop */ }
+    }
+    focusCC(mapFilter, sp);
+  } else {
+    resetVB();
+  }
+}
+
+/* ══════════ 港澳局部地图 ══════════ */
+let LOCAL_ACTIVE = '';
+
+function localProject(lat, lon){
+  const L = (window.LOCAL_MAPS || {})[LOCAL_ACTIVE];
+  if (!L) return [0, 0];
+  return [
+    L.offX + (lon - L.lon0) * L.kx * L.scale,
+    L.offY + (L.latMax - lat) * L.scale,
+  ];
+}
+
+function openLocal(cc){
+  const L = (window.LOCAL_MAPS || {})[cc];
+  if (!L || !(L.w > 0) || !(L.h > 0)) {   // 定义坏了就直接不切，别写脏状态
+    toast('这个地区没有可用的下钻地图');
+    return;
+  }
+  const districts = Array.isArray(L.districts)
+    ? L.districts.filter(d => d && typeof d.d === 'string' && d.d)
+    : [];
+  // 元素先拿到手再改 LOCAL_ACTIVE：中途返回会留下「LOCAL_ACTIVE 已换、DOM 还是旧的」
+  // 这种半截状态，之后每次 redrawPins 都按局部坐标算，点会全部飘走
+  const box = document.getElementById('localMap');
+  const g = document.getElementById('localRegions');
+  const wrapBox = document.getElementById('mapWrap');
+  if (!box || !g || !wrapBox) { toast('地图资源缺失，无法下钻'); return; }
+  LOCAL_ACTIVE = cc;
+  box.setAttribute('viewBox', `0 0 ${L.w} ${L.h}`);
+  // 容器比例跟着这个国家走，别让地图缩在中间一小块；太扁/太瘦的稍微补一下
+  let cw = L.w, ch = L.h;
+  if (cw / ch > 1.85) ch = cw / 1.85;
+  else if (cw / ch < 0.55) cw = ch * 0.55;
+  wrapBox.style.aspectRatio = `${cw} / ${ch}`;
+  // 区边界：底色浅、描边淡，鼠标不动也不抢事件
+  g.innerHTML = districts.map(d =>
+    `<path class="lregion" data-name="${esc(d.name || '')}" d="${esc(d.d)}"><title>${esc(d.name || '')}</title></path>`
+  ).join('');
+
+  document.getElementById('map').style.display = 'none';
+  document.getElementById('topoLayer').style.display = 'none';
+  document.getElementById('map').parentElement.classList.remove('mono');
+  box.style.display = '';
+  document.getElementById('localBack').style.display = '';
+  document.getElementById('zoomIn').style.display = 'none';
+  document.getElementById('zoomOut').style.display = 'none';
+  document.getElementById('zoomReset').style.display = 'none';
+  document.getElementById('mapPins').style.display = '';
+  redrawPins();
+  const st = ccStats()[cc];
+  document.getElementById('mapHint').innerHTML =
+    `已选中 <b>${esc(st ? st.region : cc)}</b> · ${st ? st.count : 0} 个节点 —— 点编号直接切换 · 点「返回世界地图」取消`;
+  document.getElementById('mapLegend').innerHTML =
+    `<span><i style="background:#1d5c3a"></i>&lt;120ms</span>
+     <span><i style="background:#3f5720"></i>&lt;250ms</span>
+     <span><i style="background:#5c3f1b"></i>&lt;500ms</span>
+     <span><i style="background:#5c2222"></i>更慢/超时</span>
+     <span><i style="background:#20415c"></i>无数据</span>`;
+}
+
+function closeLocal(keepFilter){
+  if (!LOCAL_ACTIVE) return;
+  LOCAL_ACTIVE = '';
+  document.getElementById('mapWrap').style.aspectRatio = `${BASE.w} / ${BASE.h}`;
+  document.getElementById('localMap').style.display = 'none';
+  document.getElementById('map').style.display = '';
+  document.getElementById('localBack').style.display = 'none';
+  document.getElementById('zoomIn').style.display = '';
+  document.getElementById('zoomOut').style.display = '';
+  document.getElementById('zoomReset').style.display = '';
+  if (!keepFilter) {
+    mapFilter = null;
+    localStorage.setItem('vpn_map_cc', '');
+    renderNodes();
+  }
+  mapSig = '';
+  drawMap();
+  resetVB();
+}
+
+async function selectNode(name, el){
+  if (el) el.style.opacity = .5;
+  const r = await api('/api/select', {name});
+  if (el) el.style.opacity = 1;
+  toast(r.ok ? '正在切换到 ' + name : '切换失败：' + (r.error || ''));
+  setTimeout(poll, 400);
+}
+
+/* ───────── AI 专项卡片 ───────── */
+let aiSelectSig = '';
+
+function renderAI(){
+  const a = (STATE && STATE.ai) || {};
+  $('#swAi').classList.toggle('on', !!a.enabled);
+
+  $('#aiNode').textContent = a.node || '未选择（用下方下拉切换）';
+  const bits = [];
+  if (a.delay) bits.push(a.delay + 'ms');
+  if (a.purity != null) bits.push(`纯净度 ${a.purity}${a.purity_grade ? ' ' + a.purity_grade : ''}`);
+  if (a.exit_cc) bits.push('出口 ' + a.exit_cc);
+  if (a.exit_ip) bits.push(a.exit_ip);
+  $('#aiMeta').textContent = bits.length
+    ? bits.join(' · ')
+    : `${a.domains || 0} 个 AI 域名走专用通道 · 点「测出口 IP」拿落地信息`;
+
+  const warn = $('#aiWarn'), okEl = $('#aiOk');
+  warn.className = 'ai-warn'; okEl.className = 'ai-ok';
+  if (!a.enabled) {
+    // 关掉时不提示
+  } else if (a.tz_bad) {
+    warn.className = 'ai-warn on';
+    warn.textContent = `⚠ ${a.tz_msg || '时区与节点地区不一致'}。`;
+  } else if (a.exit_cc && a.purity != null && a.purity < 70) {
+    warn.className = 'ai-warn on';
+    warn.textContent = `⚠ 出口纯净度只有 ${a.purity}（${a.purity_grade || ''}），机房/代理标记容易被风控，建议换住宅节点。`;
+  } else if (a.exit_cc && a.purity != null) {
+    okEl.className = 'ai-ok on';
+    okEl.textContent = `✓ 出口 ${a.exit_cc} · ${a.node_tz || ''} · 纯净度 ${a.purity}，可用于 Claude / Codex`;
+  } else if (a.node && /美|US|日|JP|韩|KR|德|DE|英|GB|荷|NL|法|FR/.test(a.node)) {
+    okEl.className = 'ai-ok on';
+    okEl.textContent = `✓ 节点地区对 Claude 友好。点「测出口 IP」确认落地与纯净度。`;
+  }
+
+  $('#aiTz').textContent = a.node_tz
+    ? `节点 ${a.node_tz} · 本机 ${a.sys_tz || '?'}`
+    : '';
+
+  const nodes = (STATE.nodes || []).slice().sort((x, y) => (x.delay || 1e9) - (y.delay || 1e9));
+  const sel = $('#aiSelect');
+  const sig = nodes.length + '|' + (a.node || '') + '|' +
+    nodes.map(n => n.name + n.delay + n.purity).join(',');
+  if (sig !== aiSelectSig && document.activeElement !== sel) {
+    aiSelectSig = sig;
+    sel.innerHTML = nodes.map(n => {
+      const t = [n.name, n.delay ? n.delay + 'ms' : '', n.purity != null ? '纯净度' + n.purity : '']
+        .filter(Boolean).join(' · ');
+      return `<option value="${esc(n.name)}"${n.name === a.node ? ' selected' : ''}>${esc(t)}</option>`;
+    }).join('');
+  }
+}
+
+/* 节点行里那些「检测完之后才会变」的小字段，两处渲染共用 */
+function nodeTip(n){
+  const tags = (n.purity_tags || []).join(' · ');
+  return n.purity === null || n.purity === undefined
+    ? '未检测纯净度'
+    : `${n.purity_grade || ''}${tags ? ' · ' + tags : ''}${n.purity_ip ? ' · ' + n.purity_ip : ''}`;
+}
+function nodeLocHtml(n){
+  if (!(n.city || n.purity_ip)) return '';
+  const t = esc([n.city, n.purity_ip].filter(Boolean).join(' · '));
+  return `<span class="loc" title="${t}"><span class="ct">${esc(cityZh(n.city) || '—')}</span>`
+    + (n.purity_ip ? `<span class="ip">${esc(n.purity_ip)}</span>` : '') + `</span>`;
+}
+
+/* 增量渲染缓存：结构不变时只改变化的文字和顺序，不再整表 innerHTML 重建。
+   100 个节点每 1.5 秒重建一次约 8ms，改完 0.1ms 级。 */
+let listCache = null;
+
+function buildListCache(box){
+  const regions = new Map();
+  for (const rEl of box.querySelectorAll('.region')){
+    const nodes = new Map();
+    for (const nEl of rEl.querySelectorAll('.node')){
+      nodes.set(nEl.dataset.name, {
+        el: nEl,
+        idx: nEl.querySelector('.idx'),
+        nm: nEl.querySelector('.nm'),
+        purity: nEl.querySelector('.purity'),
+        mbps: nEl.querySelector('.mbps'),
+        badge: nEl.querySelector('.badge'),
+        loc: nEl.querySelector('.loc'),
+      });
+    }
+    regions.set(rEl.dataset.region, {
+      el: rEl,
+      list: rEl.querySelector('.node-list'),
+      head: rEl.querySelector('.region-head'),
+      cnt: rEl.querySelector('.cnt'),
+      hPurity: rEl.querySelector('.region-head .purity'),
+      hBadge: rEl.querySelector('.region-head .badge'),
+      curTag: rEl.querySelector('.cur-tag'),
+      nodes,
+    });
+  }
+  return regions;
+}
+
+function patchList(order, groups, cmp, mapFilter, box){
+  const c = listCache;
+  if (!c || !c.regions) return false;
+  MAP_LIST = [];
+  let idx = 0;
+  const regionEls = [];
+  for (const region of order){
+    const g = groups[region];
+    const rg = c.regions.get(region);
+    if (!rg) return false;                       // 地区是新的 → 交回全量重建
+    const sorted = g.items.slice().sort(cmp);
+    const isCur = g.items.some(i => i.current);
+    const bestDelay = Math.min(...g.items.map(i => i.delay || 1e9));
+    const bestPurity = Math.max(...g.items.map(i => i.purity ?? -1));
+
+    rg.cnt.textContent = g.items.length + ' 个';
+    if (bestPurity >= 0){
+      if (!rg.hPurity){
+        const el = document.createElement('span');
+        el.style.minWidth = '38px';
+        rg.head.insertBefore(el, rg.hBadge);
+        rg.hPurity = el;
+      }
+      rg.hPurity.className = 'purity ' + pClass(bestPurity);
+      rg.hPurity.textContent = bestPurity;
+    } else if (rg.hPurity){
+      rg.hPurity.remove(); rg.hPurity = null;
+    }
+    rg.hBadge.className = 'badge ' + delayClass(bestDelay === 1e9 ? null : bestDelay);
+    rg.hBadge.textContent = bestDelay === 1e9 ? '—' : bestDelay + 'ms';
+    if (isCur && !rg.curTag){
+      const el = document.createElement('span');
+      el.className = 'cur-tag'; el.textContent = '当前';
+      rg.head.insertBefore(el, rg.hPurity || rg.hBadge);
+      rg.curTag = el;
+    } else if (!isCur && rg.curTag){
+      rg.curTag.remove(); rg.curTag = null;
+    }
+
+    const order2 = [];
+    for (const n of sorted){
+      idx++;
+      MAP_LIST.push({...n, idx});
+      const r = rg.nodes.get(n.name);
+      if (!r) return false;                      // 出现新节点 → 交回全量重建
+      r.el.classList.toggle('cur', !!n.current);
+      r.el.title = nodeTip(n);
+      r.idx.textContent = idx;
+      r.idx.classList.toggle('on', !!mapFilter);
+      r.purity.className = 'purity ' + pClass(n.purity);
+      r.purity.textContent = n.purity ?? '—';
+      r.mbps.textContent = n.mbps ? n.mbps + 'M' : '';
+      r.badge.className = 'badge ' + delayClass(n.delay);
+      r.badge.textContent = delayText(n.delay);
+      const wantLoc = nodeLocHtml(n);
+      if (wantLoc){
+        const tmp = document.createElement('div');
+        tmp.innerHTML = wantLoc;
+        const fresh = tmp.firstElementChild;
+        if (r.loc) r.loc.replaceWith(fresh);
+        else r.nm.insertAdjacentElement('afterend', fresh);
+        r.loc = fresh;
+      } else if (r.loc){
+        r.loc.remove(); r.loc = null;
+      }
+      order2.push(r.el);
+    }
+    for (const el of order2) rg.list.appendChild(el);   // appendChild 自带移动，顺序即对
+    regionEls.push(rg.el);
+  }
+  for (const el of regionEls) box.appendChild(el);
+  return true;
+}
+
+function renderNodes(){
+  const s = STATE;
+  if (!s || !Array.isArray(s.nodes)) return;
+  const q = ($('#search').value || '').trim().toLowerCase();
+  const sortBy = $('#sortBy').value || 'delay';
+  const nodes = (s.nodes || []).filter(n =>
+    (!mapFilter || n.cc === mapFilter) &&
+    (!q || String(n.name || '').toLowerCase().includes(q)
+        || String(n.region || '').toLowerCase().includes(q)));
+
+  const withDelay = nodes.filter(n => n.delay).length;
+  const withPurity = nodes.filter(n => n.purity !== null && n.purity !== undefined).length;
+  const scope = mapFilter ? `筛选 ${mapFilter} · ` : '';
+  $('#listHint').textContent =
+    `${scope}${nodes.length} 个节点${q ? '（已搜索）' : ''} · ${withDelay} 有延迟 · ${withPurity} 有纯净度`
+    + (s.busy ? ` · ${s.busy}…` : '') + '  ·  点一下即切换';
+
+  const box = $('#nodes');
+
+  if (!nodes.length){
+    listCache = null;
+    MAP_LIST = [];
+    box.innerHTML = s.sub && s.sub.url
+      ? `<div style="padding:30px;text-align:center;color:#5a6a80">没有匹配的节点<br><span style="font-size:12px">试试清空搜索框，或点右侧「重启内核」</span></div>`
+      : `<div style="padding:34px 20px;text-align:center;color:#7f8ea6;line-height:1.9">
+           <div style="font-size:15px;color:#e6edf6;font-weight:600;margin-bottom:6px">先填个订阅链接</div>
+           把机场 / 服务商提供的 <b>Clash 订阅地址</b> 粘贴到左边「订阅」输入框，<br>
+           点「保存并连接」，这里就会出现你的节点列表。
+         </div>`;
+    return;
+  }
+
+  // 地区名是从节点名里切出来的外部字符串，可能恰好是 "__proto__"/"constructor"。
+  // 用普通 {} 当字典时这类键会走原型链拿到 Function，再 .items.push 直接抛错。
+  const groups = Object.create(null);
+  for (const n of nodes) {
+    const rg = String(n.region || '其他');
+    (groups[rg] ||= {flag:n.flag, items:[]}).items.push(n);
+  }
+
+  const keyOf = {
+    delay: n => (n.delay || 1e9),
+    purity: n => -(n.purity ?? -1),
+    mbps: n => -(n.mbps ?? -1),
+    name: n => String(n.name || ''),
+  }[sortBy] || (n => (n.delay || 1e9));
+  const cmp = (a, b) => {
+    const ka = keyOf(a), kb = keyOf(b);
+    if (typeof ka === 'string') return ka.localeCompare(kb);
+    return ka - kb;
+  };
+
+  const order = Object.keys(groups).sort((a, b) => {
+    const ga = groups[a].items.slice().sort(cmp)[0];
+    const gb = groups[b].items.slice().sort(cmp)[0];
+    return cmp(ga, gb);
+  });
+
+  // 结构签名：地区与节点集合换了就必须重建 DOM
+  const structSig = order.map(r =>
+    r + '=' + groups[r].items.map(i => i.name).sort().join(',')).join('|')
+    + '~' + sortBy + '~' + (mapFilter || '') + '~' + q + '~' + [...collapsed].sort().join(',');
+  // 内容签名：只有这些字段变了才需要动 DOM
+  const valSig = order.map(r => groups[r].items.slice().sort(cmp).map(n =>
+    [n.name, n.delay || '', n.purity ?? '', n.mbps ?? '', n.current ? 1 : 0,
+     n.city || '', n.purity_ip || ''].join('\u0001')).join('\u0002')).join('\u0003');
+
+  if (listCache && listCache.structSig === structSig){
+    if (listCache.valSig === valSig) return;      // 一个 DOM 都不碰
+    try {
+      if (patchList(order, groups, cmp, mapFilter, box)){
+        listCache.valSig = valSig;
+        return;
+      }
+    } catch (e){ console.warn('节点列表增量更新失败，回退全量重建', e); }
+    listCache = null;
+  }
+
+  let html = '';
+  MAP_LIST = [];
+  let idx = 0;
+  for (const region of order){
+    const g = groups[region];
+    const sorted = g.items.slice().sort(cmp);
+    const isCur = g.items.some(i => i.current);
+    const col = collapsed.has(region) ? ' collapsed' : '';
+    const bestDelay = Math.min(...g.items.map(i => i.delay || 1e9));
+    const bestPurity = Math.max(...g.items.map(i => i.purity ?? -1));
+    html += `<div class="region${col}" data-region="${esc(region)}">
+      <div class="region-head">
+        <span class="chev">▼</span>
+        <span class="fl">${esc(g.flag || '')}</span>
+        <span class="nm">${esc(region)}</span>
+        <span class="cnt">${g.items.length} 个</span>
+        ${isCur ? '<span class="cur-tag">当前</span>' : ''}
+        ${bestPurity >= 0 ? `<span class="purity ${pClass(bestPurity)}" style="min-width:38px">${bestPurity}</span>` : ''}
+        <span class="badge ${delayClass(bestDelay===1e9?null:bestDelay)}" style="padding:1px 6px;border-radius:6px">${bestDelay===1e9?'—':bestDelay+'ms'}</span>
+      </div>
+      <div class="node-list">`;
+    for (const n of sorted){
+      idx++;
+      MAP_LIST.push({...n, idx});
+      html += `<div class="node${n.current?' cur':''}" data-name="${esc(n.name)}" title="${esc(nodeTip(n))}">
+        <span class="idx${mapFilter ? ' on' : ''}">${idx}</span>
+        <span class="nm">${esc(n.name)}</span>
+        ${nodeLocHtml(n)}
+        <span class="ty">${esc(n.type||'')}</span>
+        <span class="purity ${pClass(n.purity)}">${n.purity ?? '—'}</span>
+        <span class="mbps">${n.mbps ? n.mbps + 'M' : ''}</span>
+        <span class="badge ${delayClass(n.delay)}">${delayText(n.delay)}</span>
+      </div>`;
+    }
+    html += `</div></div>`;
+  }
+  box.innerHTML = html;
+  listCache = { structSig, valSig, regions: buildListCache(box) };
+}
+
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/* ip-api 返回的是英文城市名，常见的翻成中文，没收录的直接显示原文 */
+const CITY_ZH = {
+  'Hong Kong':'香港','Kowloon':'九龙','Kwai Chung':'葵涌','Tsuen Wan':'荃湾','Sha Tin':'沙田',
+  'Chai Wan':'柴湾','Central':'中环','Wan Chai':'湾仔','Mong Kok':'旺角','Tai Po':'大埔',
+  'Singapore':'新加坡','Jurong':'裕廊','Tokyo':'东京','Osaka':'大阪','Nagoya':'名古屋',
+  'Seoul':'首尔','Busan':'釜山','Taipei':'台北','Kaohsiung':'高雄','Macau':'澳门',
+  'Los Angeles':'洛杉矶','San Jose':'圣何塞','Seattle':'西雅图','New York':'纽约',
+  'Chicago':'芝加哥','Dallas':'达拉斯','Ashburn':'阿什本','Fremont':'弗里蒙特',
+  'San Francisco':'旧金山','Silicon Valley':'硅谷','Miami':'迈阿密','Atlanta':'亚特兰大',
+  'Phoenix':'凤凰城','Denver':'丹佛','Portland':'波特兰','Las Vegas':'拉斯维加斯',
+  'Frankfurt':'法兰克福','Frankfurt am Main':'法兰克福','Amsterdam':'阿姆斯特丹',
+  'London':'伦敦','Paris':'巴黎','Berlin':'柏林','Vienna':'维也纳','Madrid':'马德里',
+  'Milan':'米兰','Zurich':'苏黎世','Stockholm':'斯德哥尔摩','Helsinki':'赫尔辛基',
+  'Warsaw':'华沙','Prague':'布拉格','Budapest':'布达佩斯','Bucharest':'布加勒斯特',
+  'Sofia':'索非亚','Riga':'里加','Vilnius':'维尔纽斯','Tallinn':'塔林','Kyiv':'基辅',
+  'Dublin':'都柏林','Brussels':'布鲁塞尔','Copenhagen':'哥本哈根','Oslo':'奥斯陆',
+  'Lisbon':'里斯本','Rome':'罗马','Barcelona':'巴塞罗那','Munich':'慕尼黑',
+  'Kuala Lumpur':'吉隆坡','Cyberjaya':'赛城','Manila':'马尼拉','Bangkok':'曼谷',
+  'Hanoi':'河内','Ho Chi Minh City':'胡志明市','Jakarta':'雅加达','Phnom Penh':'金边',
+  'Sydney':'悉尼','Melbourne':'墨尔本','Brisbane':'布里斯班','Auckland':'奥克兰',
+  'Toronto':'多伦多','Vancouver':'温哥华','Montreal':'蒙特利尔',
+  'Mumbai':'孟买','New Delhi':'新德里','Dubai':'迪拜','Istanbul':'伊斯坦布尔',
+  'Moscow':'莫斯科','Tel Aviv':'特拉维夫','São Paulo':'圣保罗','Sao Paulo':'圣保罗',
+  'Buenos Aires':'布宜诺斯艾利斯','Santiago':'圣地亚哥','Mexico City':'墨西哥城',
+  'Bogotá':'波哥大','Lima':'利马','Johannesburg':'约翰内斯堡','Cairo':'开罗',
+};
+function cityZh(c){
+  if (!c) return '';
+  return CITY_ZH[c] || c;
+}
+
+/* ───────── 流量曲线 ───────── */
+function drawChart(){
+  const c = $('#chart'), ctx = c.getContext('2d');
+  const w = c.width, h = c.height;
+  ctx.clearRect(0, 0, w, h);
+  const max = Math.max(2048, ...hist.up, ...hist.down) * 1.15;
+
+  // 网格
+  ctx.strokeStyle = '#17202c'; ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++){
+    const y = h * i / 4;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  const draw = (arr, color, fill) => {
+    if (arr.length < 2) return;
+    const step = w / (HIST_MAX - 1);
+    ctx.beginPath();
+    arr.forEach((v, i) => {
+      const x = i * step, y = h - (v / max) * (h - 8) - 3;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.stroke();
+    if (fill){
+      ctx.lineTo((arr.length - 1) * step, h); ctx.lineTo(0, h); ctx.closePath();
+      const g = ctx.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, fill); g.addColorStop(1, 'transparent');
+      ctx.fillStyle = g; ctx.fill();
+    }
+  };
+  draw(hist.down, '#22c55e', '#22c55e2e');
+  draw(hist.up, '#3b82f6', '#3b82f622');
+
+  ctx.fillStyle = '#3d4b60'; ctx.font = '11px ui-monospace,Consolas,monospace';
+  ctx.fillText(fmt(max) + '/s', 6, 13);
+}
+
+/* ───────── 事件 ───────── */
+$('#nodes').addEventListener('click', async e => {
+  const head = e.target.closest('.region-head');
+  if (head){
+    const region = head.parentElement.dataset.region;
+    collapsed.has(region) ? collapsed.delete(region) : collapsed.add(region);
+    localStorage.setItem('vpn_collapsed', JSON.stringify([...collapsed]));
+    head.parentElement.classList.toggle('collapsed');
+    return;
+  }
+  const node = e.target.closest('.node');
+  if (!node) return;
+  await selectNode(node.dataset.name, node);
+});
+
+$('#search').addEventListener('input', renderNodes);
+
+/* 控制类按钮统一出口：失败说原因，成功才报「已开启」。
+   调用方无论成败都要 setTimeout(poll)，让开关拨回后端的真实状态。 */
+function okOr(r, msg){
+  if (r && r.ok === false) { toast('失败：' + (r.error || '未知错误')); return false; }
+  toast(msg);
+  return true;
+}
+
+$('#modeSeg').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-mode]');
+  if (!b) return;
+  const r = await api('/api/mode', {mode: b.dataset.mode});
+  okOr(r, '模式：' + b.textContent);
+  setTimeout(poll, 300);
+});
+
+$('#swSysproxy').addEventListener('click', async () => {
+  const on = !STATE.sysproxy;
+  const r = await api('/api/sysproxy', {on});
+  okOr(r, on ? '系统代理已开启' : '系统代理已关闭');
+  setTimeout(poll, 600);
+});
+$('#swAutostart').addEventListener('click', async () => {
+  const on = !STATE.autostart;
+  const r = await api('/api/autostart', {on});
+  okOr(r, on ? '已设置开机自启' : '已取消开机自启');
+  setTimeout(poll, 400);
+});
+$('#swAutoBest').addEventListener('click', async () => {
+  const on = !STATE.auto_best;
+  const r = await api('/api/auto_best', {on});
+  okOr(r, on ? '自动优选已开启' : '自动优选已关闭');
+  setTimeout(poll, 300);
+});
+$('#swHeal').addEventListener('click', async () => {
+  const on = !STATE.heal;
+  const r = await api('/api/heal', {on});
+  okOr(r, on ? '节点自愈已开启' : '节点自愈已关闭');
+  setTimeout(poll, 300);
+});
+
+/* ── 地图刷新 / 进度条 ── */
+const PROG_NAME = {purity: "纯净度检测", speed: "带宽测速", delay: "刷新延迟", update: "更新"};
+
+function renderProgress(){
+  const p = (STATE && STATE.progress) || {};
+  const active = !!p.kind;
+  const box = $('#mapProg'), bar = $('#mapProgBar'), barBox = $('#mapProgBarBox');
+  const txt = $('#mapProgText'), btn = $('#mapRefresh');
+
+  box.classList.toggle('on', active);
+  btn.classList.toggle('busy', active);
+  btn.disabled = active;
+  btn.title = mapMode === 'purity' ? "重新检测全部节点纯净度" : "刷新全部节点延迟";
+
+  if (!active) {
+    bar.style.width = '0%';
+    barBox.classList.remove('indet');
+    txt.textContent = '';
+    return;
+  }
+  const name = PROG_NAME[p.kind] || '处理中';
+  if (p.total > 0) {
+    const pct = Math.round((p.done || 0) / p.total * 100);
+    barBox.classList.remove('indet');
+    bar.style.width = pct + '%';
+    txt.textContent = `${name} ${p.done}/${p.total} · ${pct}%`;
+  } else {
+    barBox.classList.add('indet');
+    txt.textContent = `${name}…`;
+  }
+}
+
+$('#mapRefresh').addEventListener('click', async () => {
+  if (mapView === 'topo') {
+    toast('重新定位链路节点…');
+    TOPO = null;
+    await loadTopo(true);
+    return;
+  }
+  const busyNow = (STATE && STATE.progress && STATE.progress.kind) || STATE.probing;
+  if (busyNow) { toast('正在检测中，请稍候…'); return; }
+  if (mapMode === 'purity') {
+    // 选中了某个国家/地区就只测它，测完编号点会按真实 IP 城市重新落位
+    if (mapFilter) {
+      const st = ccStats()[mapFilter];
+      toast(`检测 ${st ? st.region : mapFilter} 的 ${st ? st.count : 0} 个节点 IP 位置…`);
+      const r = await api('/api/purity', {scope: 'cc', cc: mapFilter});
+      if (!r.ok) toast(r.error || '没测成');
+    } else {
+      toast('开始检测全部节点纯净度，约 2–4 分钟…');
+      await api('/api/purity', {scope: 'all'});
+    }
+  } else {
+    toast('正在刷新全部节点延迟…');
+    await api('/api/test');
+  }
+  setTimeout(poll, 900);
+});
+
+/* ── 地图视图切换（节点分布 / 链路拓扑）── */
+$('#mapView').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b || b.classList.contains('act')) return;
+  setMapView(b.dataset.v);
+});
+
+/* ── AI 专项 ── */
+$('#swAi').addEventListener('click', async () => {
+  const on = !(STATE.ai && STATE.ai.enabled);
+  const r = await api('/api/ai/toggle', {on});
+  toast(r.ok ? (on ? '已启用 AI 专用通道' : '已关闭 AI 专用通道') : ('失败：' + (r.error || '')));
+  setTimeout(poll, 1500);
+});
+
+$('#btnAiSet').addEventListener('click', async () => {
+  const name = $('#aiSelect').value;
+  if (!name) { toast('先选一个节点'); return; }
+  const r = await api('/api/ai/node', {name});
+  toast(r.ok ? 'AI 节点已钉到 ' + name : ('失败：' + (r.error || '')));
+  setTimeout(poll, 700);
+});
+
+$('#btnAiProbe').addEventListener('click', async () => {
+  const r = await api('/api/ai/probe', {});
+  toast(r.ok ? '正在测 AI 节点出口…' : (r.error || '失败'));
+  setTimeout(poll, 2200);
+});
+
+$('#btnAiFp').addEventListener('click', async () => {
+  const box = $('#aiFpBox');
+  box.className = 'fp-box on';
+  box.textContent = '正在读取系统指纹（约 2 秒）…';
+  const r = await api('/api/ai/fingerprint', {});
+  if (!r.ok) { box.textContent = '检测失败'; return; }
+  const d = r.data;
+  const color = d.score < 30 ? '#4ade80' : d.score < 60 ? '#fbbf24' : '#f87171';
+  const off = d.offset == null ? '?' : (d.offset > 0 ? '+' : '') + d.offset + 'h';
+  let html = `<div style="display:flex;align-items:baseline;gap:8px">
+      <span class="fp-score" style="color:${color}">${d.score}</span>
+      <span>中国特征分 · ${d.grade}</span></div>
+    <div style="color:var(--dim2);margin-top:3px">
+      时区 ${esc(d.tz_id || '?')} · 偏移 ${off} · 区域 ${esc(d.locale || '?')}</div>`;
+  if (d.hits && d.hits.length) {
+    html += d.hits.map(h =>
+      `<div class="fp-hit"><b>+${h.score}</b><span>${esc(h.item)}<i>${esc(h.fix)}</i></span></div>`).join('');
+  } else {
+    html += `<div style="margin-top:8px;color:#86efac">没有命中任何中国特征项</div>`;
+  }
+  box.innerHTML = html;
+});
+
+$('#btnAiAlign').addEventListener('click', async () => {
+  const r = await api('/api/ai/align', {});
+  toast(r.ok ? (r.message || '已对齐') : ('失败：' + (r.error || r.message || '')));
+  if (r.ok) setTimeout(() => $('#btnAiFp').click(), 900);
+});
+
+$('#btnAiRestore').addEventListener('click', async () => {
+  const r = await api('/api/ai/restore_tz', {});
+  toast(r.ok ? (r.message || '已还原') : (r.message || '没有可还原的时区'));
+  setTimeout(() => $('#btnAiFp').click(), 700);
+});
+
+$('#btnAiLauncher').addEventListener('click', async () => {
+  const r = await api('/api/ai/launcher', {tool: 'claude'});
+  toast(r.ok ? '已生成 data\\ai-launchers\\claude-safe.cmd（TZ/LANG 只影响这个窗口）' : '生成失败');
+});
+
+$('#btnBest').addEventListener('click', async () => {
+  toast('正在测速并验证节点…');
+  await api('/api/best');
+  setTimeout(poll, 800);
+});
+/* ── 纯净度 / 带宽 ── */
+$('#btnPurityCur').addEventListener('click', async () => {
+  toast('正在检测当前节点的 IP 纯净度…');
+  await api('/api/purity', {scope: 'current'});
+  setTimeout(poll, 1500);
+});
+$('#btnSpeed').addEventListener('click', async () => {
+  if (!confirm('对延迟最好的 10 个节点各下载 5MB 测速，约 1–2 分钟，会消耗约 50MB 流量。继续？')) return;
+  toast('开始带宽测速…');
+  await api('/api/speed', {scope: 'top', limit: 10});
+  setTimeout(poll, 1000);
+});
+$('#sortBy').addEventListener('change', () => {
+  localStorage.setItem('vpn_sort', $('#sortBy').value);
+  renderNodes();
+});
+$('#btnSub').addEventListener('click', async () => {
+  toast('正在更新订阅…');
+  await api('/api/sub');
+  setTimeout(poll, 1200);
+});
+$('#btnSaveSub').addEventListener('click', async () => {
+  const url = $('#subUrl').value.trim();
+  const name = $('#subName').value.trim();
+  if (!url) { toast('请先粘贴订阅链接'); return; }
+  toast('正在拉取订阅，请稍候…');
+  $('#btnSaveSub').disabled = true;
+  try {
+    const r = await api('/api/sub_url', {url, name, action: 'add'});
+    toast(r.ok ? '订阅已添加并启用' : ('失败：' + (r.error || '未知错误')));
+    if (r.ok) { $('#subUrl').value = ''; $('#subName').value = ''; }
+  } finally {
+    $('#btnSaveSub').disabled = false;
+  }
+  setTimeout(poll, 1500);
+});
+$('#btnSaveSub').disabled = false;
+
+/* ── 订阅列表：剩余流量从多到少排，当前那条置顶 ── */
+/* ───────── 关于 / 自动更新 ───────── */
+function renderUpdate(){
+  const u = (STATE && STATE.update) || {};
+  const p = (STATE && STATE.progress) || {};
+  const ver = u.current || UI_VER;
+  const installing = !!u.installing || p.kind === 'update';
+
+  $('#verNow').textContent = 'v' + ver;
+
+  const title = $('#updTitle'), sub = $('#updSub');
+  if (u.error && !u.has_update) {
+    title.textContent = '检查更新失败';
+    sub.textContent = String(u.error).slice(0, 110);
+  } else if (u.has_update) {
+    title.textContent = `发现新版本 ${u.latest}`;
+    sub.textContent = `当前 v${ver}` + (u.checked_at ? ` · 上次检查 ${fmtAge(u.checked_at)}` : '');
+  } else if (u.latest) {
+    title.textContent = '已是最新版本';
+    sub.textContent = `v${ver} · 上次检查 ${fmtAge(u.checked_at)}`;
+  } else {
+    title.textContent = '检查更新';
+    sub.textContent = '启动后自动查一次，有新版才提示';
+  }
+
+  const box = $('#updBox');
+  box.hidden = !u.has_update;
+  if (u.has_update) {
+    $('#updVer').textContent = 'v' + u.latest;
+    const bits = [];
+    if (u.published) bits.push(String(u.published).slice(0, 10));
+    if (u.size > 0) bits.push(fmt(u.size));
+    $('#updDate').textContent = bits.join(' · ');
+    $('#updNotes').textContent = String(u.notes || '（这条发布没有写说明）');
+    $('#btnApplyUpd').disabled = installing;
+  }
+
+  const bar = $('#updBar'), fill = $('#updFill');
+  bar.hidden = !installing;
+  if (installing) {
+    const pct = p.total > 0 ? Math.min(100, Math.round((p.done || 0) / p.total * 100)) : 0;
+    fill.style.width = pct + '%';
+    fill.classList.toggle('ok', pct >= 100);
+    fill.classList.toggle('bad', !!u.error);
+    sub.textContent = p.text ? `${p.text} · ${pct}%` : '准备中…';
+  } else {
+    fill.style.width = '0%';
+    fill.classList.remove('ok', 'bad');
+  }
+
+  $('#btnCheckUpd').disabled = installing;
+}
+
+function renderSubHead(sub) {
+  sub = sub || {};
+  // 订阅里的数字来自第三方响应头，可能是 "12.5"、null、甚至 "NaN"。
+  // 一律先归一成 number|null，别让 toFixed / reduce 在后面炸或拼成字符串。
+  const numOf = v => {
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const merge = sub.mode === 'merge';
+  const list = sub.list || [];
+  const total = numOf(sub.total_left_gb);
+  const nameEl = $('#sbName'), el = $('#sbTraffic'), ex = $('#sbExpire');
+  const bar = $('#sbBar');
+
+  if (merge) {
+    nameEl.textContent = `合并 ${list.length} 条`;
+    if (total == null) {
+      el.textContent = '总剩余 —'; el.className = 'sb-traffic';
+    } else {
+      el.textContent = total >= 1024 ? (total / 1024).toFixed(2) + ' TB' : total.toFixed(1) + ' GB';
+      el.className = 'sb-traffic' + (total < 5 ? ' bad' : total < 20 ? ' warn' : '');
+    }
+    const usable = sub.usable || 0;
+    ex.textContent = `· ${usable} 条可用`;
+    ex.className = 'sb-expire' + (usable === 0 ? ' warn' : '');
+    // 每条订阅按余额占比切一段，拼成一条总长条，颜色从亮绿到深绿
+    const segs = list
+      .map(x => ({...x, left: numOf(x.traffic_left_gb)}))
+      .filter(x => x.left != null && x.left > 0)
+      .sort((a, b) => b.left - a.left);
+    const sum = segs.reduce((a, x) => a + x.left, 0) || 1;
+    bar.innerHTML = segs.map((x, i) =>
+      `<i style="flex-grow:${Math.max(x.left / sum, 0.008)};background:${GREEN_SHADES[i % GREEN_SHADES.length]}"></i>`
+    ).join('');
+    const tip = segs.map(x => `${x.name}：${x.left.toFixed(1)} GB`).join('\n');
+    bar.title = tip;
+    $('#subHead').title = tip;
+    $('#btnMerge').classList.add('on');
+    return;
+  }
+  $('#btnMerge').classList.remove('on');
+
+  const now = sub.now || {};
+  nameEl.textContent = sub.name || '未配置订阅';
+  const left = numOf(now.traffic_left_gb);
+  const tot = numOf(now.traffic_total_gb);
+  if (left == null) {
+    el.textContent = now.traffic_text ? now.traffic_text.replace(/^剩余流量[：:]?/, '') : '流量 —';
+    el.className = 'sb-traffic';
+  } else {
+    el.textContent = left >= 1024 ? (left / 1024).toFixed(2) + ' TB' : left.toFixed(1) + ' GB';
+    el.className = 'sb-traffic' + (left < 5 ? ' bad' : left < 20 ? ' warn' : '');
+  }
+  // 单订阅：一条进度条（剩余 / 总量）
+  const pct = (tot && left != null) ? Math.max(0, Math.min(100, left / tot * 100)) : 100;
+  const col = pct < 10 ? '#ef4444' : pct < 30 ? '#f59e0b' : GREEN_SHADES[0];
+  bar.innerHTML = `<i style="flex-grow:${Math.max(pct, 1) / 100};background:${col}"></i>`;
+  bar.title = (tot && left != null)
+    ? `剩余 ${left.toFixed(1)} GB / 共 ${tot.toFixed(1)} GB（${pct.toFixed(0)}%）`
+    : '总量未知';
+  const d = numOf(now.days_left);
+  if (now.expire_text) {
+    if (d == null && now.expire_ts === 0) { ex.textContent = '· 长期有效'; ex.className = 'sb-expire'; }
+    else if (d != null) {
+      ex.textContent = `· 还剩 ${d} 天`;
+      ex.className = 'sb-expire' + (d <= 7 ? ' warn' : '');
+    } else { ex.textContent = ''; ex.className = 'sb-expire'; }
+  } else { ex.textContent = ''; ex.className = 'sb-expire'; }
+  $('#subHead').title = [now.traffic_text, now.expire_text, now.reset_text].filter(Boolean).join('\n');
+}
+
+function renderSubs(sub) {
+  sub = sub || {};
+  const list = (sub.list || []).slice();
+  $('#subCount').textContent = list.length ? `${list.length} 个` : '';
+  // 余额多的排前面，同额按是否当前、再按节点数
+  const _bal = v => {
+    if (v == null || v === '') return -1;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : -1;
+  };
+  list.sort((a, b) => {
+    const av = _bal(a.traffic_left_gb), bv = _bal(b.traffic_left_gb);
+    if (bv !== av) return bv - av;
+    if (a.active !== b.active) return a.active ? -1 : 1;
+    return (b.nodes || 0) - (a.nodes || 0);
+  });
+  const box = $('#subList');
+  if (!list.length) {
+    box.innerHTML = '<div class="now-meta">还没有订阅，在下面添加一个</div>';
+    return;
+  }
+  box.innerHTML = list.map((x, i) => {
+    // 后端可能给 null / 字符串（_json 降级时甚至是 "None"），先归一再判断
+    const nLeft = Number(x.traffic_left_gb), nTot = Number(x.traffic_total_gb);
+    const left = (x.traffic_left_gb == null || !Number.isFinite(nLeft)) ? null : nLeft;
+    const tot = (x.traffic_total_gb == null || !Number.isFinite(nTot) || nTot <= 0) ? null : nTot;
+    const dead = x.usable === false;
+    const tf = left == null
+      ? `<span class="tf">—</span>`
+      : `<span class="tf${left < 5 ? ' bad' : left < 20 ? ' warn' : ''}">${left >= 1024 ? (left / 1024).toFixed(2) + 'T' : left.toFixed(1) + 'G'}</span>`;
+    // 剩余占比长条：没总量时按满格
+    const pct = (tot && left != null) ? Math.max(0, Math.min(100, left / tot * 100)) : (left == null ? 0 : 100);
+    const bcol = pct < 10 ? '#ef4444' : pct < 30 ? '#f59e0b' : GREEN_SHADES[i % GREEN_SHADES.length];
+    const sbar = `<span class="sbar" title="${tot ? `剩余 ${left} / 共 ${tot} GB（${pct.toFixed(0)}%）` : '总量未知'}">
+        <i style="width:${pct}%;background:${bcol}"></i></span>`;
+    const d = x.days_left;
+    const ex = dead
+      ? `<span class="ex bad">${esc(x.why || '不可用')}</span>`
+      : (x.expire_ts === 0 ? '<span class="ex">长期</span>'
+        : (d != null ? `<span class="ex${d <= 7 ? ' warn' : ''}">${d}天</span>` : '<span class="ex">—</span>'));
+    return `<div class="sub-item${x.active ? ' on' : ''}${dead ? ' dead' : ''}" data-i="${x.i}">
+      <span class="nm" title="${esc(x.url)}">${esc(x.name)}</span>
+      ${sbar}${tf}${ex}
+      <span class="nc">${x.nodes || 0} 节点</span>
+      <span class="op">
+        ${x.active ? '<button disabled style="opacity:.45">使用中</button>'
+                   : `<button data-act="use" data-i="${x.i}"${dead ? ' disabled style="opacity:.45"' : ''}>切换</button>`}
+        <button class="del" data-act="del" data-i="${x.i}">删</button>
+      </span>
+    </div>`;
+  }).join('');
+  // 把原始下标带上（排序后位置变了）
+  [...box.children].forEach((el, k) => { el.dataset.i = list[k].i; });
+  if (sub.mode === 'merge' && list.length >= 2) {
+    const usable = sub.usable || 0;
+    box.insertAdjacentHTML('beforeend',
+      `<div class="sub-tip">合并模式已开：${usable} 条可用，一条流量跑完自动换下一条，节点选择不变</div>`);
+  } else if (list.length < 2) {
+    box.insertAdjacentHTML('beforeend',
+      '<div class="sub-tip">再加一条订阅就能在这里一键切换 · 列表按剩余流量从多到少排</div>');
+  }
+}
+
+$('#subList').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-act]');
+  if (!b) return;
+  const i = Number(b.dataset.i);
+  const act = b.dataset.act;
+  if (act === 'del' && !confirm('删除这个订阅？')) return;
+  b.disabled = true;
+  toast(act === 'use' ? '正在切换订阅…' : '正在删除…');
+  const r = await api('/api/sub_url', {action: act, index: i});
+  toast(r.ok ? (act === 'use' ? '已切换' : '已删除') : ('失败：' + (r.error || '未知错误')));
+  setTimeout(poll, 1200);
+});
+$('#btnMerge').addEventListener('click', async () => {
+  // 状态从后端拿：DOM 上的 .on 是上一次渲染的，连点两下会拿旧值反推出同一个目标
+  const cur = (STATE && STATE.sub && STATE.sub.mode) === 'merge';
+  const next = cur ? 'single' : 'merge';
+  const btn = $('#btnMerge');
+  if (btn.dataset.busy === '1') return;
+  btn.dataset.busy = '1';
+  try {
+    const r = await api('/api/sub_url', {action: 'mode', mode: next});
+    toast(r.ok ? (next === 'merge' ? '合并模式已开：一条没流量自动换下一条' : '已关闭合并模式')
+               : ('失败：' + (r.error || '未知错误')));
+  } finally {
+    delete btn.dataset.busy;
+  }
+  setTimeout(poll, 800);
+});
+$('#btnRestart').addEventListener('click', async () => {
+  toast('正在重启内核…');
+  await api('/api/kernel/restart');
+  setTimeout(poll, 2000);
+});
+$('#btnCheckUpd').addEventListener('click', async function(){
+  if (this.disabled) return;
+  this.disabled = true;
+  const old = this.textContent;
+  this.textContent = '检查中…';
+  try {
+    const r = await api('/api/update/check', {force: true});
+    if (r.ok === false && r.error) toast('检查失败：' + r.error);
+    else if (r.has_update) toast('发现新版本 ' + r.latest);
+    else toast('已经是最新版本');
+  } finally {
+    this.disabled = false;
+    this.textContent = old;
+    setTimeout(poll, 500);
+  }
+});
+
+$('#btnApplyUpd').addEventListener('click', async function(){
+  if (this.disabled) return;
+  if (!confirm('下载并覆盖安装新版本？安装时程序会退出，装完自动重新打开。')) return;
+  this.disabled = true;
+  const r = await api('/api/update/apply', {});
+  if (!r.ok) {
+    this.disabled = false;
+    toast(r.error || '启动更新失败');
+    return;
+  }
+  toast('正在下载，程序会自动重启');
+  setTimeout(poll, 800);
+});
+
+$('#btnOpenPage').addEventListener('click', () => {
+  const u = (STATE && STATE.update) || {};
+  const url = u.html_url || u.repo_url;
+  if (url) window.open(url, '_blank');
+  else toast('没有发布页地址');
+});
+
+$('#btnQuit').addEventListener('click', async () => {
+  if (!confirm('退出后系统代理会被还原，确定退出 VPN Tray？')) return;
+  await api('/api/quit');
+  document.body.innerHTML =
+    '<div style="display:grid;place-items:center;height:100vh;color:#7f8ea6;font-size:15px">' +
+    '已退出，可以关闭此页面。</div>';
+});
+$('#btnLog').addEventListener('click', async () => {
+  const r = await api('/api/log');
+  $('#logBox').textContent = (r.lines || []).join('\n') || '（暂无日志）';
+  $('#modal').classList.add('on');
+});
+$('#btnCloseLog').addEventListener('click', () => $('#modal').classList.remove('on'));
+$('#modal').addEventListener('click', e => { if (e.target.id === 'modal') $('#modal').classList.remove('on'); });
+
+/* ── 地图交互：缩放 / 拖拽 / 点击筛选 ── */
+$('#mapMode').addEventListener('click', e => {
+  const b = e.target.closest('button[data-m]');
+  if (!b) return;
+  mapMode = b.dataset.m;
+  localStorage.setItem('vpn_map_mode', mapMode);
+  [...$('#mapMode').children].forEach(x => x.classList.toggle('act', x.dataset.m === mapMode));
+  mapSig = '';
+  drawMap();
+  renderProgress();
+});
+
+let dragging = false, dragMoved = false, dragStart = null;
+
+(function bindMapPanZoom(){
+  const wrap = wrapEl();
+  if (!wrap) return;
+
+  wrap.addEventListener('pointerdown', e => {
+    dragMoved = false;   // 每次按下先重置，避免上一次拖拽吞掉点击
+    if (e.target.closest('.pin') || e.target.closest('.map-ctrl')) return;
+    dragging = true;
+    dragStart = {x: e.clientX, y: e.clientY, vx: vb.x, vy: vb.y};
+    // 注意：这里不能立刻 setPointerCapture，否则 click 的 target 会被改成 wrap，
+    // 点国家面积就选不中了（只有点数字标记还行）。等真的拖动起来再捕获。
+  });
+
+  wrap.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const rect = wrap.getBoundingClientRect();
+    if (!rect.width) return;
+    if (!dragMoved) {
+      if (Math.abs(e.clientX - dragStart.x) + Math.abs(e.clientY - dragStart.y) <= 4) return;
+      dragMoved = true;
+      wrap.classList.add('dragging');
+      try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+    const dx = (e.clientX - dragStart.x) / rect.width * vb.w;
+    const dy = (e.clientY - dragStart.y) / rect.height * vb.h;
+    vb.x = dragStart.vx - dx;
+    vb.y = dragStart.vy - dy;
+    clampVB();
+    applyVB();
+  });
+
+  const endDrag = e => {
+    if (!dragging) return;
+    dragging = false;
+    wrap.classList.remove('dragging');
+    try { wrap.releasePointerCapture(e.pointerId); } catch (_) {}
+  };
+  wrap.addEventListener('pointerup', endDrag);
+  wrap.addEventListener('pointercancel', endDrag);
+
+  wrap.addEventListener('wheel', e => {
+    e.preventDefault();
+    zoomAt(e.deltaY > 0 ? 1.16 : 1 / 1.16, e.clientX, e.clientY);
+  }, {passive: false});
+
+  wrap.addEventListener('dblclick', e => {
+    if (e.target.closest('.pin') || e.target.closest('.map-ctrl')) return;
+    zoomAt(1 / 1.9, e.clientX, e.clientY);
+  });
+
+  $('#zoomIn').addEventListener('click', e => { e.stopPropagation(); zoomCenter(1 / 1.5); });
+  $('#zoomOut').addEventListener('click', e => { e.stopPropagation(); zoomCenter(1.5); });
+  $('#zoomReset').addEventListener('click', e => { e.stopPropagation(); resetVB(); });
+
+  // 点国家面积 = 选中该国；点海洋 = 取消筛选
+  wrap.addEventListener('click', e => {
+    if (dragMoved) { dragMoved = false; return; }
+    if (e.target.closest('.pin') || e.target.closest('.map-ctrl')) return;
+    if (mapView === 'topo') return;
+    const reg = e.target.closest('.map-region');
+    if (reg) {
+      const cc = reg.dataset.cc;
+      if (!cc) return;
+      if (reg.classList.contains('has')) pickCC(cc);
+      else toast('这个地区没有可用节点');
+      return;
+    }
+    if (mapFilter) pickCC(null);
+  });
+
+  window.addEventListener('resize', layoutPins);
+})();
+
+$('#mapPins').addEventListener('click', e => {
+  const pin = e.target.closest('.pin');
+  if (!pin || dragMoved) return;
+  e.stopPropagation();
+  if (pin.dataset.node) { selectNode(pin.dataset.node); return; }   // 编号点 = 直接切节点
+  if (pin.dataset.cc) { pickCC(pin.dataset.cc); return; }
+  const idx = Number(pin.dataset.cl);
+  const box = $('#clusterBox');
+  if (box.classList.contains('on') && box.dataset.cl === String(idx)) { hideCluster(); return; }
+  box.dataset.cl = String(idx);
+  showCluster(idx, pin);
+});
+
+$('#clusterBox').addEventListener('click', e => {
+  const it = e.target.closest('.it');
+  if (it) pickCC(it.dataset.cc);
+});
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#clusterBox') && !e.target.closest('.pin')) hideCluster();
+});
+
+// 初始化地图
+(function initMap(){
+  const w = wrapEl();
+  if (w && BASE.w && BASE.h) w.style.aspectRatio = `${BASE.w} / ${BASE.h}`;
+  buildMap();
+  applyVB();
+  [...$('#mapMode').children].forEach(x => x.classList.toggle('act', x.dataset.m === mapMode));
+  $('#localBack').addEventListener('click', e => { e.stopPropagation(); closeLocal(false); });
+})();
+
+// 调试/截图用：#c0 打开第 0 个聚簇，#ccHK 直接筛选国家，#topo 直接切链路拓扑
+(function hashDebug(){
+  const m = location.hash.match(/^#c(\d+)$/);
+  if (m) {
+    setTimeout(() => {
+      const pins = document.querySelectorAll('.pin.multi');
+      const pin = pins[Number(m[1])] || pins[0];
+      if (pin) { $('#clusterBox').dataset.cl = pin.dataset.cl; showCluster(Number(pin.dataset.cl), pin); }
+    }, 2500);
+    return;
+  }
+  const m2 = location.hash.match(/^#cc([A-Z]{2})$/);
+  if (m2) { setTimeout(() => pickCC(m2[1]), 2200); return; }
+  if (location.hash === '#topo') setTimeout(() => setMapView('topo'), 1200);
+})();
+
+// 地图视图：恢复上次选择（出错也不能拖累轮询）
+try {
+  setMapView(mapView);
+} catch (err) {
+  console.error('setMapView 失败', err);
+  document.getElementById('topoLayer').style.display = 'none';
+}
+
+// 1.5s 一次轮询必须防重入：后端卡住时 fetch 会堆积，
+// 回来后又是一连串 DOM 全量重建，页面直接卡死。后台标签页也停下来省电。
+let _polling = false;
+async function pollGuarded(){
+  if (_polling || document.hidden) return;
+  _polling = true;
+  try { await poll(); } finally { _polling = false; }
+}
+pollGuarded();
+setInterval(pollGuarded, 1500);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollGuarded(); });
+
+// 恢复上次的排序方式
+(function(){
+  const saved = localStorage.getItem('vpn_sort');
+  if (saved && $('#sortBy').querySelector(`option[value="${saved}"]`)) $('#sortBy').value = saved;
+})();
+</script>
+</body>
+</html>

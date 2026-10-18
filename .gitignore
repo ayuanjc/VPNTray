@@ -1,0 +1,25 @@
+# ── 运行期数据：订阅链接、日志、缓存、纯净度库、settings ──
+# 这些是「每个人自己一份」的东西，绝不进仓库
+data/
+
+# ── 打包产物 ──
+build/
+dist/
+release/
+*.spec
+
+# ── 生成物 ──
+VPNTray.exe
+*.manifest
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
