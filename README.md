@@ -1,5 +1,7 @@
 # VPN Tray — 常驻分流代理 + 本地控制台
 
+**[⬇ 下载最新版](https://github.com/ayuanjc/VPNTray/releases/latest)** · 解压即用，不用装 Python
+
 Windows 托盘工具：内嵌 [mihomo](https://github.com/MetaCubeX/mihomo) 内核，一直挂着访问国外网站，
 国内网站保持直连。节点切换走**本地网页控制台**（也可以从托盘菜单切）。
 不需要管理员权限，不装驱动。
@@ -7,7 +9,7 @@ Windows 托盘工具：内嵌 [mihomo](https://github.com/MetaCubeX/mihomo) 内�
 ```
 解压后双击 VPNTray.exe  →  托盘出现绿色 V
 双击图标 / 右键「打开控制台」→ http://127.0.0.1:7892/
-第一次用：把订阅链接粘到控制台左下角「订阅」里，点「保存并连接」
+第一次用：先同意使用协议，再把订阅链接粘到「订阅」卡里，点「添加」
 ```
 
 ![控制台](assets/screenshot.png)
@@ -352,10 +354,10 @@ python tools\menu_shot.py      # 弹一次托盘菜单并截图（验证菜单�
 pwsh -File release.ps1
 ```
 
-产出 `release\VPNTray-1.0.0-win64.zip`（约 65 MB），解压即用：
+产出 `release\VPNTray-<版本>-win64.zip`（约 70 MB），解压即用：
 
 ```
-VPNTray-1.0.0\
+VPNTray-1.8.1\
 ├── VPNTray.exe          主程序
 ├── _internal\           Python 运行时（别删）
 ├── bin\                 mihomo 内核 + 地理数据
