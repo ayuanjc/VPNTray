@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import webbrowser
@@ -142,7 +143,14 @@ class App:
         self._set(phase="准备配置", busy="启动中")
         ok = self.prepare_config(initial=True)
         if not ok:
-            self._set(phase="配置失败", busy="")
+            # 「还没填订阅」是首次使用的正常起点，不是故障：
+            # 报成「配置失败」会让新用户以为装坏了，界面也只能看到一条红色报错。
+            err = str(self.state.get("error") or "")
+            if not err or "未配置订阅" in err or "订阅缓存不可用" in err:
+                self._set(phase="待添加订阅", error="", busy="")
+                log.info("尚未配置订阅，等待用户添加")
+            else:
+                self._set(phase="配置失败", busy="")
             return False
 
         self._set(phase="启动内核", busy="启动中")
@@ -1307,6 +1315,100 @@ class App:
                 log.debug("合并模式巡检异常: %s", e)
 
     # ══════════ 自动更新 ══════════
+    # ── 代理冲突清理 ───────────────────────────────────────────────────
+    def _self_pids(self) -> set[int]:
+        """自己的进程集合（含内核），扫描时排除 —— 否则一键清理会把自己杀掉。"""
+        pids = {os.getpid()}
+        pid = getattr(getattr(self.kernel, "proc", None), "pid", None)
+        if pid:
+            pids.add(int(pid))
+        try:
+            pids.add(int(os.getppid()))
+        except Exception:  # noqa: BLE001
+            pass
+        return pids
+
+    def net_scan(self) -> dict[str, Any]:
+        """查一遍有没有别的代理软件在抢系统代理 / 开着 TUN。"""
+        from . import netguard
+
+        try:
+            info = netguard.scan(exclude_pids=self._self_pids())
+            info["is_admin"] = netguard.is_admin()
+            info["ok"] = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("扫描代理冲突失败: %s", e)
+            info = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        with self._lock:
+            self.state["conflict"] = info
+        self._changed()
+        return info
+
+    def net_fix(self, target: str, pids: list[int] | None = None,
+                names: list[str] | None = None) -> dict[str, Any]:
+        """target: sys（关系统代理）/ apps（结束进程）/ adapters（禁用网卡）。"""
+        from . import netguard
+
+        target = (target or "").strip()
+        try:
+            if target == "sys":
+                # 关键顺序：先把「自己想开系统代理」的意图落盘关掉，
+                # 否则健康看护线程 20 秒后会把代理又装回去，白清一场。
+                self.settings["system_proxy"] = False
+                try:
+                    self.settings.save()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("保存系统代理开关失败: %s", e)
+                res = netguard.wipe_system_proxy()
+                self._set(sysproxy=False)
+                log.info("解除冲突：系统代理已清空 ok=%s", res.get("ok"))
+            elif target == "apps":
+                res = netguard.kill_apps([int(x) for x in (pids or [])])
+                log.info("解除冲突：结束 %d 个进程", len(res.get("results") or []))
+            elif target == "adapters":
+                res = netguard.disable_adapters([str(x) for x in (names or [])])
+                log.info("解除冲突：禁用 %d 张网卡", len(res.get("results") or []))
+            else:
+                return {"ok": False, "error": f"未知目标：{target}"}
+        except Exception as e:  # noqa: BLE001
+            log.exception("解除代理冲突失败")
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        after = self.net_scan()
+        return {"ok": bool(res.get("ok", True)), "detail": res, "scan": after}
+
+    # ── 反馈 / 用户协议 ────────────────────────────────────────────────
+    def feedback_send(self, title: str, detail: str, email: str = "") -> dict[str, Any]:
+        from . import feedback
+
+        try:
+            info = feedback.build(self, title, detail, email)
+            self.notify("已生成反馈文件，可在弹出的目录里找到")
+            return info
+        except Exception as e:  # noqa: BLE001
+            log.exception("生成反馈失败")
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    def feedback_open(self, path: str = "") -> dict[str, Any]:
+        from . import feedback
+
+        return {"ok": feedback.open_dir(path)}
+
+    def agree(self, version: str = "") -> dict[str, Any]:
+        """记下用户同意的那一版协议。版本变了会重新弹一次。"""
+        from . import __version__ as _v
+
+        ver = str(version or _v)
+        self.settings["agreed_version"] = ver
+        try:
+            self.settings.save()
+        except Exception as e:  # noqa: BLE001
+            log.warning("保存协议同意状态失败: %s", e)
+            return {"ok": False, "error": str(e)}
+        self._set(agreed=ver)
+        log.info("用户已同意使用协议 %s", ver)
+        return {"ok": True, "agreed": ver}
+
     def update_check(self, force: bool = False) -> dict[str, Any]:
         """查 GitHub 最新 release。结果写进 state["update"]，前端轮询就能看到。
 

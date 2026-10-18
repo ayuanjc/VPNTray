@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from . import __version__ as _APP_VER
 from . import disguise
 from .paths import ROOT, asset
 from .purity import FLAG_CC
@@ -22,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.8.0"
+UI_VER = "1.8.1"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -174,6 +175,9 @@ def build_state(app) -> dict[str, Any]:
     s = app.settings
     return {
         "ui": UI_VER,
+        "ver": _APP_VER,
+        "agreed": str(s.get("agreed_version") or ""),
+        "conflict": st.get("conflict") or {},
         "phase": st.get("phase"),
         "kernel_ok": st.get("kernel_ok"),
         "error": st.get("error", ""),
@@ -194,6 +198,8 @@ def build_state(app) -> dict[str, Any]:
         "probing": bool(getattr(app, "_purity_running", False) or getattr(app, "_speed_running", False)),
         "progress": st.get("progress") or {},
         "ai": app.ai_status(),
+        "update": st.get("update") or {},
+        "update_repo": s.get("update_repo", ""),
         "purity_count": sum(1 for n in nodes if n.get("purity") is not None),
         "speed_count": sum(1 for n in nodes if n.get("mbps") is not None),
         "sub": {
@@ -461,6 +467,45 @@ class WebUI:
         def update_apply(_):
             return app.update_apply()
 
+        # ── 代理冲突清理 ──
+        def net_scan(_):
+            return app.net_scan()
+
+        def net_fix(body):
+            b = body or {}
+            target = str(b.get("target") or "").strip()
+
+            def _pids(v):
+                out = []
+                for x in v if isinstance(v, list) else []:
+                    try:
+                        n = int(x)
+                    except (TypeError, ValueError):
+                        continue
+                    if n > 0:
+                        out.append(n)
+                return out
+
+            names = [str(x) for x in (b.get("names") or [])
+                     if isinstance(x, (str, int)) and str(x).strip()]
+            return app.net_fix(target, _pids(b.get("pids")), names[:16])
+
+        # ── 反馈 / 用户协议 ──
+        def feedback_send(body):
+            b = body or {}
+            title = str(b.get("title") or "").strip()
+            detail = str(b.get("detail") or "").strip()
+            email = str(b.get("email") or "").strip()
+            if not detail and not title:
+                return {"ok": False, "error": "请先写一下遇到的问题"}
+            return app.feedback_send(title, detail, email)
+
+        def feedback_open(body):
+            return app.feedback_open(str((body or {}).get("dir") or ""))
+
+        def agree(body):
+            return app.agree(str((body or {}).get("version") or ""))
+
         return {
             "/api/select": select,
             "/api/mode": mode,
@@ -489,6 +534,11 @@ class WebUI:
             "/api/log": log_tail,
             "/api/update/check": update_check,
             "/api/update/apply": update_apply,
+            "/api/netguard": net_scan,
+            "/api/netguard/fix": net_fix,
+            "/api/feedback": feedback_send,
+            "/api/feedback/open": feedback_open,
+            "/api/agree": agree,
         }
 
     def _do_quit(self) -> None:

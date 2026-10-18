@@ -12,15 +12,17 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
 import re
 import shutil
 import subprocess
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import requests
 
@@ -43,6 +45,10 @@ REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9._-]{1,100}$")
 VER_RE = re.compile(r"^v?(\d+(?:\.\d+)*)(?:[-+~][0-9A-Za-z.\-+]*)?$")
 
 UA = "VPNTray-Updater"
+
+# 域名抽成常量，测试时能整体指向本地假服务（生产永远是这两个）
+GH = "https://github.com"
+API = "https://api.github.com"
 
 
 class UpdateError(Exception):
@@ -100,57 +106,46 @@ def _get(url: str, proxies: dict[str, str] | None, timeout: float = 12.0) -> req
 
 def check(repo: str, current: str, local_port: int | None = None,
           timeout: float = 12.0) -> dict[str, Any]:
-    """查最新 release。异常一律转成 ok=False + error，不往上抛。"""
+    """查最新 release。异常一律转成 ok=False + error，不往上抛。
+
+    刻意**不走 api.github.com**：未认证的 API 只有 60 次/小时，而机场出口是
+    共享 IP，别人跑几次就把额度用光了（实测 startsWith 就是 403
+    "API rate limit exceeded"）。改走两样不限流的东西：
+      - `/releases/latest` 的 302 Location → 拿到 tag
+      - `/releases.atom` → 拿到更新说明
+    下载地址按发布约定拼，拼不出来才退回 API。
+    """
     repo = (repo or "").strip()
     if not REPO_RE.match(repo):
         return {"ok": False, "error": f"仓库名不合法：{repo or '(空)'}（应形如 owner/name）"}
 
-    url = f"https://api.github.com/repos/{repo}/releases/latest"
     proxies = _proxies(local_port)
-    try:
-        r = _get(url, proxies, timeout)
-        try:
-            raw = r.raw.read(MAX_JSON_BYTES + 1, decode_content=True)
-        finally:
-            r.close()
-        if len(raw) > MAX_JSON_BYTES:
-            raise UpdateError("Release 信息异常地大")
-        data = json.loads(raw.decode("utf-8", "replace"))
-        if not isinstance(data, dict):
-            raise UpdateError("Release 信息格式不对")
-    except UpdateError as e:
-        return {"ok": False, "error": str(e)}
-    except requests.RequestException as e:
-        return {"ok": False, "error": f"连不上 GitHub：{type(e).__name__}"}
-    except (ValueError, OSError) as e:
-        return {"ok": False, "error": f"解析 Release 失败：{type(e).__name__}"}
-
-    tag = str(data.get("tag_name") or "")
+    tag, err = _latest_tag(repo, proxies, timeout)
+    if err:
+        return {"ok": False, "error": err}
     parsed = parse_version(tag)
     if not parsed:
         return {"ok": False, "error": f"Release 的 tag 不是版本号：{tag or '(空)'}"}
-    # 统一成 1.8.0 这种规范形式：tag 可能是 v1.8.0-beta，而发布包名里是 1.8.0
     latest = ".".join(str(x) for x in parsed)
 
-    # 资产里挑 zip。发布脚本固定命名 VPNTray-<ver>-win64.zip，但不写死，
-    # 没有精确匹配就退回「唯一的 .zip」。
-    assets = [a for a in (data.get("assets") or []) if isinstance(a, dict)]
-    zip_name = f"VPNTray-{latest}-win64.zip"
-    picked = next((a for a in assets if str(a.get("name")) == zip_name), None)
-    if picked is None:
-        zips = [a for a in assets if str(a.get("name", "")).lower().endswith(".zip")]
-        picked = zips[0] if len(zips) == 1 else None
+    zip_url = (f"{GH}/{repo}/releases/download/{quote(tag, safe='')}"
+               f"/VPNTray-{latest}-win64.zip")
+    size = _head_size(zip_url, proxies, timeout)
+    page = f"{GH}/{repo}/releases/tag/{quote(tag, safe='')}"
 
-    size = 0
-    dl = ""
-    sha_asset = ""
-    if picked is not None:
-        try:
-            size = int(picked.get("size") or 0)
-        except (TypeError, ValueError):
-            size = 0
-        dl = str(picked.get("browser_download_url") or "")
-        sha_asset = str(picked.get("digest") or "")
+    if not size:
+        # 约定名不存在（手动发布的包名不统一）：退回 API 找资产
+        fallback = _api_release(repo, proxies, timeout)
+        if fallback:
+            zip_url = fallback.get("zip_url") or zip_url
+            size = fallback.get("zip_size") or 0
+            page = fallback.get("page") or page
+        if not size:
+            return {"ok": True, "has_update": False, "current": current,
+                    "latest": latest, "tag": tag,
+                    "error": f"最新版 {tag} 没挂 VPNTray-{latest}-win64.zip",
+                    "notes": "", "page": page, "zip_url": "", "zip_size": 0,
+                    "zip_sha256": "", "published": ""}
 
     return {
         "ok": True,
@@ -158,12 +153,147 @@ def check(repo: str, current: str, local_port: int | None = None,
         "current": current,
         "latest": latest,
         "tag": tag,
-        "notes": str(data.get("body") or "")[:4000],
-        "page": str(data.get("html_url") or ""),
-        "zip_url": dl,
+        "notes": _atom_notes(repo, tag, proxies, timeout),
+        "page": page,
+        "zip_url": zip_url,
         "zip_size": size,
-        "zip_sha256": sha_asset[7:] if sha_asset.startswith("sha256:") else "",
-        "published": str(data.get("published_at") or ""),
+        "zip_sha256": "",      # 不走 API 就没有 digest，靠解压后 UI_VER 自证
+        "published": "",
+    }
+
+
+def _req_raw(url: str, proxies: dict[str, str] | None, timeout: float,
+             method: str = "GET", allow_redirects: bool = True) -> requests.Response:
+    """带 github 白名单的裸请求：只校验主机，不校验状态码。
+
+    和 _get 的区别：_get 是给下载用的（必须 200 且校验大小），这里是给
+    「看 302」和「读 header」用的，非 200 也是有效信息。
+    """
+    host = (urlparse(url).hostname or "").lower()
+    if host not in ALLOWED_HOSTS:
+        raise UpdateError(f"拒绝访问非 GitHub 地址：{host or url}")
+    return requests.request(
+        method, url,
+        headers={"User-Agent": UA, "Accept": "application/vnd.github+json"},
+        proxies=proxies, timeout=timeout, allow_redirects=allow_redirects, stream=True,
+    )
+
+
+def _latest_tag(repo: str, proxies: dict[str, str] | None,
+                timeout: float) -> tuple[str, str]:
+    """`/releases/latest` 会 302 到 `/releases/tag/<tag>`，从 Location 里抠 tag。"""
+    url = f"{GH}/{repo}/releases/latest"
+    try:
+        r = _req_raw(url, proxies, timeout, allow_redirects=False)
+        try:
+            code = r.status_code
+            loc = r.headers.get("Location") or ""
+        finally:
+            r.close()
+    except UpdateError as e:
+        return "", str(e)
+    except requests.RequestException as e:
+        return "", f"连不上 GitHub：{type(e).__name__}"
+
+    if code == 404:
+        return "", "仓库不存在，或者还没有发布过任何版本"
+    if code not in (301, 302, 303, 307, 308):
+        return "", f"GitHub 返回 HTTP {code}"
+    m = re.search(r"/releases/tag/([^/?#]+)", urlparse(loc).path)
+    if not m:
+        return "", "解析不出最新版本号（GitHub 页面结构变了？）"
+    return unquote(m.group(1)), ""
+
+
+def _head_size(url: str, proxies: dict[str, str] | None, timeout: float) -> int:
+    """用 stream 的 GET 只读 header 就断开，比 HEAD 兼容性好。0 表示拿不到/不存在。"""
+    try:
+        r = _req_raw(url, proxies, timeout)
+        try:
+            if r.status_code != 200:
+                return 0
+            try:
+                return int(r.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                return 0
+        finally:
+            r.close()
+    except (UpdateError, requests.RequestException):
+        return 0
+
+
+def _html_text(s: str) -> str:
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</(p|div|li|h[1-6]|tr)>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = html.unescape(s)
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def _atom_notes(repo: str, tag: str, proxies: dict[str, str] | None,
+                timeout: float) -> str:
+    """从 releases.atom 取这一版的更新说明（不限流）。失败就返回空串。"""
+    url = f"{GH}/{repo}/releases.atom"
+    try:
+        r = _req_raw(url, proxies, timeout)
+        try:
+            raw = r.raw.read(MAX_JSON_BYTES + 1, decode_content=True)
+        finally:
+            r.close()
+    except (UpdateError, requests.RequestException, OSError):
+        return ""
+    if len(raw) > MAX_JSON_BYTES:
+        return ""
+    try:
+        root = ET.fromstring(raw.decode("utf-8", "replace"))
+    except ET.ParseError:
+        return ""
+    ns = "{http://www.w3.org/2005/Atom}"
+    want = tag.lstrip("vV")
+    for entry in root.findall(f"{ns}entry"):
+        title = (entry.findtext(f"{ns}title") or "").strip()
+        if title.lstrip("vV") != want:
+            continue
+        node = entry.find(f"{ns}content")
+        body = (node.text or "") if node is not None else ""
+        return _html_text(body)[:4000]
+    return ""
+
+
+def _api_release(repo: str, proxies: dict[str, str] | None,
+                 timeout: float) -> dict[str, Any] | None:
+    """兜底：只在这个 release 的资产名不符合约定时才用，可能撞上 60 次/时限流。"""
+    url = f"{API}/repos/{repo}/releases/latest"
+    try:
+        r = _req_raw(url, proxies, timeout)
+        try:
+            if r.status_code != 200:
+                return None
+            raw = r.raw.read(MAX_JSON_BYTES + 1, decode_content=True)
+        finally:
+            r.close()
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except (UpdateError, requests.RequestException, ValueError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    assets = [a for a in (data.get("assets") or []) if isinstance(a, dict)]
+    zips = [a for a in assets if str(a.get("name", "")).lower().endswith(".zip")]
+    picked = zips[0] if len(zips) == 1 else None
+    if picked is None:
+        return None
+    try:
+        size = int(picked.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    sha = str(picked.get("digest") or "")
+    return {
+        "zip_url": str(picked.get("browser_download_url") or ""),
+        "zip_size": size,
+        "zip_sha256": sha[7:] if sha.startswith("sha256:") else "",
+        "page": str(data.get("html_url") or ""),
     }
 
 
@@ -317,6 +447,7 @@ def stage(payload_root: Path, workdir: Path, target_root: Path | None = None,
     workdir = Path(workdir).resolve()
     if not (payload / exe_name).exists():
         raise UpdateError("待安装目录里没有 VPNTray.exe")
+    workdir.mkdir(parents=True, exist_ok=True)   # 正常由 prepare 建好，这里兜底
     bat = workdir / "update.cmd"
     bat.write_bytes(
         BAT.format(target=str(target), payload=str(payload),
