@@ -502,7 +502,7 @@ class TrayWin:
         threading.Thread(target=run, daemon=True).start()
 
     def open_console(self) -> None:
-        """双击图标 → 开原生窗口；没装 pywebview/WebView2 才退回浏览器。"""
+        """双击图标 → 开原生窗口；起不来就退回浏览器，绝不静默。"""
         port = 7892
         try:
             from urllib.parse import urlparse
@@ -518,7 +518,10 @@ class TrayWin:
         except Exception as e:  # noqa: BLE001
             log.warning("打开控制台失败: %s", e)
             mode = "none"
-        if mode == "none":
+        # 让用户知道发生了什么：2.0.0 这里什么都不说，窗口起不来就像功能坏了
+        if mode == "browser":
+            self.notify("原生窗口没起来，已改用浏览器打开；详见 data/logs/app.log")
+        elif mode == "none":
             self.notify("打开控制台失败，详见 data/logs/app.log")
 
     def _quit(self) -> None:

@@ -8,7 +8,17 @@ pywebview 在 Windows 上又必须拿到主线程（WinForms 的 STA + 消息泵
 界面本身一行都不用改，后台也完全不知道窗口长什么样。
 
 用法：
-    VPNTray.exe --console --port 7892
+    VPNTray.exe --window --port 7892
+
+MOTW 自愈
+---------
+从浏览器下载的 zip 解压后，每个文件会带一个 `Zone.Identifier` 备用数据流（俗称
+「来自 Internet」标记）。.NET Framework 在 Assembly.LoadFrom 时**拒绝**加载带这个
+标记的程序集（HRESULT 0x80131515），于是 pythonnet 初始化失败、WebView2 程序集
+加载不出来、窗口进程秒退。用户看到的就是「点开控制台没反应」。
+
+所以这里在启动窗口前先把整个程序目录的标记清掉。清标记是安全且可逆的（只是去掉
+Windows 给文件贴的来源标签），比让用户自己去右键属性勾「解除锁定」现实得多。
 """
 
 from __future__ import annotations
@@ -19,6 +29,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -30,6 +41,66 @@ log = logging.getLogger("ui")
 TITLE_PREFIX = "VPN Tray 控制台"
 GEO_FILE = paths.DATA / "window.json"
 DEFAULT_GEO = {"w": 1400, "h": 920}
+# 窗口从 create Popen 到真的出现，实测 1.2–2.5 秒（WebView2 首次加载更久）
+SPAWN_WAIT = 6.0
+
+
+def _app_root() -> Path:
+    """程序根目录：冻结后是 exe 所在目录，源码模式是仓库根。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _zone_stream_path(p: Path) -> str:
+    return f"{p}:Zone.Identifier"
+
+
+def has_motw(p: Path) -> bool:
+    try:
+        return os.path.exists(_zone_stream_path(p))
+    except OSError:
+        return False
+
+
+def unblock_tree(root: Path | None = None, limit: int = 4000) -> int:
+    """清掉程序目录里所有文件的「来自 Internet」标记。返回清掉的数量。
+
+    不用 subprocess 调 PowerShell（那要起一个进程、还可能被策略拦），
+    直接删那个备用数据流：`path:Zone.Identifier` 在 Win32 层就是一个可删的文件名。
+    """
+    root = root or _app_root()
+    removed = 0
+    scanned = 0
+    try:
+        for p in root.rglob("*"):
+            if scanned >= limit:
+                log.warning("扫描 %d 个文件后停止清理 MOTW（目录过大）", limit)
+                break
+            if not p.is_file():
+                continue
+            scanned += 1
+            if not has_motw(p):
+                continue
+            try:
+                os.remove(_zone_stream_path(p))
+                removed += 1
+            except OSError:
+                pass
+    except Exception as e:  # noqa: BLE001
+        log.warning("清理 MOTW 时出错（已清理 %d 个）: %s", removed, e)
+    if removed:
+        log.info("已清除 %d 个文件的「来自 Internet」标记（共扫描 %d 个）", removed, scanned)
+    return removed
+
+
+def _fatal(text: str, title: str = "VPN Tray") -> None:
+    """窗口起不来时必须让用户看见，不能静默。"""
+    log.error("%s", text.replace("\n", " | "))
+    try:
+        ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _load_geo() -> dict[str, int]:
@@ -68,16 +139,20 @@ def backend_alive(port: int, timeout: float = 2.5) -> bool:
 
 
 def available() -> tuple[bool, str]:
-    """pywebview + WebView2 能不能用。"""
+    """pywebview 能不能 import。
+
+    注意：import 成功不等于能起窗口 —— 冻结版里 webview 包在但 pythonnet 的
+    程序集可能加载失败（MOTW / 缺 DLL）。真正的判断只能靠 spawn() 之后验活。
+    """
     try:
         import webview  # noqa: F401
     except Exception as e:  # noqa: BLE001
-        return False, f"没装 pywebview（{type(e).__name__}）"
+        return False, f"没装 pywebview（{type(e).__name__}: {e}）"
     return True, ""
 
 
-def focus() -> bool:
-    """已经有窗口就把那个窗口拎到前台，别开第二个。"""
+def _find_console_window() -> int:
+    """枚举顶层窗口，找标题以 TITLE_PREFIX 开头的那个。返回 hwnd 或 0。"""
     try:
         u32 = ctypes.windll.user32
         found: list[int] = []
@@ -97,9 +172,18 @@ def focus() -> bool:
             return True
 
         u32.EnumWindows(_cb, None)
-        if not found:
-            return False
-        hwnd = found[0]
+        return found[0] if found else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def focus() -> bool:
+    """已经有窗口就把那个窗口拎到前台，别开第二个。"""
+    hwnd = _find_console_window()
+    if not hwnd:
+        return False
+    try:
+        u32 = ctypes.windll.user32
         if u32.IsIconic(hwnd):
             u32.ShowWindow(hwnd, 9)  # SW_RESTORE
         u32.SetForegroundWindow(hwnd)
@@ -108,16 +192,18 @@ def focus() -> bool:
         return False
 
 
-def spawn(port: int = 7892) -> bool:
-    """另起一个窗口进程。
+def spawn(port: int = 7892, wait: float = SPAWN_WAIT) -> tuple[bool, str]:
+    """另起一个窗口进程，并**确认它真的活下来了**。
 
-    窗口不能和后台同进程：后台主线程被托盘的 Win32 消息泵占着，
-    pywebview 又必须要主线程起 WinForms 消息泵，两者抢不了同一个线程。
+    只判 Popen 不抛异常是不够的：子进程可能因为缺 DLL / MOTW / 没装 WebView2
+    在一秒内退出，父进程却以为「窗口已经打开」，于是既不回退浏览器也不报错。
+    这就是 2.0.0 里「点开控制台没反应」的直接原因。
     """
+    root = _app_root()
     try:
-        root = Path(__file__).resolve().parent.parent
         if getattr(sys, "frozen", False):
-            exe, cmd = sys.executable, [sys.executable, "--window", "--port", str(port)]
+            exe = sys.executable
+            cmd = [exe, "--window", "--port", str(port)]
         else:
             exe = sys.executable or "pythonw.exe"
             if exe.lower().endswith("python.exe"):
@@ -125,65 +211,109 @@ def spawn(port: int = 7892) -> bool:
                 if Path(alt).is_file():
                     exe = alt
             cmd = [exe, str(root / "run.pyw"), "--window", "--port", str(port)]
-        subprocess.Popen(
+    except Exception as e:  # noqa: BLE001
+        return False, f"拼启动命令失败: {e}"
+
+    try:
+        proc = subprocess.Popen(
             cmd,
             cwd=str(root),
             close_fds=True,
             creationflags=0x00000008,  # DETACHED_PROCESS
         )
-        return True
     except Exception as e:  # noqa: BLE001
-        log.warning("开窗口进程失败: %s", e)
-        return False
+        return False, f"起子进程失败: {e}"
+
+    deadline = time.time() + max(1.0, wait)
+    while time.time() < deadline:
+        time.sleep(0.25)
+        if _find_console_window():
+            return True, ""
+        rc = proc.poll()
+        if rc is not None:
+            # 秒退：多半是程序集加载失败，把退出码带回去便于排查
+            return False, f"窗口进程立即退出（exit={rc}）"
+    # 超时但进程还活着：慢机器上首次加载 WebView2 可能要几秒，先算成功
+    if proc.poll() is None:
+        return True, "（启动较慢）"
+    return False, f"窗口进程退出（exit={proc.returncode}）"
 
 
 def open_console(port: int = 7892) -> str:
-    """优先原生窗口；实在不行退回浏览器。返回实际用的方式。"""
+    """优先原生窗口；起不来就退回浏览器，绝不静默。返回实际用的方式。"""
     if focus():
         return "focus"
-    ok, _why = available()
-    if ok and spawn(port):
-        return "window"
+
+    ok, why = available()
+    if ok:
+        good, err = spawn(port)
+        if good:
+            return "window"
+        log.warning("原生窗口起不来：%s", err)
+        # 大概率是 MOTW 拦住了程序集，清一次再试
+        if unblock_tree():
+            log.info("已清理 MOTW，重试一次")
+            good, err = spawn(port)
+            if good:
+                return "window"
+            log.warning("清 MOTW 后仍然起不来：%s", err)
+    else:
+        log.warning("pywebview 不可用：%s", why)
+
     try:
         import webbrowser
 
         webbrowser.open(f"http://127.0.0.1:{port}/")
         return "browser"
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log.error("连浏览器都打不开: %s", e)
         return "none"
 
 
 def run(port: int = 7892, title: str = TITLE_PREFIX) -> int:
     """开窗口并阻塞到用户关掉它。返回进程退出码。"""
+    # 先自愈：带 MOTW 的程序集一定加载失败，做完再谈别的
+    try:
+        unblock_tree()
+    except Exception:  # noqa: BLE001
+        pass
+
     ok, why = available()
     if not ok:
-        log.error("原生窗口不可用: %s", why)
+        _fatal(f"原生窗口装不起来：{why}\n\n请重新安装本程序，或用浏览器打开 http://127.0.0.1:{port}/")
         return 2
 
     import webview
 
+    # 后台没起来时开窗口只会得到一张连不上的白屏，不如直接说清楚
     if not backend_alive(port):
-        log.error("后台没在 127.0.0.1:%s 上响应", port)
+        _fatal(
+            f"后台没有在运行（127.0.0.1:{port} 没有响应）。\n\n"
+            "请先双击 VPNTray.exe 启动主程序，再打开控制台。",
+        )
+        return 6
 
     geo = _load_geo()
-    # 窗口标题带上版本，用户截图反馈时能看出是哪个版本
     try:
         from . import __version__ as _v
         title = f"{title} v{_v}"
     except Exception:  # noqa: BLE001
         pass
 
-    win = webview.create_window(
-        title,
-        f"http://127.0.0.1:{port}/",
-        width=geo["w"],
-        height=geo["h"],
-        min_size=(1000, 680),
-        background_color="#0b0f14",
-        text_select=True,
-        # 关掉右键菜单里的「重新加载/检查」，普通用户用不到那些
-        easy_drag=False,
-    )
+    try:
+        win = webview.create_window(
+            title,
+            f"http://127.0.0.1:{port}/",
+            width=geo["w"],
+            height=geo["h"],
+            min_size=(1000, 680),
+            background_color="#0b0f14",
+            text_select=True,
+            easy_drag=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        _fatal(f"创建窗口失败：{type(e).__name__}: {e}")
+        return 3
 
     def _remember() -> None:
         try:
@@ -196,8 +326,19 @@ def run(port: int = 7892, title: str = TITLE_PREFIX) -> int:
     except Exception:  # noqa: BLE001
         pass
 
-    # edgechromium = WebView2，Win11 自带，比 mshtml 快一个数量级
-    webview.start(gui="edgechromium", debug=bool(os.environ.get("VPNTRAY_UI_DEBUG")))
+    try:
+        webview.start(gui="edgechromium", debug=bool(os.environ.get("VPNTRAY_UI_DEBUG")))
+    except Exception as e:  # noqa: BLE001
+        # 这里是 2.0.0 静默失败的地方：异常被 DETACHED 进程的 stderr 吞掉，
+        # 父进程只看 Popen 成功就以为打开了窗口。
+        _fatal(
+            "控制台窗口无法启动：\n\n"
+            f"{type(e).__name__}: {e}\n\n"
+            "常见原因：文件被 Windows 标记为「来自 Internet」，"
+            "或缺少 WebView2 运行时。\n"
+            f"可以先用浏览器打开 http://127.0.0.1:{port}/ 继续使用。",
+        )
+        return 4
     return 0
 
 
@@ -209,7 +350,11 @@ def main(argv: list[str]) -> int:
                 port = int(argv[i + 1])
             except ValueError:
                 pass
-    return run(port)
+    try:
+        return run(port)
+    except Exception as e:  # noqa: BLE001
+        _fatal(f"窗口进程异常：{type(e).__name__}: {e}")
+        return 5
 
 
 if __name__ == "__main__":

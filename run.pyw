@@ -155,8 +155,17 @@ def _open_existing() -> bool:
 def main() -> int:
     # 原生窗口进程：只负责显示，不碰内核/订阅，所以不参与单实例检查
     if "--window" in sys.argv:
+        from vpntray import logger as _lg  # noqa: PLC0415
+        from vpntray import paths as _p  # noqa: PLC0415
         from vpntray import ui_native  # noqa: PLC0415
 
+        # 窗口进程也必须写日志：2.0.0 这里直接 return，子进程崩了连一行记录都没有，
+        # 用户反馈「点了没反应」时无从查起。
+        try:
+            _p.ensure_dirs()
+            _lg.setup()
+        except Exception:  # noqa: BLE001
+            pass
         return ui_native.main(sys.argv[1:])
 
     if _already_running():
@@ -180,6 +189,17 @@ def main() -> int:
         )
         return 1
     log = logger.get("main")
+
+    # 从浏览器下载的 zip 解压后每个文件都带「来自 Internet」标记（Zone.Identifier）。
+    # .NET 拒绝加载这种程序集，原生窗口就会起不来。这里先清一遍，用户不用知道这回事。
+    try:
+        from vpntray import ui_native as _un  # noqa: PLC0415
+
+        _n = _un.unblock_tree()
+        if _n:
+            log.info("已清除 %d 个文件的 Internet 来源标记", _n)
+    except Exception:  # noqa: BLE001
+        log.warning("清理 Internet 来源标记失败（不影响主功能）", exc_info=True)
 
     from vpntray.app import App  # noqa: PLC0415
     from vpntray.webui import WebUI  # noqa: PLC0415
