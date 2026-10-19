@@ -25,7 +25,7 @@
     font:14px/1.5 -apple-system,"Segoe UI Variable","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
     -webkit-font-smoothing:antialiased;
   }
-  .wrap{max-width:1180px;margin:0 auto;padding:22px 20px 60px}
+  .wrap{max-width:1320px;margin:0 auto;padding:18px 24px 52px}
 
   /* —— 底部使用须知 —— */
   .legal{max-width:1180px;margin:0 auto;padding:0 20px 46px}
@@ -37,8 +37,8 @@
   .legal-in .dim{color:var(--dim2)}
 
   /* ── 顶栏 ── */
-  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
-  .logo{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;
+  header{display:flex;align-items:center;gap:13px;flex-wrap:wrap;margin-bottom:14px}
+  .logo{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;
     background:linear-gradient(160deg,#1c8a4e,#22c55e);box-shadow:0 6px 20px -8px #22c55e88;font-weight:800;font-size:19px;color:#04170c}
   h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
   .sub{color:var(--dim);font-size:12px;margin-top:1px;font-variant-numeric:tabular-nums}
@@ -69,7 +69,7 @@
   .spacer{flex:1}
 
   /* ── 布局 ── */
-  .grid{display:grid;grid-template-columns:380px minmax(0,1fr);gap:16px;align-items:start}
+  .grid{display:grid;grid-template-columns:358px minmax(0,1fr);gap:14px;align-items:start}
   @media (max-width:1160px){.grid{grid-template-columns:1fr}}
 
   .card{background:linear-gradient(180deg,var(--card),var(--bg2));border:1px solid var(--line);
@@ -87,16 +87,57 @@
     font-size:11.5px;color:#9fb3cc;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
   .now-ai b{color:#7dd3fc;font-weight:600}
   .now-ai .tag{font-size:10px;padding:1px 6px;border-radius:999px;background:#0d2b3a;color:#7dd3fc;flex:none}
-  .stat-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}
-  .stat{background:#0b121b;border:1px solid var(--line);border-radius:10px;padding:9px 11px}
-  .stat b{display:block;font-size:15px;font-variant-numeric:tabular-nums;font-weight:700}
-  .stat span{color:var(--dim);font-size:11px}
+  /* 四个数字合成两行：上/下行是主角给大字，累计/连接退成小字。
+     原来四个等大的格子把左栏顶得很高，一屏里最重的视觉块是「0 B/s」这种
+     平时根本不看的数字，头重脚轻主要就重在这。 */
+  .now-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:11px}
+  .ns{background:#0b121b;border:1px solid var(--line);border-radius:9px;padding:7px 10px;
+    transition:border-color .18s, background .18s}
+  .ns:hover{border-color:#243447;background:#0d151f}
+  .ns b{display:block;font-size:14.5px;font-variant-numeric:tabular-nums;font-weight:700}
+  .ns span{color:var(--dim2);font-size:10.5px}
+  .ns.up b{color:#93c5fd}
+  .ns.dn b{color:#4ade80}
+  .now-sub{display:flex;align-items:center;gap:15px;margin-top:8px;font-size:11px;color:var(--dim2)}
+  .now-sub b{color:var(--dim);font-variant-numeric:tabular-nums;font-weight:600}
 
   /* ── 流量图 ── */
-  .chart-wrap{margin-top:14px;position:relative}
-  canvas{width:100%;height:78px;display:block;border-radius:10px;background:#0b121b;border:1px solid var(--line)}
-  .legend{display:flex;gap:14px;margin-top:8px;font-size:11.5px;color:var(--dim)}
-  .legend i{display:inline-block;width:18px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
+  .chart-wrap{margin-top:11px;position:relative}
+  canvas{width:100%;height:64px;display:block;border-radius:9px;background:#0b121b;border:1px solid var(--line)}
+  .legend{display:flex;gap:12px;margin-top:7px;font-size:11px;color:var(--dim2)}
+  .legend i{display:inline-block;width:16px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
+
+  /* ══════════ 动效 ══════════
+     原则：只在「状态真的变了」的地方动，不做无意义的呼吸灯。
+     全部走 composite-only 属性（transform/opacity），不触发重排。 */
+  @keyframes riseIn{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:none}}
+  .card{animation:riseIn .36s cubic-bezier(.22,.61,.36,1) both}
+  @keyframes rowIn{from{opacity:0;transform:translateX(-7px)}to{opacity:1;transform:none}}
+  .node{animation:rowIn .28s ease both;animation-delay:calc(var(--i,0) * 12ms)}
+  /* 数字真的变了才闪一下，眼睛能抓住「刚刚变了」 */
+  @keyframes tick{0%{color:#4ade80}100%{color:inherit}}
+  .ns b.tick{animation:tick .6s ease}
+  .btn{transition:transform .12s, border-color .18s, background .18s, color .18s}
+  .btn:active{transform:scale(.97)}
+  /* 当前节点那一行有一条缓慢扫过的光，告诉你「这是活的」。
+     用伪元素而不是 background-image：.node.cur 自己的 background 简写会把
+     后加的 background-image 冲掉（同优先级后定义赢）。 */
+  @keyframes sweep{0%{background-position:-160% 0}100%{background-position:260% 0}}
+  .node.cur{position:relative;overflow:hidden}
+  .node.cur::after{content:'';position:absolute;inset:0;pointer-events:none;
+    background-image:linear-gradient(100deg,transparent 32%,rgba(74,222,128,.13) 50%,transparent 68%);
+    background-size:230% 100%;animation:sweep 3.2s linear infinite}
+  .pin{transition:transform .16s ease-out}
+  .pin:hover{transform:scale(1.24)}
+  @keyframes slideDown{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+  .banner{animation:slideDown .3s ease both}
+  @keyframes popIn{0%{opacity:0;transform:translateY(14px) scale(.96)}100%{opacity:1;transform:none}}
+  .toast.on{animation:popIn .34s cubic-bezier(.34,1.56,.64,1)}
+  /* 系统开了「减少动效」就全关掉 */
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;
+      transition-duration:.01ms!important}
+  }
 
   /* ── 开关 ── */
   .row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px dashed #1b2533}
@@ -104,11 +145,13 @@
   .row .lbl{font-size:13px}
   .row .hint{color:var(--dim2);font-size:11px;margin-top:2px}
   .switch{position:relative;width:44px;height:25px;border-radius:999px;background:#22303f;
-    border:1px solid var(--line);cursor:pointer;flex:none;transition:.18s}
+    border:1px solid var(--line);cursor:pointer;flex:none;transition:background .2s, border-color .2s}
   .switch::after{content:"";position:absolute;top:2.5px;left:3px;width:17px;height:17px;border-radius:50%;
-    background:#8b9bb4;transition:.18s}
+    background:#8b9bb4;transition:left .26s cubic-bezier(.34,1.56,.64,1), background .2s}
+  .switch:hover{background:#2a3b4d}
   .switch.on{background:#14532d;border-color:#1d7a44}
   .switch.on::after{left:22px;background:var(--ok)}
+  .switch.on:hover{background:#185c33}
   .switch.dis{opacity:.45;pointer-events:none}
 
   /* ── 分段控件 ── */
@@ -273,6 +316,7 @@
   .map-prog span{font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums;
     min-width:112px;text-align:right;flex:none}
   .map-wrap{position:relative;width:100%;max-width:980px;margin:0 auto;aspect-ratio:1012/588;
+    max-height:min(52vh, 470px);
     user-select:none;overflow:hidden;border-radius:11px;border:1px solid var(--line);
     background:radial-gradient(120% 100% at 50% 0%, #0d1620 0%, #070b11 70%);
     cursor:grab;touch-action:none}
@@ -495,13 +539,13 @@
         <div class="now-name" id="nowName">—</div>
         <div class="now-meta" id="nowMeta">—</div>
         <div class="now-ai" id="nowAI" style="display:none"></div>
-        <div class="stat-row">
-          <div class="stat"><b id="upSpeed">0 B/s</b><span>上传</span></div>
-          <div class="stat"><b id="downSpeed">0 B/s</b><span>下载</span></div>
+        <div class="now-stats">
+          <div class="ns up"><b id="upSpeed">0 B/s</b><span>上传</span></div>
+          <div class="ns dn"><b id="downSpeed">0 B/s</b><span>下载</span></div>
         </div>
-        <div class="stat-row">
-          <div class="stat"><b id="totalDown">0 B</b><span>累计下行</span></div>
-          <div class="stat"><b id="connCount">0</b><span>活动连接</span></div>
+        <div class="now-sub">
+          <span>累计 <b id="totalDown">0 B</b></span>
+          <span>连接 <b id="connCount">0</b></span>
         </div>
         <div class="chart-wrap">
           <canvas id="chart" width="640" height="156"></canvas>
@@ -528,7 +572,7 @@
           </div>
           <div class="row">
             <div><div class="lbl">TUN 模式</div>
-              <div class="hint" id="tunHint">整台机器的流量都走代理（含游戏、命令行），需要管理员权限</div></div>
+              <div class="hint" id="tunHint">全机流量走代理（含游戏、命令行），需管理员权限</div></div>
             <div class="switch" id="swTun"></div>
           </div>
           <div class="row">
@@ -818,7 +862,7 @@
 const $ = s => document.querySelector(s);
 let STATE = null;
 // 页面自带的版本号；后端 build_state 也会返回 ui，两边不一致就强制刷新一次
-const UI_VER = '2.0.3';
+const UI_VER = '2.1.0';
 // 额度长条用的绿色梯度：第一条最亮，往后越来越深
 const GREEN_SHADES = ['#4ade80', '#37c96e', '#2aa95a', '#218a49', '#196c39', '#12522b', '#0c3b1f', '#082b16'];
 document.getElementById('uiVer').textContent = 'v' + UI_VER;
@@ -1021,10 +1065,20 @@ function render(){
   }
 
   const t = s.traffic || {};
-  $('#upSpeed').textContent = fmt(t.up_speed) + '/s';
-  $('#downSpeed').textContent = fmt(t.down_speed) + '/s';
-  $('#totalDown').textContent = fmt(t.down);
-  $('#connCount').textContent = s.connections ?? 0;
+  // 数字真的变了才闪一下。每 1.5 秒无脑重绘会让「闪」变成噪音，
+  // 所以先比字符串，变了才挂 .tick 类（动画结束后浏览器自己清掉）。
+  const tickIf = (el, text) => {
+    if (el.textContent !== text) {
+      el.textContent = text;
+      el.classList.remove('tick');
+      void el.offsetWidth;      // 强制重排，让动画能重播
+      el.classList.add('tick');
+    }
+  };
+  tickIf($('#upSpeed'), fmt(t.up_speed) + '/s');
+  tickIf($('#downSpeed'), fmt(t.down_speed) + '/s');
+  tickIf($('#totalDown'), fmt(t.down));
+  tickIf($('#connCount'), String(s.connections ?? 0));
 
   // 流量曲线：一个非数值混进去就会让 Math.max 变 NaN，整条曲线消失
   const nUp = Number(t.up_speed), nDown = Number(t.down_speed);
@@ -2123,7 +2177,7 @@ function renderNodes(){
     for (const n of sorted){
       idx++;
       MAP_LIST.push({...n, idx});
-      html += `<div class="node${n.current?' cur':''}" data-name="${esc(n.name)}" title="${esc(nodeTip(n))}">
+      html += `<div class="node${n.current?' cur':''}" data-name="${esc(n.name)}" title="${esc(nodeTip(n))}" style="--i:${Math.min(idx, 24)}">
         <span class="idx${mapFilter ? ' on' : ''}">${idx}</span>
         <span class="nm">${esc(n.name)}</span>
         ${nodeLocHtml(n)}

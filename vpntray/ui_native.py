@@ -327,7 +327,17 @@ def run(port: int = 7892, title: str = TITLE_PREFIX) -> int:
         pass
 
     try:
-        webview.start(gui="edgechromium", debug=bool(os.environ.get("VPNTRAY_UI_DEBUG")))
+        # icon 必须显式传：不传的话 pywebview 用默认图，任务栏和标题栏左边
+        # 会显示 Python 的图标（用户一眼就看出这是个 Python 程序）。
+        icon = None
+        try:
+            cand = paths.asset("app.ico")
+            if cand.exists():
+                icon = str(cand)
+        except Exception:  # noqa: BLE001
+            icon = None
+        webview.start(gui="edgechromium", debug=bool(os.environ.get("VPNTRAY_UI_DEBUG")),
+                      icon=icon)
     except Exception as e:  # noqa: BLE001
         # 这里是 2.0.0 静默失败的地方：异常被 DETACHED 进程的 stderr 吞掉，
         # 父进程只看 Popen 成功就以为打开了窗口。

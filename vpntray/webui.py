@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "2.0.3"
+UI_VER = "2.1.0"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
