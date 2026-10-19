@@ -133,7 +133,7 @@ def check(repo: str, current: str, local_port: int | None = None,
     size = _head_size(zip_url, proxies, timeout)
     page = f"{GH}/{repo}/releases/tag/{quote(tag, safe='')}"
 
-    if not size:
+    if size == 0:
         # 约定名不存在（手动发布的包名不统一）：退回 API 找资产
         fallback = _api_release(repo, proxies, timeout)
         if fallback:
@@ -146,6 +146,8 @@ def check(repo: str, current: str, local_port: int | None = None,
                     "error": f"最新版 {tag} 没挂 VPNTray-{latest}-win64.zip",
                     "notes": "", "page": page, "zip_url": "", "zip_size": 0,
                     "zip_sha256": "", "published": ""}
+    if size < 0:
+        size = 0      # 资产在，但服务端没给 Content-Length（chunked）；大小只用于显示
 
     return {
         "ok": True,
@@ -206,16 +208,25 @@ def _latest_tag(repo: str, proxies: dict[str, str] | None,
 
 
 def _head_size(url: str, proxies: dict[str, str] | None, timeout: float) -> int:
-    """用 stream 的 GET 只读 header 就断开，比 HEAD 兼容性好。0 表示拿不到/不存在。"""
+    """返回字节数。0 = 拿不到/不存在，-1 = 存在但不知道大小。
+
+    GitHub 的 release 资产是 302 到 objects.githubusercontent.com，
+    那边经常回 Transfer-Encoding: chunked（没有 Content-Length）。
+    早期版本把「没有 Content-Length」当成「资产不存在」，结果一出新版本
+    自动更新就报「没挂 VPNTray-x-win64.zip」——大小只是用来显示的，不能当存在性判据。
+    """
     try:
         r = _req_raw(url, proxies, timeout)
         try:
             if r.status_code != 200:
                 return 0
+            raw = r.headers.get("Content-Length")
+            if not raw:
+                return -1
             try:
-                return int(r.headers.get("Content-Length") or 0)
+                return int(raw)
             except (TypeError, ValueError):
-                return 0
+                return -1
         finally:
             r.close()
     except (UpdateError, requests.RequestException):
