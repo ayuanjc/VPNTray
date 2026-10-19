@@ -14,6 +14,10 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
     --add-data "$PSScriptRoot\assets;assets" `
     --hidden-import pystray._win32 `
     --hidden-import PIL._imaging `
+    --hidden-import webview.platforms.winforms `
+    --hidden-import clr_loader `
+    --hidden-import pythonnet `
+    --collect-data webview `
     --exclude-module tkinter `
     --distpath $PSScriptRoot `
     --workpath (Join-Path $PSScriptRoot 'build') `

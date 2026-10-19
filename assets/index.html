@@ -387,6 +387,25 @@
   .modal .hd{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--line)}
   .modal pre{margin:0;padding:14px 16px;overflow:auto;font:12px/1.6 ui-monospace,Consolas,monospace;
     color:#a8b7cc;white-space:pre-wrap;word-break:break-all}
+
+  /* ── 实时连接弹层 ── */
+  .conn-box{width:min(1020px,100%)!important;max-height:82vh!important}
+  .conn-sum{color:var(--dim);font-size:12px;margin-right:auto;margin-left:10px}
+  .conn-head,.conn-row{display:grid;grid-template-columns:1fr 130px 150px 116px 34px;
+    gap:10px;align-items:center;padding:8px 16px}
+  .conn-head{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.6px;
+    border-bottom:1px solid var(--line)}
+  .conn-list{overflow:auto;flex:1;min-height:120px}
+  .conn-row{border-bottom:1px solid #131b25;font-size:12.5px}
+  .conn-row:hover{background:#0f1620}
+  .conn-row .h{color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .conn-row .h em{color:var(--dim2);font-style:normal;font-size:11px}
+  .conn-row .r{color:var(--dim);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .conn-row .c{color:#7fd6a0;font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .conn-row .b{color:#8fb4dd;font-size:11.5px;text-align:right;font-variant-numeric:tabular-nums}
+  .conn-row .x{cursor:pointer;color:#5a6a7d;text-align:center;font-size:15px;line-height:1;user-select:none}
+  .conn-row .x:hover{color:#ff8f8f}
+  .conn-empty{padding:26px 16px;text-align:center;color:var(--dim2);font-size:12.5px}
   .toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);background:#16202e;
     border:1px solid var(--line);color:var(--txt);padding:10px 16px;border-radius:11px;font-size:13px;
     opacity:0;pointer-events:none;transition:.2s;z-index:60;box-shadow:0 12px 30px -12px #000}
@@ -508,6 +527,11 @@
             <div class="switch" id="swSysproxy"></div>
           </div>
           <div class="row">
+            <div><div class="lbl">TUN 模式</div>
+              <div class="hint" id="tunHint">整台机器的流量都走代理（含游戏、命令行），需要管理员权限</div></div>
+            <div class="switch" id="swTun"></div>
+          </div>
+          <div class="row">
             <div><div class="lbl">开机自启</div><div class="hint">登录后自动运行</div></div>
             <div class="switch" id="swAutostart"></div>
           </div>
@@ -572,6 +596,7 @@
         <div class="foot">
           <button class="btn" id="btnSub">更新订阅</button>
           <button class="btn" id="btnRestart">重启内核</button>
+          <button class="btn" id="btnConn">连接</button>
           <button class="btn" id="btnLog">日志</button>
           <button class="btn danger" id="btnQuit">退出程序</button>
         </div>
@@ -707,6 +732,22 @@
   </div>
 </div>
 
+<!-- 实时连接：看谁在联网、走了哪个节点、用了多少流量 -->
+<div class="modal" id="connModal">
+  <div class="box conn-box">
+    <div class="hd">
+      <b>实时连接</b>
+      <span class="conn-sum" id="connSum">—</span>
+      <button class="btn" id="btnConnClear">全部断开</button>
+      <button class="btn" id="btnCloseConn">关闭</button>
+    </div>
+    <div class="conn-head">
+      <span>目标</span><span>规则</span><span>出口</span><span>流量</span><span></span>
+    </div>
+    <div class="conn-list" id="connList"></div>
+  </div>
+</div>
+
 <!-- 首次使用：用户协议（必须先同意，拒绝就退出） -->
 <div class="modal" id="agreeModal">
   <div class="box agree-box">
@@ -777,7 +818,7 @@
 const $ = s => document.querySelector(s);
 let STATE = null;
 // 页面自带的版本号；后端 build_state 也会返回 ui，两边不一致就强制刷新一次
-const UI_VER = '1.9.1';
+const UI_VER = '2.0.0';
 // 额度长条用的绿色梯度：第一条最亮，往后越来越深
 const GREEN_SHADES = ['#4ade80', '#37c96e', '#2aa95a', '#218a49', '#196c39', '#12522b', '#0c3b1f', '#082b16'];
 document.getElementById('uiVer').textContent = 'v' + UI_VER;
@@ -1001,6 +1042,7 @@ function render(){
     el.classList.toggle('dis', !!disabled);
   };
   sw($('#swSysproxy'), s.sysproxy, !s.kernel_ok);
+  sw($('#swTun'), s.tun, !s.kernel_ok);
   // 校园网没过认证 / 断网时我们主动不接管，得说清楚「不是坏了，是在等网络」
   const spHint = $('#sysproxyHint');
   if (spHint) {
@@ -2208,6 +2250,21 @@ $('#swSysproxy').addEventListener('click', async () => {
   okOr(r, on ? '系统代理已开启' : '系统代理已关闭');
   setTimeout(poll, 600);
 });
+$('#swTun').addEventListener('click', async () => {
+  const on = !STATE.tun;
+  if (on && STATE.sysproxy && !confirm('开 TUN 会同时关掉系统代理（两个一起开会让流量绕成环）。继续？')) return;
+  const sw = $('#swTun');
+  if (sw.dataset.busy === '1') return;
+  sw.dataset.busy = '1';
+  toast(on ? '正在重启内核以启用 TUN…' : '正在关闭 TUN…');
+  try {
+    const r = await api('/api/tun', {on});
+    okOr(r, on ? 'TUN 已开启' : 'TUN 已关闭');
+  } finally {
+    sw.dataset.busy = '';
+    setTimeout(poll, 800);
+  }
+});
 $('#swAutostart').addEventListener('click', async () => {
   const on = !STATE.autostart;
   const r = await api('/api/autostart', {on});
@@ -2845,6 +2902,88 @@ $('#btnLog').addEventListener('click', async () => {
   $('#modal').classList.add('on');
 });
 $('#btnCloseLog').addEventListener('click', () => $('#modal').classList.remove('on'));
+
+/* ── 实时连接 ────────────────────────────────────────────── */
+let connTimer = 0;
+
+function fmtBytes(n){
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1){ v /= 1024; i++; }
+  return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + u[i];
+}
+
+function renderConn(d){
+  const list = $('#connList');
+  if (!list) return;
+  const sum = $('#connSum');
+  if (!d || d.ok === false){
+    list.innerHTML = '<div class="conn-empty">' + esc((d && d.error) || '拿不到连接列表') + '</div>';
+    if (sum) sum.textContent = '—';
+    return;
+  }
+  const items = Array.isArray(d.items) ? d.items : [];
+  if (sum) sum.textContent = items.length + ' 条 · 下行 ' + fmtBytes(d.down) + ' · 上行 ' + fmtBytes(d.up);
+  if (!items.length){
+    list.innerHTML = '<div class="conn-empty">当前没有活动连接</div>';
+    return;
+  }
+  list.innerHTML = items.map(it => {
+    const host = esc(it.host || it.dest || '—');
+    const proc = it.proc ? '<em>' + esc(String(it.proc).split(/[\\/]/).pop()) + '</em>' : '';
+    const rule = esc((it.rule || '—') + (it.type ? ' · ' + it.type : ''));
+    const chain = esc(it.chain || '—');
+    return '<div class="conn-row" data-id="' + esc(String(it.id || '')) + '">'
+      + '<span class="h" title="' + esc(it.host || '') + '">' + host + ' ' + proc + '</span>'
+      + '<span class="r">' + rule + '</span>'
+      + '<span class="c" title="' + chain + '">' + chain + '</span>'
+      + '<span class="b">↓' + fmtBytes(it.down) + ' ↑' + fmtBytes(it.up) + '</span>'
+      + '<span class="x" title="断开这条">×</span>'
+      + '</div>';
+  }).join('');
+}
+
+async function loadConn(){
+  try {
+    renderConn(await api('/api/connections', { limit: 300 }));
+  } catch (e) {
+    renderConn({ ok: false, error: String(e) });
+  }
+}
+
+$('#btnConn').addEventListener('click', () => {
+  $('#connModal').classList.add('on');
+  loadConn();
+  clearInterval(connTimer);
+  // 2 秒一次：内核自己就是 2 秒刷一次连接表，拉太快只是重复同一份数据
+  connTimer = setInterval(loadConn, 2000);
+});
+
+function closeConn(){
+  clearInterval(connTimer);
+  connTimer = 0;
+  $('#connModal').classList.remove('on');
+}
+$('#btnCloseConn').addEventListener('click', closeConn);
+
+$('#btnConnClear').addEventListener('click', async () => {
+  if (!confirm('断开全部连接？正在下载或上传的东西会中断。')) return;
+  const r = await api('/api/conn/clear', {});
+  toast(r.ok ? '已全部断开' : (r.error || '操作失败'));
+  loadConn();
+});
+
+$('#connList').addEventListener('click', async (ev) => {
+  const x = ev.target.closest('.x');
+  if (!x) return;
+  const row = x.closest('.conn-row');
+  const id = row && row.dataset.id;
+  if (!id) return;
+  const r = await api('/api/conn/close', { id });
+  if (!r.ok) toast(r.error || '断开失败');
+  loadConn();
+});
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') $('#modal').classList.remove('on'); });
 
 /* ── 地图交互：缩放 / 拖拽 / 点击筛选 ── */

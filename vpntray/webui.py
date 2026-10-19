@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.9.1"
+UI_VER = "2.0.0"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -191,6 +191,7 @@ def build_state(app) -> dict[str, Any]:
         # 网络还没就绪（校园网没过认证 / 断网）时主动不接管系统代理，
         # 前端据此把开关显示成「暂缓」而不是「用户关掉了」
         "sysproxy_hold": bool(st.get("sysproxy_hold")),
+        "tun": bool(s.get("tun")),
         "autostart": bool(s.get("autostart")),
         "auto_best": bool(s.get("auto_best")),
         "heal": bool(s.get("heal", True)),
@@ -513,6 +514,24 @@ class WebUI:
         def agree(body):
             return app.agree(str((body or {}).get("version") or ""))
 
+        # ── 实时连接 / TUN ──
+        def connections(body):
+            b = body or {}
+            return app.connections(_int(b.get("limit"), 200, 1, 1000))
+
+        def conn_close(body):
+            return app.close_connection(str((body or {}).get("id") or ""))
+
+        def conn_close_all(body):  # noqa: ARG001
+            return app.close_all_connections()
+
+        def tun(body):
+            b = body or {}
+            v = b.get("on")
+            if not isinstance(v, bool):
+                return {"ok": False, "error": "on 必须是 true / false"}
+            return app.set_tun(v)
+
         return {
             "/api/select": select,
             "/api/mode": mode,
@@ -546,6 +565,10 @@ class WebUI:
             "/api/feedback": feedback_send,
             "/api/feedback/open": feedback_open,
             "/api/agree": agree,
+            "/api/connections": connections,
+            "/api/conn/close": conn_close,
+            "/api/conn/clear": conn_close_all,
+            "/api/tun": tun,
         }
 
     def _do_quit(self) -> None:

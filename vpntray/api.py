@@ -106,6 +106,9 @@ class MihomoAPI:
     def connections(self) -> dict:
         return self._req("GET", "/connections", timeout=4) or {}
 
+    def close_connection(self, cid: str) -> None:
+        self._req("DELETE", f"/connections/{_q(str(cid))}", timeout=5)
+
     def close_all_connections(self) -> None:
         self._req("DELETE", "/connections", timeout=5)
 

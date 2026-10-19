@@ -502,12 +502,24 @@ class TrayWin:
         threading.Thread(target=run, daemon=True).start()
 
     def open_console(self) -> None:
-        url = self.webui.url if self.webui else f"http://127.0.0.1:7892/"
+        """双击图标 → 开原生窗口；没装 pywebview/WebView2 才退回浏览器。"""
+        port = 7892
         try:
-            webbrowser.open(url)
+            from urllib.parse import urlparse
+
+            if self.webui:
+                port = urlparse(self.webui.url).port or 7892
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from . import ui_native
+
+            mode = ui_native.open_console(port)
         except Exception as e:  # noqa: BLE001
-            log.warning("打开浏览器失败: %s", e)
-        self.notify(f"控制台：{url}")
+            log.warning("打开控制台失败: %s", e)
+            mode = "none"
+        if mode == "none":
+            self.notify("打开控制台失败，详见 data/logs/app.log")
 
     def _quit(self) -> None:
         # 可能从 Web 面板线程调用，必须切回 UI 线程做清理

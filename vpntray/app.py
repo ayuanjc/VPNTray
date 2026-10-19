@@ -17,6 +17,23 @@ from .kernel import Kernel
 from .paths import CONFIG, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
 from .settings import Settings
 
+
+def _num(v: Any, default: float = 0.0) -> float:
+    """把内核回来的数字转成 float。
+
+    bool 不算数字：Python 里 True + 1 == 2，直接用 float() 会把 true 当成 1 算进流量。
+    NaN / ±inf 也一并挡掉，否则前端 toFixed 会抛错、排序会退化成随机。
+    """
+    if isinstance(v, bool):
+        return default
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return default
+    if n != n or n in (float("inf"), float("-inf")):
+        return default
+    return n
+
 log = logging.getLogger("app")
 
 
@@ -1420,6 +1437,118 @@ class App:
         return {"ok": bool(res.get("ok", True)), "detail": res, "scan": after}
 
     # ── 反馈 / 用户协议 ────────────────────────────────────────────────
+    # ——— 实时连接 ———
+
+    def connections(self, limit: int = 200) -> dict[str, Any]:
+        """当前所有连接，按流量降序。
+
+        内核自己会把 /connections 回成一坨（含每条连接的完整元数据），
+        前端只需要「谁在用、走了哪个节点、用了多少流量」，所以这里先削一刀。
+        """
+        if not self.kernel.running():
+            return {"ok": False, "error": "内核没在运行", "items": [], "down": 0, "up": 0}
+        try:
+            raw = self.api.connections()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e), "items": [], "down": 0, "up": 0}
+
+        conns = raw.get("connections") if isinstance(raw.get("connections"), list) else []
+        items: list[dict[str, Any]] = []
+        for c in conns:
+            if not isinstance(c, dict):
+                continue
+            meta = c.get("metadata") if isinstance(c.get("metadata"), dict) else {}
+            up = _num(c.get("upload"))
+            down = _num(c.get("download"))
+            chains = c.get("chains") if isinstance(c.get("chains"), list) else []
+            items.append({
+                "id": str(c.get("id") or ""),
+                "host": str(meta.get("host") or meta.get("destinationIP") or ""),
+                "dest": str(meta.get("destinationIP") or ""),
+                "port": str(meta.get("destinationPort") or ""),
+                "net": str(meta.get("network") or ""),
+                "type": str(meta.get("type") or ""),
+                "proc": str(meta.get("process") or meta.get("processPath") or ""),
+                "rule": str(c.get("rule") or ""),
+                "chain": str(chains[0]) if chains else "",
+                "up": up,
+                "down": down,
+                "start": str(c.get("start") or ""),
+            })
+        items.sort(key=lambda x: -(x["down"] + x["up"]))
+        return {
+            "ok": True,
+            "items": items[: max(1, min(int(limit), 1000))],
+            "total": len(items),
+            "down": _num(raw.get("downloadTotal")),
+            "up": _num(raw.get("uploadTotal")),
+        }
+
+    def close_connection(self, cid: str = "") -> dict[str, Any]:
+        if not cid:
+            return {"ok": False, "error": "缺少连接 id"}
+        try:
+            self.api.close_connection(cid)
+            return {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    def close_all_connections(self) -> dict[str, Any]:
+        try:
+            self.api.close_all_connections()
+            # 全断之后内核要把现有 TCP 都拆掉，流量计数会立刻回落，通知前端刷一次
+            self._changed()
+            return {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    # ——— TUN 模式 ———
+
+    def set_tun(self, on: bool) -> dict[str, Any]:
+        """TUN 是内核层的虚拟网卡，改完必须重启内核才生效。
+
+        和系统代理不是一回事：系统代理只影响读 WinINET/internet 选项的程序，
+        TUN 会在内核里接管整台机器的流量（包括不认代理的命令行工具和游戏）。
+        两者不能同时开——同时开会变成「流量进 TUN 又被系统代理再指回 7891」的死循环。
+        """
+        want = bool(on)
+        if want and not netguard.is_admin():
+            return {"ok": False, "error": "TUN 需要管理员权限：请退出程序，右键「以管理员身份运行」再开"}
+
+        old = bool(self.settings.get("tun"))
+        if old == want:
+            return {"ok": True, "unchanged": True, "tun": want}
+
+        self._set(busy="切换 TUN")
+        try:
+            self.settings["tun"] = want
+            self.settings.save()
+            # 开 TUN 时把系统代理关掉，避免双重接管
+            if want and self.settings.get("system_proxy"):
+                self.settings["system_proxy"] = False
+                self.settings.save()
+                try:
+                    sysproxy.disable()
+                except Exception:  # noqa: BLE001
+                    log.warning("关系统代理失败（继续开 TUN）", exc_info=True)
+            ok = self.restart_kernel()
+            if not ok:
+                self.settings["tun"] = old
+                self.settings.save()
+                return {"ok": False, "error": "内核重启失败，已回滚", "tun": old}
+            self._set(tun=want, tun_on=want)
+            return {"ok": True, "tun": want}
+        except Exception as e:  # noqa: BLE001
+            log.exception("切换 TUN 失败")
+            self.settings["tun"] = old
+            try:
+                self.settings.save()
+            except Exception:  # noqa: BLE001
+                pass
+            return {"ok": False, "error": f"{type(e).__name__}: {e}", "tun": old}
+        finally:
+            self._set(busy="")
+
     def feedback_send(self, title: str, detail: str, email: str = "") -> dict[str, Any]:
         from . import feedback
 

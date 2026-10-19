@@ -9,11 +9,14 @@
     --pystray    使用旧的 pystray 托盘（备用）
     --no-web     不启动 Web 控制台
     --console    同时打开浏览器控制台
+    --window     只开原生窗口（独立进程，见 vpntray/ui_native.py）
+    --port N     配合 --window 指定后台端口
 """
 from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 import sys
 import threading
 import traceback
@@ -53,6 +56,67 @@ def _msgbox(text: str, flags: int = 0x40) -> None:
         pass
 
 
+def _spawn_console(port: int) -> bool:
+    """为已经在跑的后台另起一个原生窗口进程。
+
+    窗口不能和后台同进程：后台主线程被托盘的 Win32 消息泵占着，
+    pywebview 又必须要主线程起 WinForms 消息泵，两者抢不了同一个线程。
+    """
+    try:
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            cmd = [exe, "--window", "--port", str(port)]
+        else:
+            exe = sys.executable or "pythonw.exe"
+            # 源码模式下 sys.executable 可能是带控制台的 python.exe，换成 pythonw 免得弹黑框
+            if exe.lower().endswith("python.exe"):
+                alt = os.path.join(os.path.dirname(exe), "pythonw.exe")
+                if os.path.isfile(alt):
+                    exe = alt
+            cmd = [exe, str(ROOT / "run.pyw"), "--window", "--port", str(port)]
+        subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            close_fds=True,
+            creationflags=0x00000008,  # DETACHED_PROCESS：窗口进程不跟着后台一起死
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _focus_console() -> bool:
+    """已经有窗口就把那个窗口拎到前台，别开第二个。"""
+    try:
+        u32 = ctypes.windll.user32
+        found: list[int] = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _cb(hwnd, _lparam):  # noqa: ANN001
+            if not u32.IsWindowVisible(hwnd):
+                return True
+            n = u32.GetWindowTextLengthW(hwnd)
+            if n <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 1)
+            u32.GetWindowTextW(hwnd, buf, n + 1)
+            if buf.value.startswith("VPN Tray 控制台"):
+                found.append(hwnd)
+                return False
+            return True
+
+        u32.EnumWindows(_cb, None)
+        if not found:
+            return False
+        hwnd = found[0]
+        if u32.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        u32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _open_existing() -> bool:
     """第二个实例启动时，直接把已经在跑的控制台打开。
 
@@ -61,6 +125,9 @@ def _open_existing() -> bool:
     本程序（127.0.0.1 上的其它服务也会应答）。
     """
     import urllib.request
+
+    if _focus_console():
+        return True
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 别走系统代理
     for port in range(7892, 7900):
@@ -72,6 +139,9 @@ def _open_existing() -> bool:
             continue
         if "VPN Tray 控制台" not in head:
             continue
+        if _spawn_console(port):
+            return True
+        # 原生窗口起不来（没装 pywebview / WebView2）才退回浏览器
         try:
             import webbrowser
 
@@ -83,6 +153,12 @@ def _open_existing() -> bool:
 
 
 def main() -> int:
+    # 原生窗口进程：只负责显示，不碰内核/订阅，所以不参与单实例检查
+    if "--window" in sys.argv:
+        from vpntray import ui_native  # noqa: PLC0415
+
+        return ui_native.main(sys.argv[1:])
+
     if _already_running():
         if not _open_existing():
             _msgbox("VPN Tray 已经在运行了。\n\n双击右下角托盘图标（绿色 V）可以打开控制台。")
