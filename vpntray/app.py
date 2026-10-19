@@ -11,7 +11,7 @@ from typing import Any, Callable
 import requests
 
 from . import __version__ as _VERSION
-from . import autostart, configgen, disguise, kernel as kernel_mod, purity, subscription, sysproxy
+from . import autostart, configgen, disguise, kernel as kernel_mod, netguard, purity, subscription, sysproxy
 from .api import ApiError, MihomoAPI
 from .kernel import Kernel
 from .paths import CONFIG, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
@@ -164,7 +164,17 @@ class App:
         self._apply_mode(self.settings.get("mode", "rule"))
 
         if self.settings.get("system_proxy", True):
-            self.toggle_system_proxy(True, silent=True)
+            # 开机/刚连上 WiFi 时，校园网这类网络往往还没过门户认证。
+            # 这时候接管系统代理等于把浏览器锁死：认证页自己都要走代理，
+            # 而代理指向的内核此刻一个节点都不通。先探一下，不通就先让路，
+            # 通了以后 _loop_health 会自动接回来。
+            blocked, why = netguard.portal_status()
+            if blocked:
+                log.warning("网络尚未就绪（%s），本次先不接管系统代理", why)
+                self._set(sysproxy=False, sysproxy_hold=True)
+                self.notify(netguard.portal_hint(why))
+            else:
+                self.toggle_system_proxy(True, silent=True)
 
         self.refresh_now()
         self._sync_ai_node()
@@ -1118,6 +1128,18 @@ class App:
     # ══════════ 系统代理 / 自启 ══════════
     def toggle_system_proxy(self, on: bool, silent: bool = False) -> None:
         server = f"127.0.0.1:{self.settings.get('mixed_port')}"
+        if on and not silent:
+            # 手动点开关时也拦一道：校园网没过认证就接管，
+            # 用户会立刻打不开任何网页，连认证页都进不去 —— 这比「点了没反应」糟得多
+            blocked, why = netguard.portal_status()
+            if blocked:
+                hint = ("现在多半还没登录校园网。先把登录页打开、登录成功，"
+                        "再回来开这个开关（程序也会自动接上）") if why == "captive" else \
+                       "现在网络还没通。等能正常打开网页了再开这个开关（程序也会自动接上）"
+                log.warning("拒绝接管系统代理：%s", why)
+                self.notify(hint)
+                self._set(sysproxy=False, sysproxy_hold=True)
+                return
         # 先把意图落盘再动注册表：顺序反了的话，注册表改完、save 抛异常，
         # settings 里还是旧值，退出时按旧值判断就漏还原 → 用户断网。
         prev = bool(self.settings.get("system_proxy", False))
@@ -1144,7 +1166,7 @@ class App:
             log.warning("系统代理操作失败: %s", e)
             self.notify(f"系统代理操作失败：{e}")
             return
-        self._set(sysproxy=bool(on))
+        self._set(sysproxy=bool(on), sysproxy_hold=False)
         if not silent:
             self.notify("系统代理已开启" if on else "系统代理已关闭（浏览器等不再走代理）")
 
@@ -1225,6 +1247,17 @@ class App:
             if self.settings.get("system_proxy") and self.kernel.running():
                 server = f"127.0.0.1:{self.settings['mixed_port']}"
                 if not sysproxy.is_enabled_to(server):
+                    # 抢回来之前必须先确认「现在接管是帮忙而不是添乱」。
+                    # 校园网没认证时，代理被清掉恰恰是用户自己修的（或火绒修的），
+                    # 我们每 20 秒抢一次，用户就永远进不了认证页。
+                    blocked, why = netguard.portal_status()
+                    if blocked:
+                        if not self.state.get("sysproxy_hold"):
+                            log.info("网络尚未就绪（%s），暂不接管系统代理", why)
+                            self._set(sysproxy_hold=True, sysproxy=False)
+                        continue
+                    if self.state.get("sysproxy_hold"):
+                        self._set(sysproxy_hold=False)
                     log.warning("系统代理被其它程序改动，重新接管回 %s", server)
                     try:
                         sysproxy.enable(server)

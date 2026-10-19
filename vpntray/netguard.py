@@ -229,5 +229,80 @@ def is_admin() -> bool:
         return False
 
 
+# ────────────────────── 门户认证（captive portal）探测 ──────────────────────
+# 校园网 / 酒店 / 机场这种「先连上 WiFi 但还得打开网页认证」的网络，
+# 在认证之前任何 HTTP 都会被网关劫持到认证页。
+# 这种时候把系统代理指到还没起来的内核端口，等于把用户的浏览器彻底锁死：
+# 认证页自己都得走代理，代理又不通 —— 用户连修都无从下手（火绒断网修复就是清代理）。
+#
+# 探针选的都是「必须返回固定内容」的公网地址，直连打（不走系统代理）。
+CAPTIVE_PROBES = (
+    ("http://connect.rom.miui.com/generate_204", 204, None),
+    ("http://www.gstatic.com/generate_204", 204, None),
+    ("http://www.msftconnecttest.com/connecttest.txt", 200, "Microsoft Connect Test"),
+)
+
+_PORTAL_CACHE: dict[str, Any] = {"ts": 0.0, "blocked": False, "reason": "", "how": ""}
+_PORTAL_TTL = 25.0
+
+
+def portal_status(timeout: float = 3.0, use_cache: bool = True) -> tuple[bool, str]:
+    """判断当前网络是不是「还没通」（没过认证 / 干脆断网）。
+
+    返回 (blocked, reason)：
+      blocked=True 时 reason 是 `captive`（被门户劫持）或 `offline`（完全连不上）。
+
+    探针都返回预期内容才算通。只要有一个通就算通 —— 不同运营商可能拦掉其中某几个。
+    """
+    import time as _t
+
+    now = _t.time()
+    if use_cache and now - float(_PORTAL_CACHE["ts"]) < _PORTAL_TTL:
+        return bool(_PORTAL_CACHE["blocked"]), str(_PORTAL_CACHE["reason"])
+
+    import requests
+
+    saw_http = False   # 收到了 HTTP 响应（哪怕内容不对）→ 说明链路是通的，只是被劫持
+    how = ""
+    try:
+        with requests.Session() as s:
+            # 绝对直连：既不看环境变量，也不看注册表里的系统代理
+            s.trust_env = False
+            s.proxies = {"http": None, "https": None}
+            for url, want_code, want_text in CAPTIVE_PROBES:
+                try:
+                    with s.get(url, timeout=timeout, allow_redirects=False,
+                               headers={"User-Agent": "Mozilla/5.0 VPNTray-probe"}) as r:
+                        saw_http = True
+                        if r.status_code != want_code:
+                            how = f"{url} -> HTTP {r.status_code}"
+                            continue
+                        if want_text is not None:
+                            body = (r.text or "")[:200]
+                            if want_text not in body:
+                                how = f"{url} -> 内容不符（多半是门户页）"
+                                continue
+                        # 命中一个就算通
+                        _PORTAL_CACHE.update({"ts": now, "blocked": False, "reason": "", "how": url})
+                        return False, ""
+                except Exception as e:  # noqa: BLE001
+                    how = f"{url} -> {type(e).__name__}"
+                    continue
+    except Exception as e:  # noqa: BLE001
+        how = f"探测异常 {type(e).__name__}"
+
+    reason = "captive" if saw_http else "offline"
+    _PORTAL_CACHE.update({"ts": now, "blocked": True, "reason": reason, "how": how})
+    return True, reason
+
+
+def portal_hint(reason: str) -> str:
+    """给用户看的一句话，别只说「没网」。"""
+    if reason == "captive":
+        return "当前网络需要先登录（校园网 / 酒店那种），系统代理先不接管，登录完会自动接上"
+    return "当前网络还没通，系统代理先不接管，网络恢复后会自动接上"
+
+
 __all__ = ["scan", "wipe_system_proxy", "kill_apps", "disable_adapters",
-           "system_proxy_state", "is_admin", "PROXY_APP_PATTERNS"]
+           "system_proxy_state", "is_admin", "PROXY_APP_PATTERNS",
+           "portal_status", "portal_hint"]

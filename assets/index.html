@@ -504,7 +504,7 @@
 
         <div style="margin-top:14px">
           <div class="row">
-            <div><div class="lbl">系统代理</div><div class="hint">接管浏览器与桌面软件</div></div>
+            <div><div class="lbl">系统代理</div><div class="hint" id="sysproxyHint">接管浏览器与桌面软件</div></div>
             <div class="switch" id="swSysproxy"></div>
           </div>
           <div class="row">
@@ -777,7 +777,7 @@
 const $ = s => document.querySelector(s);
 let STATE = null;
 // 页面自带的版本号；后端 build_state 也会返回 ui，两边不一致就强制刷新一次
-const UI_VER = '1.9.0';
+const UI_VER = '1.9.1';
 // 额度长条用的绿色梯度：第一条最亮，往后越来越深
 const GREEN_SHADES = ['#4ade80', '#37c96e', '#2aa95a', '#218a49', '#196c39', '#12522b', '#0c3b1f', '#082b16'];
 document.getElementById('uiVer').textContent = 'v' + UI_VER;
@@ -1001,6 +1001,17 @@ function render(){
     el.classList.toggle('dis', !!disabled);
   };
   sw($('#swSysproxy'), s.sysproxy, !s.kernel_ok);
+  // 校园网没过认证 / 断网时我们主动不接管，得说清楚「不是坏了，是在等网络」
+  const spHint = $('#sysproxyHint');
+  if (spHint) {
+    if (s.sysproxy_hold) {
+      spHint.textContent = '网络未就绪，暂缓接管（联网后自动接上）';
+      spHint.style.color = '#e0b341';
+    } else {
+      spHint.textContent = '接管浏览器与桌面软件';
+      spHint.style.color = '';
+    }
+  }
   sw($('#swAutostart'), s.autostart);
   sw($('#swAutoBest'), s.auto_best);
   sw($('#swHeal'), s.heal);

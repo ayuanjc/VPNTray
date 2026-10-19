@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.9.0"
+UI_VER = "1.9.1"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -188,6 +188,9 @@ def build_state(app) -> dict[str, Any]:
         "busy": st.get("busy", ""),
         "mode": st.get("mode"),
         "sysproxy": st.get("sysproxy"),
+        # 网络还没就绪（校园网没过认证 / 断网）时主动不接管系统代理，
+        # 前端据此把开关显示成「暂缓」而不是「用户关掉了」
+        "sysproxy_hold": bool(st.get("sysproxy_hold")),
         "autostart": bool(s.get("autostart")),
         "auto_best": bool(s.get("auto_best")),
         "heal": bool(s.get("heal", True)),
