@@ -29,6 +29,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +40,9 @@ from . import paths
 log = logging.getLogger("ui")
 
 TITLE_PREFIX = "VPN Tray 控制台"
+# 任务栏分组用的标识。整个产品统一这一个，主进程和窗口进程都要设成一样，
+# 否则两边各算一个应用，图标、跳转列表都会错乱。
+APP_ID = "ayuanjc.VPNTray.Desktop"
 GEO_FILE = paths.DATA / "window.json"
 DEFAULT_GEO = {"w": 1400, "h": 920}
 # 窗口从 create Popen 到真的出现，实测 1.2–2.5 秒（WebView2 首次加载更久）
@@ -270,8 +274,45 @@ def open_console(port: int = 7892) -> str:
         return "none"
 
 
+def _set_app_id() -> None:
+    """给进程一个显式 AppUserModelID。
+
+    不设的话 Windows 任务栏按「exe 路径」分组，dev 下就是 pythonw.exe 的图标
+    （那个 Python 蛇形 logo），窗口自己设的 WM_SETICON 管不到任务栏按钮。
+    设了 AppID 之后任务栏才按窗口图标走。
+    """
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            ctypes.c_wchar_p(APP_ID))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _force_icon(hwnd: int, ico_path: str) -> None:
+    """窗口显示后再钉一次 WM_SETICON（大/小两个都设）。
+
+    pywebview 设的是 Form.Icon，在部分 Windows 版本上任务栏按钮仍会回落到
+    exe 图标；这里直接对 hwnd 补一刀，确保 ICON_BIG 是我们那张。
+    """
+    try:
+        LR_LOADFROMFILE = 0x0010
+        IMAGE_ICON = 1
+        big = ctypes.windll.user32.LoadImageW(
+            None, ctypes.c_wchar_p(ico_path), IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+        small = ctypes.windll.user32.LoadImageW(
+            None, ctypes.c_wchar_p(ico_path), IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+        WM_SETICON = 0x0080
+        if big:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 1, big)
+        if small:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 0, small)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def run(port: int = 7892, title: str = TITLE_PREFIX) -> int:
     """开窗口并阻塞到用户关掉它。返回进程退出码。"""
+    _set_app_id()   # 必须在创建任何窗口之前
     # 先自愈：带 MOTW 的程序集一定加载失败，做完再谈别的
     try:
         unblock_tree()
@@ -326,18 +367,36 @@ def run(port: int = 7892, title: str = TITLE_PREFIX) -> int:
     except Exception:  # noqa: BLE001
         pass
 
+    # 显式取图标路径，窗口显示后还要用它补一刀
+    icon_path = ""
     try:
-        # icon 必须显式传：不传的话 pywebview 用默认图，任务栏和标题栏左边
-        # 会显示 Python 的图标（用户一眼就看出这是个 Python 程序）。
-        icon = None
+        cand = paths.asset("app.ico")
+        if cand.exists():
+            icon_path = str(cand)
+    except Exception:  # noqa: BLE001
+        icon_path = ""
+
+    def _pin_icon() -> None:
+        """Form.Icon 有时管不到任务栏按钮，窗口出来后再对 hwnd 钉一次。"""
+        if not icon_path:
+            return
         try:
-            cand = paths.asset("app.ico")
-            if cand.exists():
-                icon = str(cand)
+            hwnd = int(win.native.Handle.ToInt64())
         except Exception:  # noqa: BLE001
-            icon = None
+            return
+        # 窗口刚 show 时 papi 还没完全建好，稍等一下再钉
+        for _ in range(6):
+            _force_icon(hwnd, icon_path)
+            time.sleep(0.25)
+
+    try:
+        win.events.shown += lambda: threading.Thread(target=_pin_icon, daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
         webview.start(gui="edgechromium", debug=bool(os.environ.get("VPNTRAY_UI_DEBUG")),
-                      icon=icon)
+                      icon=icon_path or None)
     except Exception as e:  # noqa: BLE001
         # 这里是 2.0.0 静默失败的地方：异常被 DETACHED 进程的 stderr 吞掉，
         # 父进程只看 Popen 成功就以为打开了窗口。

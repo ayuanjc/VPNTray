@@ -69,7 +69,7 @@
   .spacer{flex:1}
 
   /* ── 布局 ── */
-  .grid{display:grid;grid-template-columns:358px minmax(0,1fr);gap:14px;align-items:start}
+  .grid{display:grid;grid-template-columns:340px minmax(0,1fr);gap:14px;align-items:start}
   @media (max-width:1160px){.grid{grid-template-columns:1fr}}
 
   .card{background:linear-gradient(180deg,var(--card),var(--bg2));border:1px solid var(--line);
@@ -140,7 +140,7 @@
   }
 
   /* ── 开关 ── */
-  .row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px dashed #1b2533}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px dashed #1b2533}
   .row:last-child{border-bottom:0}
   .row .lbl{font-size:13px}
   .row .hint{color:var(--dim2);font-size:11px;margin-top:2px}
@@ -501,6 +501,23 @@
   .map-card > h2::before{content:none}
   .inp::placeholder{color:#4d5b6e}
 
+
+  /* ── 总开关：整个界面最重要的一个按钮 ── */
+  .power{width:100%;margin-top:12px;height:44px;border-radius:11px;border:1px solid #1d7a44;
+    background:linear-gradient(180deg,#17913f,#12692f);color:#eafff0;font-size:14px;font-weight:700;
+    display:flex;align-items:center;justify-content:center;gap:9px;cursor:pointer;
+    font-family:inherit;transition:transform .12s, filter .18s, background .2s, border-color .2s, color .2s}
+  .power:hover{filter:brightness(1.1)}
+  .power:active{transform:scale(.985)}
+  .power .dot{width:8px;height:8px;border-radius:50%;background:#bbf7d0;
+    box-shadow:0 0 0 3px rgba(187,247,208,.22);transition:background .2s, box-shadow .2s}
+  .power.on{background:#141c26;border-color:#3b2a2a;color:#ff9b9b}
+  .power.on:hover{background:#1a222e}
+  .power.on .dot{background:#ff6b6b;box-shadow:0 0 0 3px rgba(255,107,107,.2)}
+  .power[disabled]{opacity:.6;pointer-events:none}
+  /* 底部通栏卡（关于/帮助） */
+  .card.wide{max-width:none}
+
   /* 首次使用：还没有订阅时的引导高亮 */
   @keyframes needPulse{0%,100%{border-color:var(--line)}50%{border-color:#2e7d52}}
   .card.need{border-color:#2e7d52;animation:needPulse 2.2s ease-in-out infinite}
@@ -535,10 +552,13 @@
     <!-- 左栏 -->
     <div>
       <div class="card now" id="nowCard">
-        <h2>当前节点</h2>
+        <h2>代理<span class="h2r" id="nowState">未连接</span></h2>
         <div class="now-name" id="nowName">—</div>
         <div class="now-meta" id="nowMeta">—</div>
         <div class="now-ai" id="nowAI" style="display:none"></div>
+        <button class="power" id="btnPower">
+          <span class="dot"></span><span class="txt">连接</span>
+        </button>
         <div class="now-stats">
           <div class="ns up"><b id="upSpeed">0 B/s</b><span>上传</span></div>
           <div class="ns dn"><b id="downSpeed">0 B/s</b><span>下载</span></div>
@@ -646,54 +666,6 @@
         </div>
       </div>
 
-      <div class="card" style="margin-top:14px" id="aboutCard">
-        <h2>关于 · 帮助 <span class="h2r" id="verNow"></span></h2>
-        <div class="upd-row">
-          <div class="upd-l">
-            <b id="updTitle">检查更新</b>
-            <span id="updSub">启动后自动查一次，有新版才提示</span>
-          </div>
-          <button class="btn" id="btnCheckUpd">检查</button>
-        </div>
-        <div class="upd-box" id="updBox" hidden>
-          <div class="upd-head">
-            <b id="updVer"></b>
-            <span class="upd-date" id="updDate"></span>
-          </div>
-          <pre class="upd-notes" id="updNotes"></pre>
-          <div class="foot" style="margin-top:8px">
-            <button class="btn primary" id="btnApplyUpd">下载并安装</button>
-            <button class="btn" id="btnOpenPage">打开发布页</button>
-          </div>
-        </div>
-        <div class="upd-bar" id="updBar" hidden>
-          <div class="upd-fill" id="updFill"></div>
-        </div>
-
-        <div class="upd-row" style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
-          <div class="upd-l">
-            <b>代理冲突清理</b>
-            <span id="ngSub">别的代理软件会抢系统代理和路由</span>
-          </div>
-          <button class="btn" id="btnNetGuard">检测</button>
-        </div>
-        <div class="ng-box" id="ngBox" hidden>
-          <pre id="ngText"></pre>
-          <div class="foot" style="margin-top:9px">
-            <button class="btn danger" id="btnNgSys">关闭系统代理</button>
-            <button class="btn danger" id="btnNgApps" hidden>结束冲突进程</button>
-            <button class="btn danger" id="btnNgAdap" hidden>禁用 TUN 网卡</button>
-          </div>
-        </div>
-
-        <div class="upd-row" style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px">
-          <div class="upd-l">
-            <b>问题反馈</b>
-            <span>自动附带脱敏日志，一键发到 GitHub</span>
-          </div>
-          <button class="btn" id="btnFeedback">反馈</button>
-        </div>
-      </div>
     </div>
 
     <!-- 右栏：地图 + 节点 -->
@@ -755,6 +727,56 @@
     </div>
   </div>
 </div>
+
+      <div class="card wide" style="margin-top:14px" id="aboutCard">
+        <h2>关于 · 帮助 <span class="h2r" id="verNow"></span></h2>
+        <div class="upd-row">
+          <div class="upd-l">
+            <b id="updTitle">检查更新</b>
+            <span id="updSub">启动后自动查一次，有新版才提示</span>
+          </div>
+          <button class="btn" id="btnCheckUpd">检查</button>
+        </div>
+        <div class="upd-box" id="updBox" hidden>
+          <div class="upd-head">
+            <b id="updVer"></b>
+            <span class="upd-date" id="updDate"></span>
+          </div>
+          <pre class="upd-notes" id="updNotes"></pre>
+          <div class="foot" style="margin-top:8px">
+            <button class="btn primary" id="btnApplyUpd">下载并安装</button>
+            <button class="btn" id="btnOpenPage">打开发布页</button>
+          </div>
+        </div>
+        <div class="upd-bar" id="updBar" hidden>
+          <div class="upd-fill" id="updFill"></div>
+        </div>
+
+        <div class="upd-row" style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+          <div class="upd-l">
+            <b>代理冲突清理</b>
+            <span id="ngSub">别的代理软件会抢系统代理和路由</span>
+          </div>
+          <button class="btn" id="btnNetGuard">检测</button>
+        </div>
+        <div class="ng-box" id="ngBox" hidden>
+          <pre id="ngText"></pre>
+          <div class="foot" style="margin-top:9px">
+            <button class="btn danger" id="btnNgSys">关闭系统代理</button>
+            <button class="btn danger" id="btnNgApps" hidden>结束冲突进程</button>
+            <button class="btn danger" id="btnNgAdap" hidden>禁用 TUN 网卡</button>
+          </div>
+        </div>
+
+        <div class="upd-row" style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px">
+          <div class="upd-l">
+            <b>问题反馈</b>
+            <span>自动附带脱敏日志，一键发到 GitHub</span>
+          </div>
+          <button class="btn" id="btnFeedback">反馈</button>
+        </div>
+      </div>
+
 
 <footer class="legal" id="legal">
   <div class="legal-in">
@@ -862,7 +884,7 @@
 const $ = s => document.querySelector(s);
 let STATE = null;
 // 页面自带的版本号；后端 build_state 也会返回 ui，两边不一致就强制刷新一次
-const UI_VER = '2.1.0';
+const UI_VER = '2.2.0';
 // 额度长条用的绿色梯度：第一条最亮，往后越来越深
 const GREEN_SHADES = ['#4ade80', '#37c96e', '#2aa95a', '#218a49', '#196c39', '#12522b', '#0c3b1f', '#082b16'];
 document.getElementById('uiVer').textContent = 'v' + UI_VER;
@@ -1026,6 +1048,17 @@ function render(){
   if (document.activeElement !== inp) inp.value = s.sub.url || '';
 
   $('#nowName').textContent = s.current || '未选择';
+
+  // 总开关：这一行的状态必须和内核真实状态一致，
+  // 不能只看 phase（「待添加订阅」时内核没起，但 phase 也不是「已断开」）
+  const powered = !!(s.kernel_ok && s.phase === '运行中');
+  const pbtn = $('#btnPower');
+  if (pbtn && !pbtn.disabled) {
+    pbtn.classList.toggle('on', powered);
+    pbtn.querySelector('.txt').textContent = powered ? '断开代理' : '连接';
+  }
+  const stEl = $('#nowState');
+  if (stEl) stEl.textContent = powered ? '已连接' : (s.phase || '未连接');
   const curNode = (s.nodes || []).find(n => n.current);
   if (curNode) {
     const bits = [`${curNode.flag} ${curNode.region}`, curNode.type || 'proxy', delayText(curNode.delay)];
@@ -2296,6 +2329,32 @@ $('#modeSeg').addEventListener('click', async e => {
   const r = await api('/api/mode', {mode: b.dataset.mode});
   okOr(r, '模式：' + b.textContent);
   setTimeout(poll, 300);
+});
+
+$('#btnPower').addEventListener('click', async () => {
+  const btn = $('#btnPower');
+  if (btn.disabled) return;
+  const powered = btn.classList.contains('on');
+  const want = !powered;
+  btn.disabled = true;
+  const txt = btn.querySelector('.txt');
+  const old = txt.textContent;
+  txt.textContent = want ? '连接中…' : '断开中…';
+  try {
+    const r = await api('/api/power', {on: want});
+    if (!r.ok) {
+      toast(r.error || '操作失败');
+      txt.textContent = old;
+    } else {
+      toast(want ? '已连接' : '已断开');
+    }
+  } catch (e) {
+    toast('操作失败：' + (e.message || e));
+    txt.textContent = old;
+  } finally {
+    btn.disabled = false;
+    setTimeout(poll, 500);
+  }
 });
 
 $('#swSysproxy').addEventListener('click', async () => {

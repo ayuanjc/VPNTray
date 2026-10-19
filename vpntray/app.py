@@ -108,6 +108,7 @@ class App:
         self._probe_busy = False
         self._update_busy = False
         self._task_lock = threading.Lock()   # 检测类长任务的互斥
+        self._power_busy = False             # 总开关防连点
 
     def _claim_task(self, flag: str) -> bool:
         """「有没有任务在跑」+「置位」必须原子：面板双击就能并发两份，
@@ -199,6 +200,45 @@ class App:
         self._set(phase="运行中", busy="")
         log.info("启动完成，端口 %s", self.settings["mixed_port"])
         return True
+
+    # ══════════ 总开关（连接 / 断开，不退出进程）══════════
+    def power(self, on: bool) -> dict[str, Any]:
+        """界面最上面那个大开关。
+
+        和 shutdown() 的区别：这里**不置 self._stop**，所以线程还活着，
+        再点一次「连接」能马上起来。shutdown() 是给退出程序用的，一旦调过，
+        _stop 就永久置位，之后 start() 起的线程会立刻退出。
+        """
+        if self._power_busy:
+            return {"ok": False, "on": not on, "error": "正在切换，稍等一秒"}
+        self._power_busy = True
+        try:
+            if on:
+                if self.kernel.running():
+                    return {"ok": True, "on": True, "error": ""}
+                ok = self.start()
+                return {
+                    "ok": bool(ok),
+                    "on": bool(ok) and self.kernel.running(),
+                    "error": "" if ok else (self.state.get("error") or "启动失败"),
+                }
+            self._set(busy="断开中")
+            try:
+                if self.settings.get("system_proxy", True):
+                    sysproxy.disable()
+                    self._set(sysproxy=False)
+            except Exception as e:  # noqa: BLE001
+                log.warning("断开时还原系统代理失败: %s", e)
+            self.kernel.stop()
+            self._set(phase="已断开", kernel_ok=False, busy="", sysproxy_hold=False)
+            log.info("已断开代理（进程仍在运行）")
+            return {"ok": True, "on": False, "error": ""}
+        except Exception as e:  # noqa: BLE001
+            log.exception("总开关操作失败")
+            self._set(busy="")
+            return {"ok": False, "on": not on, "error": f"{type(e).__name__}: {e}"}
+        finally:
+            self._power_busy = False
 
     # ══════════ AI 专项（Claude Code / Codex）══════════
     def topo(self) -> dict[str, Any]:
