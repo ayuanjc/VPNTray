@@ -1089,10 +1089,12 @@ class App:
                 self.notify(f"已切换到可用节点：{best}")
         return best
 
-    def _verify_and_select(self, candidates: list[str], timeout: float = 6.0) -> str | None:
+    def _verify_and_select(self, candidates: list[str], timeout: float = 3.5) -> str | None:
         """逐个验证候选节点：连发两次真实请求都成功才算可用。
 
         机场节点会「刚测通 2 秒后就掉」，单次验证选出来的节点经常立刻不可用。
+        但超时不能给太长：每试一个节点都要先 select（断流一次），
+        8 个候选 × 6 秒 = 用户在 48 秒里被断 8 次，比不切还糟。
         """
         group = self.settings.get("main_group") or "节点选择"
         for name in candidates:
@@ -1119,19 +1121,39 @@ class App:
 
     def _probe_via_proxy(self, timeout: float = 6.0) -> bool:
         """通过本地代理端口做一次真实 HTTPS 请求，确认整条链路可用。"""
+        return self._probe_detail(timeout)[0]
+
+    def _probe_detail(self, timeout: float = 6.0) -> tuple[bool, str]:
+        """同上，但把失败原因带出来 —— 排查「节点到底怎么挂的」全靠这个。"""
         port = int(self.settings["mixed_port"])
         p = f"http://127.0.0.1:{port}"
         s = requests.Session()
         s.trust_env = False
         s.proxies = {"http": p, "https": p}
-        for url in ("https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204"):
+        last = "无响应"
+        try:
+            for url in ("https://www.gstatic.com/generate_204",
+                        "https://cp.cloudflare.com/generate_204"):
+                host = url.split("/")[2]
+                try:
+                    r = s.get(url, timeout=timeout, allow_redirects=False)
+                    if r.status_code in (200, 204):
+                        return True, ""
+                    last = f"{host} HTTP {r.status_code}"
+                except requests.Timeout:
+                    last = f"{host} 超时 {timeout:g}s"
+                except requests.ConnectionError as e:
+                    # 代理端口本身连不上，说明内核没了；连上了被 reset 才是节点的问题
+                    tail = str(e)[-90:]
+                    last = f"{host} 连接失败（{tail}）"
+                except Exception as e:  # noqa: BLE001
+                    last = f"{host} {type(e).__name__}"
+            return False, last
+        finally:
             try:
-                r = s.get(url, timeout=timeout, allow_redirects=False)
-                if r.status_code in (200, 204):
-                    return True
+                s.close()
             except Exception:  # noqa: BLE001
-                continue
-        return False
+                pass
 
     def ensure_usable(self) -> str | None:
         """当前节点还活着就什么都不做，挂了才重新挑。"""
@@ -1141,6 +1163,76 @@ class App:
             return self.state.get("group_now")
         log.warning("当前节点不可用，开始重新选择")
         return self.auto_pick_best()
+
+    def _probe_ai(self, timeout: float = 8.0) -> tuple[bool, str]:
+        """单独确认 AI 专用通道能不能出去。
+
+        codex / claude 走的是 AI_GROUP，跟主节点不是同一条线 ——
+        主节点好好的、AI 节点挂了，用户看到的就是「codex 连不上但别的都正常」。
+        所以这条必须自己测，不能靠主节点的探测结果推断。
+        """
+        if not self.settings.get("ai_enabled", True):
+            return True, ""
+        port = int(self.settings["mixed_port"])
+        p = f"http://127.0.0.1:{port}"
+        s = requests.Session()
+        s.trust_env = False
+        s.proxies = {"http": p, "https": p}
+        try:
+            # 用 AI 客户端真正会连的接口当探针。官网首页（www.anthropic.com）
+            # 走的是另一套 Cloudflare 策略，探测结果跟 api 不一样，别拿它当判据。
+            for url in ("https://api.openai.com/v1/models",
+                        "https://api.anthropic.com/v1/models"):
+                host = url.split("/")[2]
+                try:
+                    r = s.get(url, timeout=timeout, allow_redirects=False)
+                    # 拿到任何正经 HTTP 响应都说明隧道通了；
+                    # 401/403 只是「没给 key」，不是代理的问题
+                    if r.status_code < 500:
+                        return True, ""
+                    return False, f"{host} HTTP {r.status_code}"
+                except requests.Timeout:
+                    return False, f"{host} 超时 {timeout:g}s"
+                except requests.ConnectionError as e:
+                    return False, f"{host} 连接失败（{str(e)[-70:]}）"
+                except Exception as e:  # noqa: BLE001
+                    return False, f"{host} {type(e).__name__}"
+            return False, "无响应"
+        finally:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _heal_ai(self) -> None:
+        """AI 节点挂了就在 AI 组里换一个能用的，别去动主节点。"""
+        proxies = self.state.get("proxies") or {}
+        g = proxies.get(configgen.AI_GROUP) or {}
+        cur = str(g.get("now") or "")
+        delays = self.state.get("delays") or {}
+        cand = [str(m) for m in (g.get("all") or [])
+                if m and str(m) != cur and str(m) != configgen.AI_GROUP]
+        if not cand:
+            log.warning("AI 组里没有其它可切节点")
+            return
+        cand.sort(key=lambda k: (delays.get(k) or 99999))
+        # 候选少试几个：每试一个都要断流一次
+        for name in cand[:4]:
+            try:
+                self.api.select(configgen.AI_GROUP, name)
+            except ApiError as e:
+                log.debug("AI 切 %s 失败: %s", name, e)
+                continue
+            time.sleep(0.3)
+            ok, why = self._probe_ai(7.0)
+            if ok:
+                self.settings["ai_node"] = name
+                self.settings.save()
+                log.info("AI 通道已切到 %s", name)
+                self.notify(f"AI 通道已切换：{name}")
+                return
+            log.info("AI 候选 %s 也不通：%s", name, why)
+        log.warning("AI 组里没找到能用的节点")
 
     # ══════════ 系统代理 / 自启 ══════════
     def toggle_system_proxy(self, on: bool, silent: bool = False) -> None:
@@ -1282,17 +1374,44 @@ class App:
                     except Exception as e:  # noqa: BLE001
                         log.warning("重新接管系统代理失败: %s", e)
 
+            # ②-a AI 通道单独看护（每 3 轮 = 60 秒）。主节点正常不代表 AI 那条线正常，
+            # 而 codex/claude 只走 AI 那条线 —— 只测主节点会让「AI 挂了」完全隐形。
+            # 注意：self.state 里没有 "ai" 这个键（前端那份是 build_state 现算的），
+            # 判据必须读 settings，否则这个分支永远不会进。
+            if tick % 3 == 0 and self.settings.get("ai_enabled", True) \
+                    and self.kernel.running() and not self.state.get("busy"):
+                ok_ai, why_ai = self._probe_ai(8.0)
+                if ok_ai:
+                    if getattr(self, "_ai_fail", 0):
+                        log.info("AI 通道恢复正常")
+                    self._ai_fail = 0
+                else:
+                    self._ai_fail = getattr(self, "_ai_fail", 0) + 1
+                    log.warning("AI 通道探测失败（连续 %d 次）：%s", self._ai_fail, why_ai)
+                    if self._ai_fail >= 2:
+                        self._ai_fail = 0
+                        try:
+                            self._heal_ai()
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("AI 通道自愈失败: %s", e)
+
             # ② 节点健康探测
             if tick % 2 or not self.settings.get("heal", True) or not self.kernel.running():
                 continue
             if self.state.get("busy") or self._stop.is_set():
                 continue  # 正在测速/切换，或正在退出，别干扰
-            if self._probe_via_proxy(5.0):
+
+            ok, why = self._probe_detail(4.0)
+            if ok:
+                if self._health_fail:
+                    log.info("节点恢复正常（之前连续失败 %d 次）", self._health_fail)
                 self._health_fail = 0
                 continue
             self._health_fail = getattr(self, "_health_fail", 0) + 1
-            log.warning("健康探测失败（连续 %d 次）", self._health_fail)
-            if self._health_fail < 2:
+            log.warning("健康探测失败（连续 %d 次）：%s", self._health_fail, why)
+            # 机场节点抖 30–60 秒很正常。2 次（约 80 秒）就换节点太急，
+            # 换节点本身要断流几秒，一到两次重选叠加起来，用户会以为「整个软件坏了」。
+            if self._health_fail < 3:
                 continue
             self._health_fail = 0
             try:
