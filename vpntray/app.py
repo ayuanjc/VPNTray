@@ -1754,10 +1754,21 @@ class App:
             updater.launch(bat)
             log.info("更新器已启动，准备退出：%s", bat)
             self._set(update={**info, "installing": True, "checked_at": time.time()})
+            # 更新场景下进程必须死透：update.cmd 要等到 VPNTray.exe 消失才敢覆盖文件。
+            # 所以这里不指望托盘消息泵能干净收尾（hwnd 丢了、UI 线程卡在模态里都会挂住），
+            # 先把内核和系统代理收干净，然后硬退出。
+            try:
+                self.shutdown()
+            except Exception:  # noqa: BLE001
+                log.exception("更新前清理失败（继续退出）")
+            try:
+                if self.on_quit:
+                    self.on_quit()
+            except Exception:  # noqa: BLE001
+                log.warning("更新时关闭托盘失败（继续退出）")
             time.sleep(1.0)
-            # 走正常退出：mihomo 和系统代理才会被清干净，否则新版本一起来就撞端口
-            if self.on_quit:
-                self.on_quit()
+            log.info("更新：强制退出进程，等待 update.cmd 覆盖文件")
+            os._exit(0)
         except updater.UpdateError as e:
             log.warning("更新失败：%s", e)
             self._set(busy="")

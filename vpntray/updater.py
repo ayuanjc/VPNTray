@@ -418,23 +418,35 @@ setlocal
 set "TARGET={target}"
 set "PAYLOAD={payload}"
 set "EXE={exe}"
-rem 等上一份进程彻底退出，最多 40 秒
-for /l %%i in (1,1,40) do (
-    tasklist /fi "IMAGENAME eq %EXE%" 2>nul | find /i "%EXE%" >nul || goto gone
-    timeout /t 1 /nobreak >nul
-)
-:gone
-timeout /t 1 /nobreak >nul
+rem log goes to TEMP (workdir gets deleted below)
+set "LOG=%TEMP%\\vpntray-update.log"
+echo [%DATE% %TIME%] ==== start ==== > "%LOG%"
+echo target=%TARGET% >> "%LOG%"
+echo payload=%PAYLOAD% >> "%LOG%"
+rem 等上一份进程退出 + 让系统释放文件句柄。
+rem 这里刻意不用 tasklist：update.cmd 是用 DETACHED_PROCESS 起的，没有控制台，
+rem tasklist 在那种环境里会卡死（实测：纯 for+ping 正常，加 tasklist 一行输出都没有，
+rem 2.0.2 之前所有人卡在「更新器已启动」之后就再也没动静，就是这个原因）。
+rem 主进程那边是 os._exit(0)，进程立刻消失，固定等 3 秒足够；
+rem 万一文件还被占着，交给 robocopy 自己重试（/R:10 /W:1 = 最多 10 次、每次隔 1 秒）。
+ping -n 4 127.0.0.1 >nul
+echo copying >> "%LOG%"
 rem /E 递归  /IS 覆盖同名  /IT 保留文件属性  /NP 不刷进度
-robocopy "%PAYLOAD%" "%TARGET%" /E /IS /IT /R:3 /W:1 /NFL /NDL /NJH /NJS /NP >nul
-if errorlevel 8 goto failed
+robocopy "%PAYLOAD%" "%TARGET%" /E /IS /IT /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >> "%LOG%" 2>&1
+set "RC=%ERRORLEVEL%"
+echo robocopy rc=%RC% >> "%LOG%"
+rem robocopy 的 0-7 都算成功（1=复制了文件，3=复制+多出），8 以上才是失败
+if %RC% GEQ 8 goto failed
 start "" "%TARGET%\\%EXE%"
+echo started new version >> "%LOG%"
 rmdir /s /q "{workdir}" 2>nul
 (goto) 2>nul & del "%~f0"
 exit /b 0
 :failed
-echo 覆盖文件失败，旧版本仍在。按任意键关闭。
-pause >nul
+rem 覆盖失败就把旧版本拉起来，别让用户面对一个打不开的软件
+start "" "%TARGET%\\%EXE%"
+echo copy failed, rolled back to old version >> "%LOG%"
+(goto) 2>nul & del "%~f0"
 exit /b 1
 """
 
@@ -452,7 +464,7 @@ def stage(payload_root: Path, workdir: Path, target_root: Path | None = None,
     bat.write_bytes(
         BAT.format(target=str(target), payload=str(payload),
                    exe=str(exe_name), workdir=str(workdir))
-        .replace("\n", "\r\n").encode("gbk", "replace")
+        .replace("\n", "\r\n").encode("utf-8")
     )
     return bat
 

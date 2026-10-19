@@ -568,3 +568,69 @@ codex / claude 的请求走 `AI 稳定` 组，跟主节点不是同一条线。�
 
 如果你用 codex / claude 时断时续，直接升到 2.0.2。升级后不用管 AI 节点是哪台，
 程序会自己挑一台能通的；也可以在「AI 专项」卡里手动指定。
+
+## 2.0.3：修「自动更新之后软件就没了」
+
+2.0.2 的日志停在最后一行：`18:32:49 更新器已启动，准备退出`，之后就再没有任何记录 ——
+新版本没起来，旧版本也退掉了。用户面对的是一个打不开的软件。
+
+排查下来是**两个独立的坑叠在一起**。
+
+### 坑一：`tasklist` 在没有控制台的进程里会卡死
+
+`update.cmd` 是用 `DETACHED_PROCESS` 起的（必须这样，主进程死了它才能继续跑）。
+它原本靠这一行等旧进程退出：
+
+```bat
+tasklist /fi "IMAGENAME eq VPNTray.exe" | find /i "VPNTray.exe" >nul || goto gone
+```
+
+实测（同样的 flags、同样的重定向）：
+
+- 纯 `for` + `ping` 循环 → 正常跑完，标记文件按时写出来
+- 把 `tasklist` 那行加回去 → **一行输出都没有**，脚本原地卡住
+
+`tasklist` 在无控制台环境里会阻塞在某个 console API 上。
+
+**改法**：不再探进程，固定等 3 秒（主进程那边是 `os._exit(0)`，进程立刻消失），
+文件万一还被占着就交给 `robocopy /R:10 /W:1` 自己重试。
+
+顺带修了 `timeout /t 1` —— 它同样需要 stdin 手柄，在分离进程里也会失败。
+
+### 坑二：`on_quit` 不保证进程真的退出
+
+更新时调的是 `tray._quit`（只撤托盘图标），指望主消息泵自己收尾。
+托盘窗口句柄丢了、或者 UI 线程卡在某个模态里，`PumpMessages` 就永远不返回，
+进程挂着 → `update.cmd` 等不到 → 覆盖失败。
+
+**改法**：更新前先 `app.shutdown()`（停内核、还原系统代理，这些必须做），
+再撤托盘，然后 **`os._exit(0)` 硬退出**。更新本来就要进程死透，没什么好留恋的。
+
+### 顺带加固
+
+- 覆盖失败时**自动把旧版本拉起来**（原来只是 `pause`，用户看到的是一闪而过的黑窗口，然后软件没了）
+- `robocopy` 输出写进 `%TEMP%\vpntray-update.log`（原来 `>nul`，出问题什么都看不到）
+- 等待上限 40s → 60s，重试 `/R:3` → `/R:10`
+- BAT 里的 echo 全改 ASCII（cmd 在 UTF-8 代码页下写中文会截断字，日志变乱码）
+
+### 验证
+
+用真实的 stage/launch 跑了一遍完整覆盖流程（旧目录里放 marker-old，payload 里放 marker-new）：
+
+```
+覆盖完成，用时 4s
+新文件到位: True
+旧文件保留(/E 不删): True
+README 到位: True
+--- update.log ---
+==== start ====
+copying
+robocopy rc=3
+started new version
+```
+
+`rc=3` 是 robocopy 的「复制了文件 + 目标有额外文件」，属于成功（0–7 都算）。
+
+> 已经在 2.0.2 上点过更新的用户，需要手动去
+> https://github.com/ayuanjc/VPNTray/releases/latest 下载 2.0.3 解压覆盖一次
+> （坏掉的更新器没法自己修自己）。之后从 2.0.3 起，更新链路是通的。
