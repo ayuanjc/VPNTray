@@ -519,8 +519,10 @@ class TrayWin:
             log.warning("打开控制台失败: %s", e)
             mode = "none"
         # 让用户知道发生了什么：2.0.0 这里什么都不说，窗口起不来就像功能坏了
-        if mode == "browser":
-            self.notify("原生窗口没起来，已改用浏览器打开；详见 data/logs/app.log")
+        if mode == "appwindow":
+            self.notify("已用 Edge/Chrome 窗口打开控制台（原生窗口在本机起不来，详见日志）")
+        elif mode == "browser":
+            self.notify("窗口都没起来，已改用浏览器标签页打开；详见 data/logs/app.log")
         elif mode == "none":
             self.notify("打开控制台失败，详见 data/logs/app.log")
 

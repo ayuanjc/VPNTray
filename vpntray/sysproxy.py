@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+import time
 import winreg
 from ctypes import wintypes
 
@@ -51,9 +52,28 @@ def _read(name: str):
         return None
 
 
-def _write(name: str, value, kind=winreg.REG_SZ) -> None:
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY, 0, winreg.KEY_SET_VALUE) as k:
-        winreg.SetValueEx(k, name, 0, kind, value)
+def _write(name: str, value, kind=winreg.REG_SZ, tries: int = 4) -> None:
+    """写注册表：对「瞬时被拒」重试几次。
+
+    日志里那串 [WinError 5] 拒绝访问 就是这么来的：火绒之类的 HIPS 会在打开键的
+    一瞬间拦住写操作（它要扫一遍再放行），几毫秒后同样的写就成功了。以前一次就放弃，
+    于是启动时明明接管成功、健康看护却报「重新接管系统代理失败」，白吓人。
+    真的没权限（不是瞬时）时，重试完照样把异常抛给上层，不吞。
+    """
+    last: PermissionError | None = None
+    for i in range(max(1, tries)):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, name, 0, kind, value)
+            if i:
+                log.info("写注册表 %s 第 %d 次才成功（前 %d 次被安全软件瞬时拒绝）",
+                         name, i + 1, i)
+            return
+        except PermissionError as e:
+            last = e
+            time.sleep(0.12 * (i + 1))
+    if last is not None:
+        raise last
 
 
 def _delete(name: str) -> None:

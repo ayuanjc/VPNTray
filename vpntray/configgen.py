@@ -15,7 +15,7 @@ from typing import Any
 
 import yaml
 
-from .paths import CONFIG, DATA, UI_DIR, ensure_dirs
+from .paths import CONFIG, DATA, MMDB, UI_DIR, ensure_dirs
 
 log = logging.getLogger("config")
 
@@ -179,9 +179,19 @@ def build(sub: dict[str, Any], settings) -> dict[str, Any]:
     node_names = [p["name"] for p in sub["proxies"]]
     ai_on = bool(settings.get("ai_enabled", True)) and bool(node_names)
     if ai_on:
+        from . import hotspot as _hots
         ai_node = str(settings.get("ai_node") or "")
-        members = ([ai_node] if ai_node in node_names else []) + \
-                  [n for n in node_names if n != ai_node]
+        # 只把「不会被 OpenAI 拒绝」的地区放进 AI 组。
+        # 香港节点延迟再低也过不去：api.openai.com 在握手阶段就被 RST，
+        # 表现出来是 SSL EOF，而 google / github 全通 —— 所以必须按地区剔。
+        pool = [n for n in node_names if not _hots.is_blocked_region(n, settings)]
+        if len(pool) < 2:            # 剔空了就别剔，否则组是空的、规则还引用它
+            pool = list(node_names)
+        # 组内顺序 = 界面里从上到下的顺序。按偏好地区排，让「能用的」
+        # 全堆在最上面，手动切的时候不用在 100 个节点里翻。
+        pool.sort(key=lambda x: _hots.region_rank(x, settings))
+        members = ([ai_node] if ai_node in pool else []) + \
+                  [x for x in pool if x != ai_node]
         groups.insert(0, {
             "name": AI_GROUP,
             "type": "select",
@@ -222,6 +232,13 @@ def build(sub: dict[str, Any], settings) -> dict[str, Any]:
     if dns.pop("nameserver-policy", None):
         log.info("已移除订阅中的 nameserver-policy（避免境外 DoH 卡顿）")
 
+    # —— 链路档位（hotspot.py）：手机热点下换保守参数 ——
+    from . import hotspot as _hs
+    prof = _hs.profile(settings)
+    if prof["tier"] == "hotspot":
+        log.info("检测到手机热点，使用保守档：tcp-concurrent=%s find-process=%s",
+                 prof["tcp-concurrent"], prof["find-process-mode"])
+
     cfg: dict[str, Any] = {
         "mixed-port": _port(settings, "mixed_port", 7891),
         "port": 0,
@@ -233,13 +250,15 @@ def build(sub: dict[str, Any], settings) -> dict[str, Any]:
         "log-level": settings.get("log_level") or "warning",
         "ipv6": False,
         "unified-delay": True,
-        "tcp-concurrent": True,
-        "find-process-mode": "strict",
+        "tcp-concurrent": bool(prof["tcp-concurrent"]),
+        "find-process-mode": prof["find-process-mode"],
         "external-controller": f"127.0.0.1:{_port(settings, 'controller_port', 9091)}",
         "secret": settings.get("secret") or "",
         "profile": {
             "store-selected": True,
             "store-fake-ip": True,
+            # 移动网络中途 NAT 超时频繁，保活间隔按档位拉长
+            "keep-alive-interval": int(prof["keep-alive-interval"]),
         },
         "dns": dns,
         "sniffer": SNIFFER,
@@ -259,7 +278,11 @@ def build(sub: dict[str, Any], settings) -> dict[str, Any]:
         cfg["external-ui"] = str(UI_DIR).replace("\\", "/")
         cfg["external-ui-name"] = "ui"
 
-    cfg["geodata-mode"] = False
+    # geodata-mode=False 走 country.mmdb；缺了这个文件 mihomo 不会报错退出，
+    # 而是「Can't find MMDB, start download」去联网拉一份 —— 在这种破网络下
+    # 就是几十秒没 API、最后被上层判成「内核启动后 API 无响应」。
+    # 所以缺 mmdb 时改用 GeoIP.dat/GeoSite.dat（随包发的），彻底不联网。
+    cfg["geodata-mode"] = not MMDB.exists()
     cfg["geo-auto-update"] = False
     return cfg
 

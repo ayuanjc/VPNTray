@@ -47,6 +47,14 @@ DEFAULTS: dict[str, Any] = {
     "auto_best_interval_min": 30,
     "heal": True,                   # 节点失效时自动换到可用节点
 
+    # ——— 移动热点特化（本版内置）———
+    "mobile_aware": True,           # 认得出手机热点就切保守档 mihomo 参数
+    "ai_block_regions": ["香港", "澳门", "中国大陆", "中国", "俄罗斯", "伊朗",
+                         "朝鲜", "古巴", "叙利亚", "白俄罗斯"],   # OpenAI 拒绝的地区，不放进 AI 组
+    "ai_prefer_regions": ["新加坡", "台湾", "日本", "美国", "韩国"],
+    "net_change_restart": True,     # 热点重连 / 换网后自动重建内核
+    "edition": "mobile",            # 发行版标记：mobile = 热点特化版
+
     # ——— AI 客户端专项（Claude Code / Codex）———
     "ai_enabled": True,             # AI 域名单独走「AI 稳定」组，不自动切换
     "ai_node": "",                  # 钉死的 AI 节点

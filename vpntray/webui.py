@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "2.2.0"
+UI_VER = "2.2.1"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -63,7 +63,8 @@ def _total_left(app) -> float | None:
     total = 0.0
     seen = False
     for sub in app.subscriptions():
-        left = (sub.get("info") or {}).get("traffic_left_gb")
+        info = sub.get("info")
+        left = info.get("traffic_left_gb") if isinstance(info, dict) else None
         if left is None:
             continue
         total += _num(left)

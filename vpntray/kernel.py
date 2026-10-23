@@ -100,6 +100,8 @@ def ensure_geo_assets() -> None:
     ensure_dirs()
     for src in (GEOIP, GEOSITE, MMDB):
         if not src.exists():
+            # country.mmdb 缺了不会立刻出事（configgen 会退回 geodata-mode=True
+            # 用 GeoIP.dat），但这份警告要留着——它能解释「为什么地理规则变粗了」
             log.warning("缺少地理数据文件: %s", src)
             continue
         dst = DATA / src.name

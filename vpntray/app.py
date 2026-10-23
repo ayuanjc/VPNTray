@@ -11,7 +11,7 @@ from typing import Any, Callable
 import requests
 
 from . import __version__ as _VERSION
-from . import autostart, configgen, disguise, kernel as kernel_mod, netguard, purity, subscription, sysproxy
+from . import autostart, configgen, disguise, hotspot, kernel as kernel_mod, netguard, purity, subscription, sysproxy
 from .api import ApiError, MihomoAPI
 from .kernel import Kernel
 from .paths import CONFIG, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
@@ -195,6 +195,10 @@ class App:
                 self.toggle_system_proxy(True, silent=True)
 
         self.refresh_now()
+        try:
+            self._net_id = tuple(hotspot.net_id())
+        except Exception:  # noqa: BLE001
+            self._net_id = ()
         self._sync_ai_node()
         self._start_loops()
         self._set(phase="运行中", busy="")
@@ -339,18 +343,44 @@ class App:
         return True, ""
 
     def _sync_ai_node(self) -> None:
-        """首次启用时，把 AI 组钉到当前主组节点上，避免它空着。"""
+        """AI 组钉一个「不会被 OpenAI 拒绝」的节点。
+
+        原版钉的是当前主组节点，图的是「别让 AI 组空着」。但在手机热点 +
+        这家机场的组合下主组多半停在香港，而香港落地在握手阶段就被 OpenAI
+        RST —— 一钉就钉在必然失败的位置上，自愈再多次也只是在香港里换。
+        所以改成：ai_node 为空、或属于封锁地区时，从 AI 组里挑非封锁地区
+        里延迟最低的那个。
+        """
         if not self.settings.get("ai_enabled", True):
             return
-        if self.settings.get("ai_node"):
+        cur = str(self.settings.get("ai_node") or "")
+        if cur and not hotspot.is_blocked_region(cur, self.settings):
             try:
-                self.api.select(configgen.AI_GROUP, self.settings["ai_node"])
+                self.api.select(configgen.AI_GROUP, cur)
             except ApiError:
                 pass
             return
-        cur = self.state.get("group_now")
-        if cur:
-            self.set_ai_node(cur)
+        # 先实测：对 api.openai.com 真能通的才算候选，地区只作兜底
+        measured = []
+        if self.kernel.running():
+            measured = [n for _ms, n in self.ai_ranking(limit=6)
+                        if n != configgen.AI_GROUP]
+        if measured:
+            log.info("AI 节点为空或落在封锁地区，按实测改钉 %s", measured[0])
+            self.set_ai_node(measured[0])
+            return
+        proxies = self.state.get("proxies") or {}
+        g = proxies.get(configgen.AI_GROUP) or {}
+        names = [str(m) for m in (g.get("all") or [])
+                 if m and str(m) != configgen.AI_GROUP]
+        pool = [n for n in names if not hotspot.is_blocked_region(n, self.settings)]
+        if not pool:
+            return
+        delays = self.state.get("delays") or {}
+        pool.sort(key=lambda k: (hotspot.region_rank(k, self.settings),
+                                 delays.get(k) or 99999))
+        log.info("AI 节点为空或落在封锁地区，改钉 %s", pool[0])
+        self.set_ai_node(pool[0])
 
     def set_ai_enabled(self, on: bool) -> tuple[bool, str]:
         self.settings["ai_enabled"] = bool(on)
@@ -385,6 +415,13 @@ class App:
                 self.settings["subs"] = subs
                 self.settings["sub_active"] = 0
                 self.settings.save()
+        # 老配置里 info 可能是「剩余流量：xx」这类字符串列表，也可能干脆是脏值。
+        # 统一收敛成 dict，否则 build_state / _sub_usable 里的 .get 会抛
+        # AttributeError: 'list' object has no attribute 'get'，整个面板 500。
+        for s in subs:
+            if isinstance(s, dict) and not isinstance(s.get("info"), dict):
+                raw = s.get("info")
+                s["info"] = subscription.parse_info(raw if isinstance(raw, list) else [])
         return subs
 
     def active_sub(self) -> dict[str, Any]:
@@ -1226,15 +1263,35 @@ class App:
                 host = url.split("/")[2]
                 try:
                     r = s.get(url, timeout=timeout, allow_redirects=False)
-                    # 拿到任何正经 HTTP 响应都说明隧道通了；
-                    # 401/403 只是「没给 key」，不是代理的问题
+                    # 401 = 没给 key，这说明隧道和国家都没问题。
+                    # 但 403 得看正文：unsupported_country 是「这个出口地区
+                    # 不在服务范围」，跟链路好坏无关 —— 澳门节点就是这种，
+                    # 延迟最低、TCP 全通，Codex 却直接连不上。
+                    if r.status_code == 403:
+                        body = ""
+                        try:
+                            body = (r.text or "")[:600]
+                        except Exception:  # noqa: BLE001
+                            body = ""
+                        low = body.lower()
+                        if ("unsupported_country" in low or "not supported" in low
+                                or "unsupported" in low and "country" in low):
+                            return False, f"{host} 出口地区不受支持（OpenAI 拒绝该地区）"
+                        return False, f"{host} HTTP 403（被拦）"
                     if r.status_code < 500:
                         return True, ""
                     return False, f"{host} HTTP {r.status_code}"
+                except requests.exceptions.SSLError:
+                    # 握手阶段就被对端重置：不是节点挂了，是这个出口地区被拒
+                    return False, f"{host} TLS 被重置（出口地区被拒）"
                 except requests.Timeout:
                     return False, f"{host} 超时 {timeout:g}s"
                 except requests.ConnectionError as e:
-                    return False, f"{host} 连接失败（{str(e)[-70:]}）"
+                    tail = str(e)[-90:]
+                    low = tail.lower()
+                    if "eof" in low or "reset" in low or "aborted" in low:
+                        return False, f"{host} 连接被中断（出口地区可能被拒）"
+                    return False, f"{host} 连接失败（{tail}）"
                 except Exception as e:  # noqa: BLE001
                     return False, f"{host} {type(e).__name__}"
             return False, "无响应"
@@ -1244,18 +1301,69 @@ class App:
             except Exception:  # noqa: BLE001
                 pass
 
+    AI_PROBE_URL = "https://api.openai.com/v1/models"
+
+    def ai_ranking(self, limit: int = 6) -> list[tuple[int, str]]:
+        """让内核自己并发测一遍 AI 组里每个成员到 api.openai.com 的真实延迟。
+
+        为什么不能靠「地区顺序 + 通用测速」挑：机场把不同服务放在同一台落地
+        机器的不同端口上，可达性完全不一样（实测 20179 整片 i/o timeout，
+        20138 通），而且哪个端口通还要看用户当前这条链路（手机热点 + 4G 尤其
+        明显）。只有在用户自己机器上、对着目标域名实测才作数。
+        返回 [(毫秒, 节点名)]，按快慢排，只含真能过的；limit<=0 表示全都要。
+        """
+        out: list[tuple[int, str]] = []
+        try:
+            delays = self.api.group_delay(configgen.AI_GROUP, self.AI_PROBE_URL, 6000)
+        except Exception as e:  # noqa: BLE001
+            log.debug("AI 组实测失败: %s", e)
+            return out
+        for name, ms in (delays or {}).items():
+            try:
+                val = int(ms)
+            except (TypeError, ValueError):
+                continue
+            if val > 0:
+                out.append((val, str(name)))
+        # 「能连上」不等于「能用」：澳门这种地区 TCP、TLS 全通，
+        # 延迟还最低，但 OpenAI 直接回 unsupported_country。
+        # 所以先按地区名单剔掉，再按延迟排。
+        out = [(ms, n) for ms, n in out
+               if not hotspot.is_blocked_region(n, self.settings)]
+        out.sort()
+        if out:
+            log.info("AI 组实测：%d 个能过 api.openai.com，最快 %dms %s",
+                     len(out), out[0][0], out[0][1])
+        else:
+            log.warning("AI 组实测：没有一个成员能过 api.openai.com")
+        return out[:limit] if limit and limit > 0 else out
+
     def _heal_ai(self) -> None:
-        """AI 节点挂了就在 AI 组里换一个能用的，别去动主节点。"""
+        """AI 节点挂了就在 AI 组里换一个**实测能通**的，别去动主节点。"""
         proxies = self.state.get("proxies") or {}
         g = proxies.get(configgen.AI_GROUP) or {}
         cur = str(g.get("now") or "")
         delays = self.state.get("delays") or {}
-        cand = [str(m) for m in (g.get("all") or [])
-                if m and str(m) != cur and str(m) != configgen.AI_GROUP]
-        if not cand:
+        raw = [str(m) for m in (g.get("all") or [])
+               if m and str(m) != cur and str(m) != configgen.AI_GROUP]
+        if not raw:
             log.warning("AI 组里没有其它可切节点")
             return
-        cand.sort(key=lambda k: (delays.get(k) or 99999))
+        # 先用实测结果：能过 api.openai.com 的按快慢排，前面几个才值得断流去试
+        measured = [n for _ms, n in self.ai_ranking(limit=0)
+                    if n != cur and n != configgen.AI_GROUP]
+        if measured:
+            cand = measured
+            log.info("按实测结果依次试：%s", " / ".join(measured[:4]))
+        else:
+            # 实测拿不到（内核不支持组测速 / 全都不通）才退回地区排序
+            # 先按地区筛：切到被 OpenAI 拒绝的地区也是白断一次流
+            cand = [m for m in raw if not hotspot.is_blocked_region(m, self.settings)]
+            if not cand:
+                log.warning("AI 组里没有非封锁地区节点，只能在封锁地区里碰运气")
+                cand = raw
+            cand.sort(key=lambda k: (hotspot.region_rank(k, self.settings),
+                                     delays.get(k) or 99999))
         # 候选少试几个：每试一个都要断流一次
         for name in cand[:4]:
             try:
@@ -1272,7 +1380,7 @@ class App:
                 self.notify(f"AI 通道已切换：{name}")
                 return
             log.info("AI 候选 %s 也不通：%s", name, why)
-        log.warning("AI 组里没找到能用的节点")
+        log.warning("AI 组里没找到能用的节点（实测也全不通：机场落地/端口在你这条链路上整片失效）")
 
     # ══════════ 系统代理 / 自启 ══════════
     def toggle_system_proxy(self, on: bool, silent: bool = False) -> None:
@@ -1392,6 +1500,27 @@ class App:
         tick = 0
         while not self._stop.wait(20):
             tick += 1
+            # ⓪ 网络换了（热点重连 / 切 WiFi / 换 SIM 卡）就重建内核。
+            # iPhone 热点每次重连本地 IP 都会变（.2 ~ .14），旧内核还绑在
+            # 上一个地址上，表现就是「看着连着但什么都没速度」。
+            if tick % 3 == 0 and self.settings.get("net_change_restart", True) \
+                    and self.kernel.running() and not self.state.get("busy"):
+                try:
+                    nid = tuple(hotspot.net_id())
+                except Exception:  # noqa: BLE001
+                    nid = ()
+                prev = getattr(self, "_net_id", ())
+                if nid and prev and nid != prev:
+                    log.warning("网络变化 %s → %s，重建内核", prev, nid)
+                    self._net_id = nid
+                    self._ai_fail = 0
+                    try:
+                        self.restart_kernel()
+                        self.notify("网络已切换，内核已重建")
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("网络切换后重建内核失败: %s", e)
+                elif nid:
+                    self._net_id = nid
             # ① 系统代理看护：别的代理客户端会偷偷把注册表改回去
             if self.settings.get("system_proxy") and self.kernel.running():
                 server = f"127.0.0.1:{self.settings['mixed_port']}"
