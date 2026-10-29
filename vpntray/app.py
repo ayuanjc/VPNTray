@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 import webbrowser
@@ -158,6 +159,12 @@ class App:
 
     # ══════════ 启动 / 关闭 ══════════
     def start(self) -> bool:
+        # 版本行必须最先落盘：以前日志里没有任何版本号，出了问题只能靠
+        # 提示文案去考古（朋友那份 2026-10 的日志就是靠「缺少 WebView2 运行时」
+        # 这句才反推出来是 2.0.1 代的 ui_native）。
+        log.info("VPNTray %s 启动（frozen=%s，Python %s）",
+                 _version(), bool(getattr(sys, "frozen", False)),
+                 ".".join(str(x) for x in sys.version_info[:3]))
         self._set(phase="准备配置", busy="启动中")
         ok = self.prepare_config(initial=True)
         if not ok:
@@ -1181,12 +1188,16 @@ class App:
                 log.debug("选择 %s 失败: %s", name, e)
                 continue
             time.sleep(0.25)
-            if not self._probe_via_proxy(timeout):
-                log.info("节点 %s 首次验证失败", name)
+            ok1, why1 = self._probe_detail(timeout)
+            if not ok1:
+                # 带上失败原因：只写「首次验证失败」时，事后完全分不清是
+                # 节点 RST、TLS 被打断，还是本机代理端口没人听。
+                log.info("节点 %s 首次验证失败: %s", name, why1)
                 continue
             time.sleep(0.6)
-            if not self._probe_via_proxy(timeout):
-                log.info("节点 %s 二次验证失败（抖动）", name)
+            ok2, why2 = self._probe_detail(timeout)
+            if not ok2:
+                log.info("节点 %s 二次验证失败（抖动）: %s", name, why2)
                 continue
             sel = dict(self.settings.get("selected") or {})
             sel[group] = name
@@ -1207,7 +1218,10 @@ class App:
         s = requests.Session()
         s.trust_env = False
         s.proxies = {"http": p, "https": p}
-        last = "无响应"
+        # 两个站点的失败原因都留着：以前只报最后一个，gstatic 被 reset、
+        # cloudflare 超时，日志里永远只看得到 cp.cloudflare.com，
+        # 判断「到底是节点挂了还是本机在拦」时白丢一半证据。
+        reasons: list[str] = []
         try:
             for url in ("https://www.gstatic.com/generate_204",
                         "https://cp.cloudflare.com/generate_204"):
@@ -1216,16 +1230,16 @@ class App:
                     r = s.get(url, timeout=timeout, allow_redirects=False)
                     if r.status_code in (200, 204):
                         return True, ""
-                    last = f"{host} HTTP {r.status_code}"
+                    reasons.append(f"{host} HTTP {r.status_code}")
                 except requests.Timeout:
-                    last = f"{host} 超时 {timeout:g}s"
+                    reasons.append(f"{host} 超时 {timeout:g}s")
                 except requests.ConnectionError as e:
                     # 代理端口本身连不上，说明内核没了；连上了被 reset 才是节点的问题
                     tail = str(e)[-90:]
-                    last = f"{host} 连接失败（{tail}）"
+                    reasons.append(f"{host} 连接失败（{tail}）")
                 except Exception as e:  # noqa: BLE001
-                    last = f"{host} {type(e).__name__}"
-            return False, last
+                    reasons.append(f"{host} {type(e).__name__}: {str(e)[-60:]}")
+            return False, " | ".join(reasons) or "无响应"
         finally:
             try:
                 s.close()
@@ -1511,16 +1525,30 @@ class App:
                     nid = ()
                 prev = getattr(self, "_net_id", ())
                 if nid and prev and nid != prev:
-                    log.warning("网络变化 %s → %s，重建内核", prev, nid)
-                    self._net_id = nid
-                    self._ai_fail = 0
-                    try:
-                        self.restart_kernel()
-                        self.notify("网络已切换，内核已重建")
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("网络切换后重建内核失败: %s", e)
+                    # 热点/校园网会在两个地址之间来回横跳，旧逻辑一看到不同就
+                    # 重建内核，跳一次断流几秒，用户感觉就是「网络忽好忽坏」。
+                    # 现在要连续两轮采样都指向同一个新地址才重建，并且距上次
+                    # 重建不足 2 分钟就先忍一轮。
+                    stable = nid == getattr(self, "_net_pending", ())
+                    self._net_pending = nid
+                    since = time.time() - float(getattr(self, "_net_restart_at", 0.0))
+                    if not stable:
+                        log.info("网络地址 %s → %s，先等下一轮确认", prev, nid)
+                    elif since < 120:
+                        log.info("网络地址仍在变（%s），距上次重建仅 %.0fs，暂不重建", nid, since)
+                    else:
+                        log.warning("网络变化 %s → %s（连续两轮稳定），重建内核", prev, nid)
+                        self._net_id = nid
+                        self._net_restart_at = time.time()
+                        self._ai_fail = 0
+                        try:
+                            self.restart_kernel()
+                            self.notify("网络已切换，内核已重建")
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("网络切换后重建内核失败: %s", e)
                 elif nid:
                     self._net_id = nid
+                    self._net_pending = nid
             # ① 系统代理看护：别的代理客户端会偷偷把注册表改回去
             if self.settings.get("system_proxy") and self.kernel.running():
                 server = f"127.0.0.1:{self.settings['mixed_port']}"

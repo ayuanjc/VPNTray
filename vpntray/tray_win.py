@@ -101,6 +101,10 @@ class TrayWin:
         self.hwnd: int | None = None
         self.hicon: int | None = None
         self._icon_state = ""
+        # 图标按状态缓存：tooltip 里带实时速度，tip 每 2 秒就变，
+        # 以前会连带每个 tick 重新 LoadImage 一次（缺图标时就是日志刷屏的根）。
+        self._icon_cache: dict[str, int] = {}
+        self._icon_missing: set[str] = set()
         self._node_cmds: dict[int, str] = {}
         self._last_key: tuple | None = None
         self._menu_open = False
@@ -136,18 +140,45 @@ class TrayWin:
 
     # ══════════ 托盘图标 ══════════
     def _load_icon(self, state: str) -> int:
-        path = (ICONS.get(state) or ICONS["on"])()
-        if not path.exists():
-            log.warning("图标文件缺失，回落到运行中图标: %s", path)
-            path = ICONS["on"]()
-        try:
-            return win32gui.LoadImage(
-                0, str(path), win32con.IMAGE_ICON, 0, 0,
-                win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("加载图标失败，使用系统默认图标: %s", e)
-            return win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+        """按状态加载一次并缓存。
+
+        旧实现每次刷新都 LoadImage：tooltip 带实时上下行速度、每 2 秒必变，
+        于是图标被反复从磁盘读，图标缺失的机器上更狠 —— 每个 tick 两条
+        warning，「图标文件缺失」+「加载图标失败」各刷了 1289 次，日志九成
+        是这对噪音，真正的故障（节点全挂）反而被埋掉了。
+        """
+        key = state if state in ICONS else "on"
+        cached = self._icon_cache.get(key)
+        if cached:
+            return cached
+
+        tried: set[str] = set()
+        for cand in (ICONS[key](), ICONS["on"]()):
+            s = str(cand)
+            if s in tried:
+                continue
+            tried.add(s)
+            if not cand.exists():
+                if s not in self._icon_missing:
+                    self._icon_missing.add(s)
+                    log.warning("图标文件缺失（打包时漏了 assets）：%s（本条只提示一次）", cand)
+                continue
+            try:
+                hicon = win32gui.LoadImage(
+                    0, s, win32con.IMAGE_ICON, 0, 0,
+                    win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("加载图标失败，换下一个候选: %s（%s）", cand, e)
+                continue
+            self._icon_cache[key] = hicon
+            return hicon
+
+        # 一个 ico 都读不到：直接用系统图标，不再每次刷日志。
+        if "system" not in self._icon_cache:
+            log.warning("没有任何图标文件可用，托盘改用系统默认图标（本条只提示一次）")
+            self._icon_cache["system"] = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+        return self._icon_cache["system"]
 
     def _nid(self, flags: int, tip: str = "", icon: int | None = None) -> tuple:
         return (self.hwnd, 0, flags, WM_TRAY, self.hicon if icon is None else icon, tip)
@@ -162,11 +193,12 @@ class TrayWin:
             state = "on"
         tip = self._tooltip(st)
 
-        if not force and state == self._icon_state and tip == getattr(self, "_tip", ""):
+        state_changed = force or self.hicon is None or state != self._icon_state
+        if not state_changed and tip == getattr(self, "_tip", ""):
             return
 
-        new_icon = self._load_icon(state)
-        old = self.hicon
+        # 只有状态变了才碰磁盘；单纯 tip 变化复用缓存里的 HICON。
+        new_icon = self._load_icon(state) if state_changed else self.hicon
         need_add = not getattr(self, "_nid_added", False)
         flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
         try:
@@ -180,18 +212,10 @@ class TrayWin:
             self.hicon = new_icon
             self._icon_state = state
             self._tip = tip
-            if old:
-                try:
-                    win32gui.DestroyIcon(old)
-                except Exception:  # noqa: BLE001
-                    pass
+            # 注意：不能 DestroyIcon —— 图标现在是缓存复用的，
+            # 销毁它等于把下一次要用的句柄也一起废掉。
         except win32gui.error as e:
             log.debug("更新托盘图标失败: %s", e)
-            if need_add:
-                try:
-                    win32gui.DestroyIcon(new_icon)
-                except Exception:  # noqa: BLE001
-                    pass
             self._icon_state = ""      # 下一轮继续试
             self._tip = tip
 
