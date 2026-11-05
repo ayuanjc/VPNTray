@@ -30,6 +30,7 @@ KERNEL_LOG = LOGS / "kernel.log"
 APP_LOG = LOGS / "app.log"
 UI_DIR = DATA / "ui"
 LOCK_FILE = DATA / "app.lock"
+DELAYS = DATA / "delays.json"          # 上次测速结果，重启/刷新面板后直接复用
 
 # 系统级目录：重置/删除 data 也不会丢，用于保存「接管前的系统代理原始设置」
 APPDATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "VPNTray"

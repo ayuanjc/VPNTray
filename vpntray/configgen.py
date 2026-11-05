@@ -91,6 +91,64 @@ AI_DOMAINS = [
     "closeai-asia.com",
 ]
 
+# ── 场景加速：Steam / GitHub ──
+# 和「AI 稳定」正好相反：这两个要的是**延迟、带宽、下载 CDN 命中**，IP 会变
+# 也无所谓。所以各自一个 select 组，组内按偏好地区排序（港台日最省事），
+# 用户钉住哪个就哪个；不钉就用组里第一个。
+# 分流优先级：比订阅规则高（订阅常把它们丢进「国际媒体」，那条线往往绕地球
+# 一圈），比 GEOSITE,cn 高（GitHub 在国内有 CDN，但 Pages / Release 资产
+# 一律走境外，geo 分类不可靠）。
+SCENES: list[dict[str, Any]] = [
+    {
+        "key": "steam",
+        "title": "Steam 加速",
+        "desc": "商店 / 社区 / 下载 CDN",
+        "settings_key": "steam_enabled",
+        "node_key": "steam_node",
+        "prefer_key": "steam_prefer_regions",
+        "prefer": ["香港", "台湾", "日本", "韩国", "新加坡"],
+        "domains": [
+            "steampowered.com",       # 商店 / 登录 / 支付
+            "steamcommunity.com",     # 社区、创意工坊、市场
+            "steamstatic.com",        # 图片与静态资源
+            "steamcontent.com",       # 下载 CDN（游戏本体）
+            "steamusercontent.com",   # 工坊内容
+            "steamgames.com",
+            "steamserver.net",
+            "steam-chat.com",
+            "steamconnecttest.com",
+            "steamdeck.com",
+            "s.team",                 # 短链与登录跳转
+        ],
+    },
+    {
+        "key": "github",
+        "title": "GitHub 加速",
+        "desc": "git / Release / Pages / 容器镜像",
+        "settings_key": "github_enabled",
+        "node_key": "github_node",
+        "prefer_key": "github_prefer_regions",
+        "prefer": ["香港", "日本", "新加坡", "台湾", "美国"],
+        "domains": [
+            "github.com",             # 含 api / gist / codeload（git 传输）
+            "githubusercontent.com",  # raw / objects / avatars
+            "githubassets.com",       # 页面静态资源
+            "github.io",              # Pages
+            "ghcr.io",                # 容器镜像
+            "github.dev",             # 网页编辑器
+            "githubcopilot.com",
+            "github.blog",
+        ],
+    },
+]
+
+
+def scene_by_key(key: str) -> dict[str, Any] | None:
+    for sc in SCENES:
+        if sc["key"] == key:
+            return sc
+    return None
+
 FAKE_IP_FILTER = [    "*.lan",
     "*.local",
     "*.localdomain",
@@ -146,6 +204,35 @@ SNIFFER: dict[str, Any] = {
 }
 
 
+def _scene_members(sc: dict[str, Any], node_names: list[str], settings) -> list[str]:
+    """场景组里的成员顺序：钉住的排第一，其后按偏好地区，其余按名字。
+
+    select 组的第一个就是默认出口，所以「排序」= 「默认用什么节点」。
+    Steam 下载靠港台日，GitHub git 传输靠日本/新加坡，各有各的偏好，
+    所以偏好列表按场景分开配置（settings 里可覆盖）。
+    """
+    from . import hotspot as _hs
+
+    pref: list[str] = []
+    try:
+        pref = list(settings.get(sc["prefer_key"]) or [])
+    except Exception:  # noqa: BLE001
+        pref = []
+    pref = pref or list(sc["prefer"])
+
+    def rank(n: str) -> int:
+        reg = _hs.region_of(n)
+        for i, w in enumerate(pref):
+            if w and (w == reg or w in n):
+                return i
+        # 没命中偏好地区的不剔除（订阅节点命名千奇百怪），排后面就行
+        return len(pref) + 5
+
+    pinned = str(settings.get(sc["node_key"]) or "")
+    rest = sorted((n for n in node_names if n != pinned), key=lambda n: (rank(n), n))
+    return ([pinned] if pinned and pinned in node_names else []) + rest
+
+
 def build(sub: dict[str, Any], settings) -> dict[str, Any]:
     """sub: subscription.normalize() 的结果。"""
     if not sub.get("proxy-groups"):
@@ -197,6 +284,25 @@ def build(sub: dict[str, Any], settings) -> dict[str, Any]:
             "type": "select",
             "proxies": members,
         })
+
+    # —— 场景加速组（Steam / GitHub）——
+    # 和 AI 组一样有「建了组却没插规则 / 插了规则却没建组」的坑：
+    # mihomo 遇到引用不存在的组会直接起不来，所以两边用同一个 scene_on 判断。
+    scene_on: set[str] = set()
+    scene_groups: list[dict[str, Any]] = []
+    for sc in SCENES:
+        if not bool(settings.get(sc["settings_key"], True)) or not node_names:
+            continue
+        members = _scene_members(sc, node_names, settings)
+        if not members:
+            continue
+        scene_groups.append({"name": sc["title"], "type": "select", "proxies": members})
+        scene_on.add(sc["title"])
+    for i, g in enumerate(scene_groups):
+        groups.insert((1 if ai_on else 0) + i, g)
+    if scene_on:
+        log.info("场景加速：%s", "、".join(sorted(scene_on)))
+
     sub = {**sub, "proxy-groups": groups}
 
     # —— 规则拼装 ——
@@ -206,6 +312,11 @@ def build(sub: dict[str, Any], settings) -> dict[str, Any]:
     # AI 域名优先级高于订阅规则，避免被分到「国际媒体」之类的乱切组
     if ai_on:
         out_rules += [f"DOMAIN-SUFFIX,{d},{AI_GROUP}" for d in AI_DOMAINS]
+    # 场景加速同样排在订阅规则前面：订阅把这些域名丢进「国际媒体」时，
+    # 那条线按 Netflix 的落地点走，Steam 下载和 git clone 会慢到没法用。
+    for sc in SCENES:
+        if sc["title"] in scene_on:
+            out_rules += [f"DOMAIN-SUFFIX,{d},{sc['title']}" for d in sc["domains"]]
     out_rules += [r for r in CN_EXTRA_RULES if r not in sub_rules]
     out_rules += sub_rules
     # 国内兜底：geosite:cn 域名直连（fake-ip 下比 GEOIP 更可靠）

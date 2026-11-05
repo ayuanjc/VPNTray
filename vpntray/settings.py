@@ -60,6 +60,16 @@ DEFAULTS: dict[str, Any] = {
     "ai_node": "",                  # 钉死的 AI 节点
     "ai_keep_alive": 30,            # 长连接保活（秒）
 
+    # ——— 场景加速（Steam / GitHub）———
+    # 各自一个 select 组，默认挑偏好地区里排最前的节点；钉住后不会被自动
+    # 优选/自愈改掉（这两个场景换 IP 不触发风控，但要保证出口稳定不绕路）。
+    "steam_enabled": True,
+    "steam_node": "",
+    "steam_prefer_regions": ["香港", "台湾", "日本", "韩国", "新加坡"],
+    "github_enabled": True,
+    "github_node": "",
+    "github_prefer_regions": ["香港", "日本", "新加坡", "台湾", "美国"],
+
     # ——— 自动更新 ———
     "auto_update": True,            # 启动后静默查一次更新，有新版才提示
     "update_repo": "ayuanjc/VPNTray",  # GitHub 仓库 owner/name，留空则关闭更新检查

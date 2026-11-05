@@ -1,6 +1,7 @@
 """应用核心：状态机 + 订阅/内核/测速/系统代理的编排。"""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -15,7 +16,7 @@ from . import __version__ as _VERSION
 from . import autostart, configgen, disguise, hotspot, kernel as kernel_mod, netguard, purity, subscription, sysproxy
 from .api import ApiError, MihomoAPI
 from .kernel import Kernel
-from .paths import CONFIG, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
+from .paths import CONFIG, DELAYS, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
 from .settings import Settings
 
 
@@ -82,7 +83,8 @@ class App:
             "main_group": self.settings.get("main_group", "节点选择"),
             "group_now": "",
             "group_all": [],
-            "delays": {},
+            "delays": {},                   # {节点名: 毫秒}；只有测速成功才整体替换
+            "delay_error": "",              # 最近一次测速失败原因（旧结果继续留着）
             "proxies": {},
             "traffic": {"up": 0, "down": 0, "up_speed": 0, "down_speed": 0},
             "connections": 0,
@@ -110,6 +112,8 @@ class App:
         self._update_busy = False
         self._task_lock = threading.Lock()   # 检测类长任务的互斥
         self._power_busy = False             # 总开关防连点
+        # 上次测出来的延迟直接读回来：重启程序 / 刷新面板不该是一片空白
+        self._load_delays()
 
     def _claim_task(self, flag: str) -> bool:
         """「有没有任务在跑」+「置位」必须原子：面板双击就能并发两份，
@@ -207,6 +211,7 @@ class App:
         except Exception:  # noqa: BLE001
             self._net_id = ()
         self._sync_ai_node()
+        self._sync_scene_nodes()
         self._start_loops()
         self._set(phase="运行中", busy="")
         log.info("启动完成，端口 %s", self.settings["mixed_port"])
@@ -409,6 +414,101 @@ class App:
             self.refresh_now()
         self.notify("已启用 AI 专用通道" if on else "已关闭 AI 专用通道")
         return True, ""
+
+    # ══════════ 场景加速（Steam / GitHub）══════════
+    def scenes_status(self) -> list[dict[str, Any]]:
+        """两个场景组的实时状态（每轮轮询都调，保持便宜）。"""
+        proxies = self.state.get("proxies") or {}
+        delays = self.state.get("delays") or {}
+        out: list[dict[str, Any]] = []
+        for sc in configgen.SCENES:
+            name = sc["title"]
+            g = proxies.get(name) or {}
+            cur = str(g.get("now") or "")
+            members = [str(m) for m in (g.get("all") or []) if m and str(m) != name]
+            out.append({
+                "key": sc["key"],
+                "title": name,
+                "desc": sc.get("desc", ""),
+                "enabled": bool(self.settings.get(sc["settings_key"], True)),
+                "active": bool(g),          # 内核里真有这个组（关掉/无节点时没有）
+                "node": cur,
+                "pinned": str(self.settings.get(sc["node_key"]) or ""),
+                "delay": delays.get(cur),
+                "members": len(members),
+                "domains": len(sc["domains"]),
+                "main": str(self.state.get("group_now") or ""),
+            })
+        return out
+
+    def set_scene_node(self, key: str, name: str) -> tuple[bool, str]:
+        sc = configgen.scene_by_key(key)
+        if not sc:
+            return False, f"未知场景：{key}"
+        name = (name or "").strip()
+        if not name:
+            return False, "缺少节点名"
+        self.settings[sc["node_key"]] = name
+        self.settings.save()
+        try:
+            self.api.select(sc["title"], name)
+        except ApiError as e:
+            return False, f"切换失败：{e}"
+        self.notify(f"{sc['title']}：{name}")
+        self.refresh_now()
+        return True, ""
+
+    def set_scene_enabled(self, key: str, on: bool) -> tuple[bool, str]:
+        sc = configgen.scene_by_key(key)
+        if not sc:
+            return False, f"未知场景：{key}"
+        self.settings[sc["settings_key"]] = bool(on)
+        self.settings.save()
+        cached = subscription.load_cache()
+        if not cached:
+            return False, "没有订阅缓存"
+        sub = subscription.normalize(cached)
+        cfg = configgen.build(sub, self.settings)
+        path = configgen.write(cfg)
+        if self.kernel.running():
+            try:
+                self.api.reload(path)
+            except ApiError as e:
+                return False, f"重载失败：{e}"
+            self._apply_saved_selection()
+            if on:
+                self._sync_scene_nodes()
+            self.refresh_now()
+        self.notify(f"已{'启用' if on else '关闭'}{sc['title']}")
+        return True, ""
+
+    def _sync_scene_nodes(self) -> None:
+        """把场景组的出口钉到一个真实存在的节点上。
+
+        钉的值可能来自上一个订阅（换机场后节点名全变了），也可能是被删掉的
+        节点 —— 这时组里还留着别的成员，但 select 的 now 会指向不存在的名字，
+        流量按 DIRECT 走，用户看到的就是「开了加速反而更慢」。所以每次重建
+        配置后都校验一遍，失效就从组头（偏好地区）挑一个。
+        """
+        proxies = self.state.get("proxies") or {}
+        for sc in configgen.SCENES:
+            if not bool(self.settings.get(sc["settings_key"], True)):
+                continue
+            g = proxies.get(sc["title"]) or {}
+            members = [str(m) for m in (g.get("all") or []) if m and str(m) != sc["title"]]
+            if not members:
+                continue
+            pinned = str(self.settings.get(sc["node_key"]) or "")
+            if pinned not in members:
+                pick = members[0]
+                log.info("%s 原钉节点 %r 不在成员里，改钉 %s", sc["title"], pinned, pick)
+                self.settings[sc["node_key"]] = pick
+                self.settings.save()
+                pinned = pick
+            try:
+                self.api.select(sc["title"], pinned)
+            except ApiError as e:
+                log.info("%s 选节点失败: %s", sc["title"], e)
 
     def subscriptions(self) -> list[dict[str, Any]]:
         """订阅列表（老版本只有 sub_url，这里自动迁移成一条）。"""
@@ -738,6 +838,8 @@ class App:
                 self.api.reload(path)
                 self._apply_saved_selection()
                 self.refresh_now()
+                # 换订阅后节点名全变了，场景组的钉选要跟着重新落地
+                self._sync_scene_nodes()
                 self.notify(f"订阅已更新：{len(sub['proxies'])} 个节点")
             self._set(busy="")
             return True
@@ -913,6 +1015,54 @@ class App:
         self._changed()
 
     # ══════════ 测速 ══════════
+    DELAY_TTL = 12 * 3600          # 半天前的延迟不再拿来充数
+
+    def _load_delays(self) -> None:
+        """启动时把上次的测速结果读回来。
+
+        没有这一步时，只要程序重启过（或用户自己重启一次内核），面板上的
+        延迟就全是空白，非得手动点一次测速才回来 —— 用户看到的是
+        「刷新以后延迟全没了」。
+        """
+        try:
+            raw = json.loads(DELAYS.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("延迟缓存读不出来（%s），当作没有", e)
+            return
+        if not isinstance(raw, dict):
+            return
+        now = time.time()
+        out: dict[str, int] = {}
+        newest = 0.0
+        for name, item in raw.items():
+            if not isinstance(item, dict):
+                continue
+            ms = _int(item.get("ms"), 0, 1)
+            ts = _num(item.get("ts"))
+            if ms <= 0 or ts <= 0 or (now - ts) > self.DELAY_TTL:
+                continue
+            out[str(name)] = ms
+            newest = max(newest, ts)
+        if out:
+            with self._lock:
+                self.state["delays"] = out
+                self._delays_ts = newest
+            log.info("读回上次测速结果：%d 个节点", len(out))
+
+    def _save_delays(self, delays: dict[str, int]) -> None:
+        """整份覆盖写：只留这次真测出来的节点，没测到的不再冒充有效。"""
+        ensure_dirs()
+        now = time.time()
+        data = {k: {"ms": int(v), "ts": now} for k, v in delays.items() if v}
+        tmp = DELAYS.with_name(DELAYS.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, DELAYS)
+        except OSError as e:
+            log.warning("延迟缓存写入失败: %s", e)
+
     def test_delays(self, group: str | None = None) -> dict[str, int]:
         group = group or (self.settings.get("main_group") or "节点选择")
         url = self.settings.get("delay_url", "https://www.gstatic.com/generate_204")
@@ -920,24 +1070,41 @@ class App:
         self._set(busy="测速中")
         self._set_progress("delay", 0, 0, "刷新延迟…")
         delays: dict[str, int] = {}
+        err = ""
         try:
             delays = self.api.group_delay(group, url, timeout)
+            if not delays:
+                err = "内核没有返回任何延迟（节点全部超时或内核未就绪）"
         except ApiError as e:
+            err = f"测速失败：{e}"
             log.warning("测速失败: %s", e)
         except Exception:  # noqa: BLE001
+            err = "测速异常，详情见日志"
             log.exception("测速异常")
         finally:
             # busy 必须无条件清掉：一旦漏在这里，_wait_idle 会永远返回 False，
             # 之后所有「测纯净度 / 带宽测速」都会被静默跳过，面板上毫无提示。
             self._set_progress()
-            with self._lock:
-                self.state["delays"] = delays
-                self._delays_ts = time.time()
+            if delays:
+                with self._lock:
+                    self.state["delays"] = delays
+                    self.state["delay_error"] = ""
+                    self._delays_ts = time.time()
+                self._save_delays(delays)
+            else:
+                # 一次失败不能把面板上已有的延迟全擦掉 —— 机场整体超时（504
+                # all proxies timeout）或内核刚重启都会走到这里，旧数字虽然过
+                # 期，但比一片「无延迟数据」有用。留着旧值，只把原因记下来。
+                with self._lock:
+                    self.state["delay_error"] = err or "测速失败"
             self._set(busy="")
             self._changed()
         if delays:
             best = min(delays.items(), key=lambda kv: kv[1])
             log.info("测速完成 %d 个节点，最快 %s %dms", len(delays), best[0], best[1])
+        else:
+            log.warning("测速没拿到结果：%s（保留上次的 %d 条）",
+                        err, len(self.state.get("delays") or {}))
         return delays
 
     def _recent_delays(self, max_age: float = 120.0) -> dict[str, int]:

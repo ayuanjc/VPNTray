@@ -490,6 +490,14 @@
   .ai-split .same{color:var(--dim2)}
   .ai-split .diff{color:#ffd08a}
 
+  /* 场景加速（Steam / GitHub）：两行，各带一个开关和一个钉选下拉 */
+  .scene-row{padding:11px 0;border-top:1px solid var(--line)}
+  .scene-row:first-child{border-top:0;padding-top:2px}
+  .scene-head{display:flex;align-items:center;gap:10px;justify-content:space-between}
+  .scene-head .lbl{font-size:13px}
+  .scene-head .hint{font-size:11px;color:var(--dim2);margin-top:3px;line-height:1.6}
+  .scene-row .sel{flex:1;min-width:0;font-size:12px}
+
   /* ── 卡片折叠：点标题收起，低频卡片（关于）默认折叠 ── */
   .card > h2{cursor:pointer;user-select:none}
   .card > h2::before{content:'▾';display:inline-block;font-size:9px;color:var(--dim2);
@@ -639,6 +647,11 @@
           <button class="btn" id="btnAiLauncher">生成启动脚本</button>
         </div>
         <div class="fp-box" id="aiFpBox"></div>
+      </div>
+
+      <div class="card" style="margin-top:14px" id="sceneCard">
+        <h2>场景加速<span class="hint-inline">Steam / GitHub</span></h2>
+        <div class="scene-list" id="sceneList"></div>
       </div>
 
       <div class="card" style="margin-top:14px" id="subCard">
@@ -884,7 +897,7 @@
 const $ = s => document.querySelector(s);
 let STATE = null;
 // 页面自带的版本号；后端 build_state 也会返回 ui，两边不一致就强制刷新一次
-const UI_VER = '2.2.2';
+const UI_VER = '2.3.0';
 // 额度长条用的绿色梯度：第一条最亮，往后越来越深
 const GREEN_SHADES = ['#4ade80', '#37c96e', '#2aa95a', '#218a49', '#196c39', '#12522b', '#0c3b1f', '#082b16'];
 document.getElementById('uiVer').textContent = 'v' + UI_VER;
@@ -1162,6 +1175,7 @@ function render(){
   drawMap();
   renderProgress();
   renderAI();
+  renderScenes();
 }
 
 /* ───────── 世界地图（矢量 SVG，可缩放拖拽） ───────── */
@@ -1983,6 +1997,75 @@ function renderAI(){
   }
 }
 
+/* ───────── 场景加速卡片（Steam / GitHub）───────── */
+let sceneSig = '';
+
+function renderScenes(){
+  const list = (STATE && STATE.scenes) || [];
+  const box = $('#sceneList');
+  if (!box) return;
+  if (!list.length){
+    box.innerHTML = '<div class="hint">内核还没加载策略组</div>';
+    sceneSig = '';
+    return;
+  }
+  // 整块只在内容变化时重建：每轮都重排 <select> 会把用户正在选的项吞掉
+  const sig = JSON.stringify(list.map(s => [s.key, s.active, s.enabled, s.node, s.pinned, s.members, s.domains]))
+    + '|' + ((STATE.nodes || []).length);
+  if (sig === sceneSig) return;
+  const focused = document.activeElement && document.activeElement.tagName === 'SELECT';
+  if (focused) return;
+  sceneSig = sig;
+
+  const nodes = (STATE.nodes || []).slice()
+    .sort((x, y) => (x.delay || 1e9) - (y.delay || 1e9));
+  box.innerHTML = list.map(s => {
+    const bits = [];
+    if (!s.enabled) bits.push('已关闭，走主代理');
+    else if (!s.active) bits.push('未生效（当前订阅没有可用节点）');
+    if (s.node) bits.push('出口 ' + s.node);
+    if (s.delay) bits.push(s.delay + 'ms');
+    if (s.node && s.node === (STATE.current || '')) bits.push('与主代理同一节点');
+    bits.push(s.domains + ' 个域名');
+    const opts = nodes.map(n => {
+      const t = n.name + (n.delay ? ' · ' + n.delay + 'ms' : '');
+      return `<option value="${esc(n.name)}"${n.name === s.node ? ' selected' : ''}>${esc(t)}</option>`;
+    }).join('');
+    return `<div class="scene-row" data-key="${esc(s.key)}" data-title="${esc(s.title)}">
+      <div class="scene-head">
+        <div>
+          <div class="lbl">${esc(s.title)}</div>
+          <div class="hint">${esc(s.desc || '')} · ${esc(bits.join(' · '))}</div>
+        </div>
+        <div class="switch${s.enabled ? ' on' : ''}" data-act="toggle"></div>
+      </div>
+      <div class="sub-edit" style="margin:9px 0 0">
+        <select class="sel" data-act="sel">${opts}</select>
+        <button class="btn" data-act="pin">钉住</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+$('#sceneList').addEventListener('click', async e => {
+  const row = e.target.closest('.scene-row');
+  if (!row) return;
+  const key = row.dataset.key, title = row.dataset.title || key;
+  const act = e.target.dataset.act;
+  if (e.target.classList.contains('switch')){
+    const on = !e.target.classList.contains('on');
+    const r = await api('/api/scene/toggle', {key, on});
+    toast(r.ok ? (on ? '已启用 ' : '已关闭 ') + title : ('失败：' + (r.error || '')));
+    sceneSig = ''; setTimeout(poll, 1400);
+  } else if (act === 'pin'){
+    const sel = row.querySelector('select');
+    if (!sel || !sel.value){ toast('先选一个节点'); return; }
+    const r = await api('/api/scene/node', {key, name: sel.value});
+    toast(r.ok ? title + ' 已钉到 ' + sel.value : ('失败：' + (r.error || '')));
+    sceneSig = ''; setTimeout(poll, 700);
+  }
+});
+
 /* 节点行里那些「检测完之后才会变」的小字段，两处渲染共用 */
 function puritySrcName(src){
   return src === 'one-ip' ? 'One-IP' : src === 'ipapi.is' ? 'ipapi.is' : src === 'ip-api' ? 'ip-api' : '';
@@ -2121,8 +2204,18 @@ function renderNodes(){
   const withDelay = nodes.filter(n => n.delay).length;
   const withPurity = nodes.filter(n => n.purity !== null && n.purity !== undefined).length;
   const scope = mapFilter ? `筛选 ${mapFilter} · ` : '';
+  // 上一次测速失败时把原因说出来：否则用户只看到延迟列突然全空，
+  // 以为面板「刷新坏了」，其实内核那边根本没返回数据（504 全超时 / 内核刚重启）。
+  let delayNote = '';
+  if (s.delay_error) {
+    const age = s.delay_ts ? Math.max(0, Math.round((Date.now() / 1000 - s.delay_ts) / 60)) : 0;
+    const when = s.delay_ts ? `${age < 1 ? '刚刚' : age + ' 分钟前'}的` : '没有';
+    const kept = withDelay ? ` · 显示${when}结果` : '';
+    delayNote = ' · 刷新延迟失败：' + s.delay_error + kept;
+  }
   $('#listHint').textContent =
     `${scope}${nodes.length} 个节点${q ? '（已搜索）' : ''} · ${withDelay} 有延迟 · ${withPurity} 有纯净度`
+    + delayNote
     + (s.busy ? ` · ${s.busy}…` : '') + '  ·  点一下即切换';
 
   const box = $('#nodes');
@@ -2742,7 +2835,9 @@ function renderSubs(sub) {
       <span class="op">
         ${x.active ? '<button disabled style="opacity:.45">使用中</button>'
                    : `<button data-act="use" data-i="${x.i}"${dead ? ' disabled style="opacity:.45"' : ''}>切换</button>`}
-        <button class="del" data-act="del" data-i="${x.i}">删</button>
+        ${list.length < 2
+          ? '<button class="del" disabled style="opacity:.45" title="至少留一个订阅">删</button>'
+          : `<button class="del" data-act="remove" data-i="${x.i}">删</button>`}
       </span>
     </div>`;
   }).join('');
@@ -2763,7 +2858,7 @@ $('#subList').addEventListener('click', async e => {
   if (!b) return;
   const i = Number(b.dataset.i);
   const act = b.dataset.act;
-  if (act === 'del' && !confirm('删除这个订阅？')) return;
+  if (act === 'remove' && !confirm('删除这个订阅？')) return;
   b.disabled = true;
   toast(act === 'use' ? '正在切换订阅…' : '正在删除…');
   const r = await api('/api/sub_url', {action: act, index: i});

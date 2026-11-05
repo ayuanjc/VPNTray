@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "2.2.2"
+UI_VER = "2.3.0"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -205,8 +205,14 @@ def build_state(app) -> dict[str, Any]:
         "traffic": st.get("traffic") or {},
         "connections": st.get("connections", 0),
         "probing": bool(getattr(app, "_purity_running", False) or getattr(app, "_speed_running", False)),
+        # 延迟是「上一次成功测出来的」结果 + 本次刷新的失败原因，
+        # 前端据此在列表头标一句「上次刷新失败，显示的是 X 分钟前的数据」
+        "delay_ts": _num(getattr(app, "_delays_ts", 0.0)),
+        "delay_error": str(st.get("delay_error") or ""),
         "progress": st.get("progress") or {},
         "ai": app.ai_status(),
+        # Steam / GitHub 场景组：组名、当前出口、成员数，前端直接渲染
+        "scenes": app.scenes_status(),
         "update": st.get("update") or {},
         "update_repo": s.get("update_repo", ""),
         "purity_count": sum(1 for n in nodes if n.get("purity") is not None),
@@ -332,9 +338,15 @@ class WebUI:
                 ok, err = app.use_subscription(_int(b.get("index"), 0, 0, 999), keep_node=True)
             elif action == "mode":
                 ok, err = app.set_sub_mode(str(b.get("mode", "single")))
-            elif action == "remove":
+            # 前端 1.8.0~2.2.2 发的是 "del"，老的后端只认 "remove"，
+            # 于是删除请求掉进下面的 else 分支，被当成「加一条空订阅」，
+            # 用户看到的是「订阅链接必须以 http:// 或 https:// 开头」，
+            # 日志里连一行都没有 —— 订阅永远删不掉。两个都收。
+            elif action in ("remove", "del"):
                 ok, err = app.remove_subscription(_int(b.get("index"), 0, 0, 999))
             else:
+                if not url:
+                    return {"ok": False, "error": "缺少订阅链接"}
                 ok, err = app.set_subscription(url, name)
             return {"ok": ok, "error": err}
 
@@ -399,6 +411,21 @@ class WebUI:
         def ai_toggle(body):
             on = bool((body or {}).get("on", True))
             ok, err = app.set_ai_enabled(on)
+            return {"ok": ok, "error": err}
+
+        # ── 场景加速（Steam / GitHub）──
+        def scene_node(body):
+            b = body or {}
+            ok, err = app.set_scene_node(str(b.get("key", "")).strip(),
+                                         str(b.get("name", "")).strip())
+            return {"ok": ok, "error": err}
+
+        def scene_toggle(body):
+            b = body or {}
+            on = b.get("on", True)
+            if not isinstance(on, bool):
+                return {"ok": False, "error": "on 必须是 true / false"}
+            ok, err = app.set_scene_enabled(str(b.get("key", "")).strip(), on)
             return {"ok": ok, "error": err}
 
         def topo(_):
@@ -552,6 +579,8 @@ class WebUI:
             "/api/speed": check_speed,
             "/api/ai/node": ai_node,
             "/api/ai/toggle": ai_toggle,
+            "/api/scene/node": scene_node,
+            "/api/scene/toggle": scene_toggle,
             "/api/ai/fingerprint": ai_fingerprint,
             "/api/ai/align": ai_align,
             "/api/ai/restore_tz": ai_restore_tz,
