@@ -263,9 +263,13 @@ def _atom_notes(repo: str, tag: str, proxies: dict[str, str] | None,
         return ""
     ns = "{http://www.w3.org/2005/Atom}"
     want = tag.lstrip("vV")
+    # Release 标题不一定正好是 tag：2.3.0 起都写成「VPNTray 2.3.0 — 一句话」，
+    # 早期严格相等比对导致更新弹窗里永远没有更新说明。改成「标题里出现这个版本号」，
+    # 用 \b 卡住边界，避免 2.4.0 命中 2.4.0-rc1 或 12.4.0。
+    want_re = re.compile(rf"(?<![0-9A-Za-z.])v?{re.escape(want)}(?![0-9A-Za-z.])", re.I)
     for entry in root.findall(f"{ns}entry"):
         title = (entry.findtext(f"{ns}title") or "").strip()
-        if title.lstrip("vV") != want:
+        if title.lstrip("vV") != want and not want_re.search(title):
             continue
         node = entry.find(f"{ns}content")
         body = (node.text or "") if node is not None else ""
@@ -395,8 +399,10 @@ def extract(zip_path: Path, workdir: Path, expect_version: str) -> Path:
     if root is None:
         raise UpdateError("安装包里找不到 VPNTray.exe")
 
-    # 版本自证：发布包里 assets/index.html 带着 UI_VER
+    # 版本自证：发布包里 assets/index.html 带着 UI_VER（onedir 打包后它在 _internal/assets）
     idx = root / "assets" / "index.html"
+    if not idx.exists():
+        idx = root / "_internal" / "assets" / "index.html"
     if idx.exists():
         try:
             text = idx.read_text(encoding="utf-8", errors="replace")
