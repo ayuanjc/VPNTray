@@ -261,3 +261,42 @@ VPN Tray — 使用说明
     不会再出现浏览器拦住「多个对话框」的情况
   · 地址没变，还是 http://127.0.0.1:7892/ ，浏览器缓存旧样式时按 Ctrl+F5 刷一次
 
+十九、GitHub 打不开 / git clone 报 unexpected eof（2.5.0 新增自动组与自检）
+
+  2.3.0 给 GitHub 建了专线，但那条专线只保证「规则不被别人抢走」，它不保证你钉的那个
+  节点还活着。机场节点大面积失效时（那天 100 个只剩 12 个活的），GitHub 组常常还锁在
+  一个已经挂掉的香港节点上 —— 表现就是网页转半天能开、git clone 一定断：
+
+    fatal: unable to access 'https://github.com/...':
+    TLS connect error: error:0A000126:SSL routines::unexpected eof while reading
+
+  2.5.0 做了四件事：
+
+  1) 「GitHub 加速」里多了一个「GitHub 自动」组（fallback），排在下拉第一位，也是默认
+     选项。它只装测速通过的节点，进去之后由内核每 3 分钟自己复查、自动挑最快的。
+     以前钉住的节点要是测不通了，启动时会自动退回这个组，不再死抱着那个节点。
+
+  2) 「场景加速」下面多了一行 GitHub 体检框：
+       · 五个探针：网页 github.com / API api.github.com / raw 源文件 /
+         Release 资产 objects.githubusercontent.com / 容器镜像 ghcr.io
+         （TLS 和 HTTP 通了就算通，所以 ghcr 出 401、资产出 404 都是正常）
+       · 一行 git 实测：拿到几个 ref、花多少毫秒 —— 网页能开不等于 git 能拉
+       · 「GitHub 自检」按钮：哪项断了，就用 GitHub 的地址给自动组重测、挑最快的切过去，
+         然后再测一遍给你看
+       · 「对齐 git 代理」按钮：见第 3 条
+
+  3) git 的全局代理会被自动对齐。典型坑：以前装过 Clash，git 的 http.proxy 还指着
+     127.0.0.1:7897，而那个端口现在被系统（WSL / Hyper-V 的 localhost 转发）占着，
+     连上去立刻 EOF。现在每次启动都会把它改成当前混合端口（默认 7891），面板上会写
+     「http.proxy http://127.0.0.1:7897 → 7891」。指向公司网关的那种值不动。
+
+  4) 规则补了两条：Release 老直链（github-production-release-asset-*.s3.amazonaws.com）
+     和 github-cloud.s3.amazonaws.com。这两个以前会漏到别的组，下载 Release 附件特别慢。
+
+  还是不行怎么办？按顺序看：
+    · 五项里"网页"就不通 → 点「GitHub 自检」，让它换节点
+    · 只有 git 那条红、五项全绿 → 点「对齐 git 代理」；再不行在命令行跑
+        git config --global --get http.proxy     确认它等于 http://127.0.0.1:7891
+    · 五项全红、怎么换都不行 → 机场中转段整片失效，换订阅或找机场，软件修不了这个
+
+

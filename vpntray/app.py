@@ -4,6 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -37,6 +40,10 @@ def _num(v: Any, default: float = 0.0) -> float:
     return n
 
 log = logging.getLogger("app")
+
+# 打包成无控制台的 exe 后，任何 subprocess 都会闪一个黑框（git config 这种
+# 几百毫秒的命令也会）。统一带上这个标志。
+CREATE_NO_WINDOW = 0x08000000
 
 
 def _version() -> str:
@@ -101,6 +108,9 @@ class App:
             "busy": "",
             "started_at": 0.0,
             "update": {},                   # 最近一次检查更新的结果
+            "github": {},                   # 最近一次 GitHub 链路自检结果
+            "git_proxy": "",                # git 全局 http.proxy 的当前值
+            "git_proxy_note": "",           # 本次启动有没有帮用户纠正过
         }
         self._last_conn = (0, 0, 0.0)  # up, down, ts
         self._delays_ts = 0.0
@@ -212,6 +222,8 @@ class App:
             self._net_id = ()
         self._sync_ai_node()
         self._sync_scene_nodes()
+        # git 的全局代理经常停留在「上一次那个客户端」的端口上，初始化时对齐一次
+        self.sync_git_proxy()
         self._start_loops()
         self._set(phase="运行中", busy="")
         log.info("启动完成，端口 %s", self.settings["mixed_port"])
@@ -401,7 +413,7 @@ class App:
         if not cached:
             return False, "没有订阅缓存"
         sub = subscription.normalize(cached)
-        cfg = configgen.build(sub, self.settings)
+        cfg = configgen.build(sub, self.settings, self._delay_map())
         path = configgen.write(cfg)
         if self.kernel.running():
             try:
@@ -416,6 +428,12 @@ class App:
         return True, ""
 
     # ══════════ 场景加速（Steam / GitHub）══════════
+    def _delay_map(self) -> dict[str, int]:
+        """上次测速的真实结果（{节点名: 毫秒}），生成场景组时按它排优先级。"""
+        with self._lock:
+            d = dict(self.state.get("delays") or {})
+        return {str(k): _int(v, 0, 1) for k, v in d.items() if _int(v, 0, 1) > 0}
+
     def scenes_status(self) -> list[dict[str, Any]]:
         """两个场景组的实时状态（每轮轮询都调，保持便宜）。"""
         proxies = self.state.get("proxies") or {}
@@ -426,6 +444,14 @@ class App:
             g = proxies.get(name) or {}
             cur = str(g.get("now") or "")
             members = [str(m) for m in (g.get("all") or []) if m and str(m) != name]
+            # 自动子组：select 的 now 会是 "GitHub 自动"，真正的出口在
+            # 那个 fallback 组的 now 里。界面上要显示真实节点，不然用户
+            # 只知道「在自动」，不知道自动跳到了哪台机器。
+            aname = configgen.auto_name(sc)
+            real = cur
+            auto_g = proxies.get(aname) or {}
+            if cur == aname:
+                real = str(auto_g.get("now") or "")
             out.append({
                 "key": sc["key"],
                 "title": name,
@@ -433,8 +459,12 @@ class App:
                 "enabled": bool(self.settings.get(sc["settings_key"], True)),
                 "active": bool(g),          # 内核里真有这个组（关掉/无节点时没有）
                 "node": cur,
+                "exit": real,               # 真实出口节点
+                "auto": bool(auto_g),        # 有没有自动子组
+                "auto_name": aname if auto_g else "",
+                "auto_members": len([m for m in (auto_g.get("all") or []) if m]),
                 "pinned": str(self.settings.get(sc["node_key"]) or ""),
-                "delay": delays.get(cur),
+                "delay": delays.get(real),
                 "members": len(members),
                 "domains": len(sc["domains"]),
                 "main": str(self.state.get("group_now") or ""),
@@ -468,7 +498,7 @@ class App:
         if not cached:
             return False, "没有订阅缓存"
         sub = subscription.normalize(cached)
-        cfg = configgen.build(sub, self.settings)
+        cfg = configgen.build(sub, self.settings, self._delay_map())
         path = configgen.write(cfg)
         if self.kernel.running():
             try:
@@ -499,6 +529,16 @@ class App:
             if not members:
                 continue
             pinned = str(self.settings.get(sc["node_key"]) or "")
+            # 钉住的节点要是已经测不通（机场节点大面积失效的常态），就别死抱着它，
+            # 直接退回自动组 —— 那正是「GitHub 组锁死在挂掉的香港-IEPL 01」的解法
+            auto_n = configgen.auto_name(sc) if sc.get("auto") else ""
+            alive = self._delay_map()
+            if (auto_n and auto_n in members and pinned and pinned != auto_n
+                    and alive and pinned not in alive):
+                log.info("%s 钉住的 %s 没有测速数据，改走 %s", sc["title"], pinned, auto_n)
+                self.settings[sc["node_key"]] = auto_n
+                self.settings.save()
+                pinned = auto_n
             if pinned not in members:
                 pick = members[0]
                 log.info("%s 原钉节点 %r 不在成员里，改钉 %s", sc["title"], pinned, pick)
@@ -509,6 +549,202 @@ class App:
                 self.api.select(sc["title"], pinned)
             except ApiError as e:
                 log.info("%s 选节点失败: %s", sc["title"], e)
+
+    # ══════════ GitHub 特化：自检 + git 代理对齐 ══════════
+    # 探针按「GitHub 实际会走到的域名」排：网页、API、raw 源文件、Release
+    # 资产、容器镜像。只 ping github.com 是不够的 —— 这台机器上就出现过
+    # 网页 200、raw 全 reset（hosts 固定 IP）的情况。
+    GITHUB_PROBES = (
+        ("web", "网页", "https://github.com/"),
+        ("api", "API", "https://api.github.com/"),
+        ("raw", "raw 源文件", "https://raw.githubusercontent.com/git/git/master/README.md"),
+        ("assets", "Release 资产", "https://objects.githubusercontent.com/"),
+        ("ghcr", "容器镜像", "https://ghcr.io/v2/"),
+    )
+    # git 的代理只改「指向本机」的那种；公司网关之类的外部件一律不碰
+    _GIT_PROXY_RE = re.compile(r"^(?:https?://)?(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?/?$", re.I)
+
+    def _git_exe(self) -> str:
+        return shutil.which("git") or ""
+
+    def _git_env(self, port: int) -> dict[str, str]:
+        """git 子进程只走我们的代理，别继承 shell 里的坏代理变量。"""
+        env = {k: v for k, v in os.environ.items()
+               if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+        env["NO_PROXY"] = "127.0.0.1,localhost"
+        env["GIT_TERMINAL_PROMPT"] = "0"     # 要账号就直接失败，别把线程挂住
+        return env
+
+    def git_probe(self, port: int | None = None) -> dict[str, Any]:
+        """真的跑一次 git ls-remote —— 浏览器能开不等于 git 能拉。"""
+        exe = self._git_exe()
+        if not exe:
+            return {"ok": False, "refs": 0, "error": "没装 git（PATH 里找不到）"}
+        port = port or _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
+        px = f"http://127.0.0.1:{port}"
+        cmd = [exe, "-c", f"http.proxy={px}", "-c", f"https.proxy={px}",
+               "-c", "http.sslVerify=true",
+               "ls-remote", "--heads", "https://github.com/git/git"]
+        t0 = time.time()
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=25,
+                               env=self._git_env(port), encoding="utf-8",
+                               errors="replace", creationflags=CREATE_NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "refs": 0, "ms": 25000, "error": "git 25s 没拉完（链路太慢或断流）"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "refs": 0, "error": f"{type(e).__name__}: {e}"}
+        out = (p.stdout or "").strip()
+        refs = len([x for x in out.splitlines() if x.strip()])
+        err = (p.stderr or "").strip().splitlines()
+        return {
+            "ok": p.returncode == 0 and refs > 0,
+            "refs": refs,
+            "ms": int((time.time() - t0) * 1000),
+            "error": "" if p.returncode == 0 else (err[-1][:160] if err else f"exit {p.returncode}"),
+        }
+
+    def _probe_github(self, port: int) -> list[dict[str, Any]]:
+        s = requests.Session()
+        s.trust_env = False          # 别让系统 http_proxy 变量二次套娃
+        px = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
+        out: list[dict[str, Any]] = []
+        for key, label, url in self.GITHUB_PROBES:
+            t0 = time.time()
+            code, err = 0, ""
+            try:
+                r = s.get(url, proxies=px, timeout=8, allow_redirects=False,
+                          headers={"User-Agent": "VPNTray-github-check",
+                                   "Cache-Control": "no-store"})
+                code = int(r.status_code)
+            except Exception as e:  # noqa: BLE001
+                err = f"{type(e).__name__}: {e}"[:140]
+            ms = int((time.time() - t0) * 1000)
+            # 401 / 403 / 404 也说明 TCP + TLS + HTTP 全程通了，只有 5xx 和
+            # 异常才算这条链路坏 —— 用「必须 200」判会把 ghcr 永远判成失败。
+            out.append({"key": key, "label": label, "url": url,
+                        "ok": bool(code and code < 500), "code": code,
+                        "ms": ms, "error": err})
+        return out
+
+    def github_check(self, heal: bool = True) -> dict[str, Any]:
+        """GitHub 专项自检：探针 + git 实测，坏了就地换节点。
+
+        这台机器上的典型故障是「GitHub 组钉在一个已经死掉的节点上」：
+        浏览器打不开、git 报 unexpected eof，但内核本身活着、其他站都通。
+        自检发现网页探针失败时，会用 GitHub 自己的地址给自动组重测一遍，
+        把出口拉回健康节点，再复测一次 —— 用户点一下就好，不用手工试 100 个。
+        """
+        port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
+        items = self._probe_github(port)
+        bad = [i["key"] for i in items if not i["ok"]]
+        switched = ""
+        note = ""
+        # 别用 state["proxies"]：那是刷新循环的缓存，可能落后好几秒，也可能还没跑过。
+        # 自检要的是「此刻内核里到底有哪些组」，只能现查。
+        try:
+            live = self.api.proxies() or {}
+            live_ok = bool(live)
+        except Exception:  # noqa: BLE001
+            live, live_ok = dict(self.state.get("proxies") or {}), False
+        sc = configgen.scene_by_key("github")
+        grp = (sc["title"] if sc else "") or "GitHub 加速"
+        aname = configgen.auto_name(sc) if sc else ""
+        if heal and bad:
+            # 能查到组才谈得上换节点；只看 kernel.running() 会把「API 已死但进程还在」漏掉
+            if not live_ok:
+                note = "内核没响应，自动换节点这一步跳过"
+            else:
+                target = aname if (aname and aname in live) else grp
+                try:
+                    d = self.api.group_delay(
+                        target, (sc or {}).get("probe") or "https://github.com/robots.txt", 3000)
+                except Exception as e:  # noqa: BLE001
+                    d = {}
+                    log.info("GitHub 自检组测速异常: %s", e)
+                if d:
+                    best = min(d, key=lambda k: d[k])
+                    # 有自动组就切回自动组（它自己会挑最快的），否则直接钉最快那个
+                    want = aname if (aname and aname in live) else best
+                    try:
+                        self.api.select(grp, want)
+                        switched = want if want != aname else f"{aname} → {best}"
+                        note = f"已切到 {best}（{d[best]}ms）"
+                    except ApiError as e:
+                        note = f"切换失败：{e}"
+                    if switched:
+                        items = self._probe_github(port)
+                        bad = [i["key"] for i in items if not i["ok"]]
+                        if bad:
+                            note += f"，换完仍有 {len(bad)} 项不通"
+                        try:
+                            live = self.api.proxies() or live
+                        except Exception:  # noqa: BLE001
+                            pass
+                else:
+                    note = "自动组里没有能连上 github.com 的节点（机场中转段可能整片失效）"
+        git = self.git_probe(port)
+        res = {
+            "ts": time.time(),
+            "ok": not bad and git["ok"],
+            "port": port,
+            "items": items,
+            "bad": bad,
+            "git": git,
+            "switched": switched,
+            "note": note,
+            "node": "",
+        }
+        g = (live.get(grp) or {})
+        res["node"] = str(g.get("now") or "")
+        self._set(github=res)
+        log.info("GitHub 自检：%s，git %s，%s",
+                 "通" if not bad else "断(" + ",".join(bad) + ")",
+                 "ok" if git["ok"] else "fail", note or "未动")
+        return res
+
+    def sync_git_proxy(self) -> str:
+        """把 git 全局代理对齐到当前混合端口，返回给人看的变更说明。
+
+        典型症状：git 的 http.proxy 还指着上一次装的 Clash（127.0.0.1:7897），
+        那个端口现在被 svchost / WSL 转发占着，连上去立刻 EOF —— 表现就是
+        「GitHub 网页能开，git clone 报 unexpected eof while reading」。
+        只改指向本机端口的配置；指向公司网关的外部件不动。
+        """
+        if not bool(self.settings.get("git_proxy_sync", True)):
+            return ""
+        exe = self._git_exe()
+        if not exe:
+            return ""
+        port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
+        want = f"http://127.0.0.1:{port}"
+        changed: list[str] = []
+        for key in ("http.proxy", "https.proxy"):
+            try:
+                cur = subprocess.run([exe, "config", "--global", "--get", key],
+                                     capture_output=True, text=True, timeout=8,
+                                     encoding="utf-8", errors="replace",
+                                     creationflags=CREATE_NO_WINDOW).stdout.strip()
+            except Exception as e:  # noqa: BLE001
+                log.info("读 git %s 失败，跳过: %s", key, e)
+                continue
+            if not cur or cur.rstrip("/") == want:
+                continue
+            if not self._GIT_PROXY_RE.match(cur):
+                log.info("git %s 指向外部代理 %s，不自动改", key, cur)
+                continue
+            try:
+                subprocess.run([exe, "config", "--global", key, want],
+                               capture_output=True, text=True, timeout=8,
+                               creationflags=CREATE_NO_WINDOW)
+            except Exception as e:  # noqa: BLE001
+                log.info("git %s 改写失败: %s", key, e)
+                continue
+            changed.append(f"{key} {cur} → {want}")
+        if changed:
+            log.info("git 代理已对齐：%s", "；".join(changed))
+        self._set(git_proxy=want, git_proxy_note="；".join(changed))
+        return "；".join(changed)
 
     def subscriptions(self) -> list[dict[str, Any]]:
         """订阅列表（老版本只有 sub_url，这里自动迁移成一条）。"""
@@ -779,7 +1015,7 @@ class App:
             self._set(error="订阅缓存不可用")
             return False
         sub = subscription.normalize(cached)
-        cfg = configgen.build(sub, self.settings)
+        cfg = configgen.build(sub, self.settings, self._delay_map())
         configgen.write(cfg)
         self._set(
             main_group=cfg["rules"][-1].split(",", 1)[1],
@@ -833,7 +1069,7 @@ class App:
 
             if write_config and changed and self.kernel.running():
                 sub = subscription.normalize(parsed)
-                cfg = configgen.build(sub, self.settings)
+                cfg = configgen.build(sub, self.settings, self._delay_map())
                 path = configgen.write(cfg)
                 self.api.reload(path)
                 self._apply_saved_selection()

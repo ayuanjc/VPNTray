@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "2.4.0"
+UI_VER = "2.5.0"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -213,6 +213,10 @@ def build_state(app) -> dict[str, Any]:
         "ai": app.ai_status(),
         # Steam / GitHub 场景组：组名、当前出口、成员数，前端直接渲染
         "scenes": app.scenes_status(),
+        # GitHub 特化：最近一次自检结果 + git 全局代理当前指向
+        "github": st.get("github") or {},
+        "git_proxy": str(st.get("git_proxy") or ""),
+        "git_proxy_note": str(st.get("git_proxy_note") or ""),
         "update": st.get("update") or {},
         "update_repo": s.get("update_repo", ""),
         "purity_count": sum(1 for n in nodes if n.get("purity") is not None),
@@ -428,6 +432,24 @@ class WebUI:
             ok, err = app.set_scene_enabled(str(b.get("key", "")).strip(), on)
             return {"ok": ok, "error": err}
 
+        def github_check(_body):
+            """GitHub 专项自检（网页 / API / raw / Release / 镜像 + git 实测）。"""
+            if getattr(app, "_github_busy", False):
+                return {"ok": False, "error": "自检正在进行，稍等"}
+            app._github_busy = True
+            try:
+                res = app.github_check(heal=bool(app.settings.get("github_heal", True)))
+            except Exception as e:  # noqa: BLE001
+                log.exception("GitHub 自检失败")
+                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            finally:
+                app._github_busy = False
+            return {"ok": True, "github": res}
+
+        def git_proxy_fix(_body):
+            note = app.sync_git_proxy()
+            return {"ok": True, "note": note, "value": str(app.state.get("git_proxy") or "")}
+
         def topo(_):
             return {"ok": True, "topo": app.topo()}
 
@@ -581,6 +603,8 @@ class WebUI:
             "/api/ai/toggle": ai_toggle,
             "/api/scene/node": scene_node,
             "/api/scene/toggle": scene_toggle,
+            "/api/github/check": github_check,
+            "/api/git/proxy": git_proxy_fix,
             "/api/ai/fingerprint": ai_fingerprint,
             "/api/ai/align": ai_align,
             "/api/ai/restore_tz": ai_restore_tz,

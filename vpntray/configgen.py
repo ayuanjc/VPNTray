@@ -129,18 +129,35 @@ SCENES: list[dict[str, Any]] = [
         "node_key": "github_node",
         "prefer_key": "github_prefer_regions",
         "prefer": ["香港", "日本", "新加坡", "台湾", "美国"],
+        # 自动子组：一个 select 组只能钉死一个出口，钉到的节点一挂，整个
+        # GitHub 就打不开（这台机器 100 个节点里 88 个是死的，机场中转段
+        # 大面积失效）。所以组里第一位放一个 fallback 子组，它拿 GitHub
+        # 自己的地址每 180s 探一次，探测超时 3s，第一个通的就是出口。
+        "auto": True,
+        "auto_title": "GitHub 自动",
+        "probe": "https://github.com/robots.txt",
         "domains": [
-            "github.com",             # 含 api / gist / codeload（git 传输）
-            "githubusercontent.com",  # raw / objects / avatars
+            "github.com",             # 含 api / gist / codeload / uploads / npm.pkg
+            "githubusercontent.com",  # raw / objects / media(LFS) / release-assets
             "githubassets.com",       # 页面静态资源
             "github.io",              # Pages
             "ghcr.io",                # 容器镜像
             "github.dev",             # 网页编辑器
             "githubcopilot.com",
             "github.blog",
+            "githubstatus.com",       # 状态页
+        ],
+        # Release 老式直链会 302 到 S3，那些域名不属于上面任何一个后缀，
+        # 掉到 MATCH 就按 Netlfix 的落地点绕地球一圈，下载速度掉到几十 KB/s。
+        "extra_rules": [
+            "DOMAIN-KEYWORD,github-production-release-asset",
+            "DOMAIN,github-cloud.s3.amazonaws.com",
         ],
     },
 ]
+
+
+AUTO_SUFFIX = " 自动"
 
 
 def scene_by_key(key: str) -> dict[str, Any] | None:
@@ -148,6 +165,11 @@ def scene_by_key(key: str) -> dict[str, Any] | None:
         if sc["key"] == key:
             return sc
     return None
+
+
+def auto_name(sc: dict[str, Any]) -> str:
+    """场景的自动子组名（"GitHub 自动"）。关掉自动的组没有这个名字。"""
+    return str(sc.get("auto_title") or f"{sc['title']}{AUTO_SUFFIX}")
 
 FAKE_IP_FILTER = [    "*.lan",
     "*.local",
@@ -233,7 +255,41 @@ def _scene_members(sc: dict[str, Any], node_names: list[str], settings) -> list[
     return ([pinned] if pinned and pinned in node_names else []) + rest
 
 
-def build(sub: dict[str, Any], settings) -> dict[str, Any]:
+def _scene_layout(sc: dict[str, Any], node_names: list[str], settings,
+                  delays: dict[str, Any] | None = None) -> tuple[list[str], list[str]]:
+    """返回 (select 组成员, 自动子组成员；不需要自动组时为空)。
+
+    自动子组只装「上次测速真拿到响应」的节点，并按延迟从小到大排：
+    fallback 组的语义就是「按顺序找第一个健康的」，所以顺序 = 优先级，
+    排前面的先被用到。没有测速数据（新装、刚换订阅）时退回全部节点，
+    由组自己的健康检查去筛 —— 这样不会因为「还没测过」就把组建成空的。
+    """
+    members = _scene_members(sc, node_names, settings)
+    if not members or not sc.get("auto") or not bool(settings.get("scene_auto", True)):
+        return members, []
+    d = delays or {}
+
+    def ms(n: str) -> float:
+        try:
+            v = float(d.get(n) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return v if v > 0 else 0.0
+
+    fresh = [(ms(n), n) for n in members if ms(n) > 0]
+    if len(fresh) >= 2:
+        return members, [n for _, n in sorted(fresh)]
+    if len(fresh) == 1:
+        # 只有一个测通过：让它排第一，但别把其他人剔掉 —— 那次测速本身可能
+        # 刚好撞上抖动，剔掉就再也没有被选中的机会了。
+        only = fresh[0][1]
+        return members, [only] + [n for n in members if n != only]
+    # 完全没测过（新装 / 刚换订阅）：全量交给组自己的健康检查去筛
+    return members, list(members)
+
+
+def build(sub: dict[str, Any], settings,
+          delays: dict[str, Any] | None = None) -> dict[str, Any]:
     """sub: subscription.normalize() 的结果。"""
     if not sub.get("proxy-groups"):
         raise ValueError("订阅里没有可用的策略组")
@@ -293,10 +349,32 @@ def build(sub: dict[str, Any], settings) -> dict[str, Any]:
     for sc in SCENES:
         if not bool(settings.get(sc["settings_key"], True)) or not node_names:
             continue
-        members = _scene_members(sc, node_names, settings)
+        members, auto = _scene_layout(sc, node_names, settings, delays)
         if not members:
             continue
-        scene_groups.append({"name": sc["title"], "type": "select", "proxies": members})
+        if auto and len(auto) >= 2:
+            aname = auto_name(sc)
+            scene_groups.append({
+                "name": aname,
+                "type": "fallback",
+                # 探测地址用场景自己的域名：拿 gstatic 探出来的「快」，在
+                # GitHub 上完全可能 502 / TLS 被掐，测了等于没测。
+                "url": sc.get("probe") or "https://www.gstatic.com/generate_204",
+                "interval": 180,
+                "timeout": 3000,     # 3s 还没握手完的节点在 GitHub 上就是不可用
+                "lazy": False,
+                "proxies": auto,
+            })
+            pinned = str(settings.get(sc["node_key"]) or "")
+            if pinned and pinned in members:
+                # 用户明确钉了节点：钉的优先，自动组退到第二位（还能手动选回来）
+                head = [pinned, aname] + [m for m in members if m != pinned]
+            else:
+                # 没钉（或钉的是自动组本身）：默认走自动组，组内自己挑活的
+                head = [aname] + [m for m in members if m != aname]
+            scene_groups.append({"name": sc["title"], "type": "select", "proxies": head})
+        else:
+            scene_groups.append({"name": sc["title"], "type": "select", "proxies": members})
         scene_on.add(sc["title"])
     for i, g in enumerate(scene_groups):
         groups.insert((1 if ai_on else 0) + i, g)
@@ -317,6 +395,8 @@ def build(sub: dict[str, Any], settings) -> dict[str, Any]:
     for sc in SCENES:
         if sc["title"] in scene_on:
             out_rules += [f"DOMAIN-SUFFIX,{d},{sc['title']}" for d in sc["domains"]]
+            # 场景自带的非后缀规则（Release 的 S3 直链用 KEYWORD 才盖得住）
+            out_rules += [f"{pat},{sc['title']}" for pat in (sc.get("extra_rules") or [])]
     out_rules += [r for r in CN_EXTRA_RULES if r not in sub_rules]
     out_rules += sub_rules
     # 国内兜底：geosite:cn 域名直连（fake-ip 下比 GEOIP 更可靠）

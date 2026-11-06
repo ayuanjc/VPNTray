@@ -69,6 +69,11 @@ DEFAULTS: dict[str, Any] = {
     "github_enabled": True,
     "github_node": "",
     "github_prefer_regions": ["香港", "日本", "新加坡", "台湾", "美国"],
+    # GitHub 组里带一个 fallback 自动子组（只有 GitHub 场景有）：机场节点
+    # 大面积抖动时靠它自动跳过死节点，不用手工一个个试。
+    "scene_auto": True,
+    "github_heal": True,            # 自检失败时自动把出口切到能连上的节点
+    "git_proxy_sync": True,         # 启动时把 git 全局 http(s).proxy 对齐到混合端口
 
     # ——— 自动更新 ———
     "auto_update": True,            # 启动后静默查一次更新，有新版才提示

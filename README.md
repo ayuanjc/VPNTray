@@ -52,7 +52,7 @@ Windows 托盘工具：内嵌 [mihomo](https://github.com/MetaCubeX/mihomo) 内�
 2. **节点列表**：每行 `序号 · 国旗 · 节点名 · 纯净度 · 延迟`，当前节点高亮；
    上面一行是搜索框 + 地区 chip（点一下只看这个地区，再点「全部」取消）+ 排序下拉
    （按延迟 / 按纯净度 / 按名称）；列表自己滚动，不带走整页
-3. **场景加速**（Steam / GitHub 各一条专线）+ **AI 稳定**（出口 IP、时区对齐、启动器）+
+3. **场景加速**（Steam / GitHub 各一条专线，GitHub 自带「自动组」与五项链路自检）+ **AI 稳定**（出口 IP、时区对齐、启动器）+
    **订阅**（多条订阅、剩余流量、合并模式）
 4. **流量曲线**、**日志**（最近 200 行，可折叠）、**高级**（纯净度·当前 / 纯净度·全部 /
    带宽测速 / 重启内核 / 断开全部连接 / 扫描代理冲突 / 检查更新 / 退出程序）
@@ -955,6 +955,98 @@ INFO app: VPNTray 2.2.2 启动（frozen=True，Python 3.12.10）
 
 覆盖安装后 `data/` 保留。如果日志里出现「图标文件缺失（打包时漏了 assets）」，说明手上
 那份包不完整 —— 换回官方 zip（`VPNTray-<版本>-win64.zip`）即可。
+
+## 2.5.0：GitHub 不再靠运气（自动组 + 自检 + git 代理对齐）
+
+2.3.0 给 GitHub 建了专线，但它只解决「规则被别人抢走」。真正把 GitHub 弄死的是另外三件事，
+这一版逐个按死：
+
+| 现场症状 | 真实原因 | 2.5.0 的做法 |
+|---|---|---|
+| 网页能开、`git clone` 报 `unexpected eof while reading` | `GitHub 加速` 组钉在一个已经死掉的节点上，网页靠重试勉强打开，git 一次 TLS 就断 | 新增 `GitHub 自动` fallback 组（只装**测速通过**的节点），专线默认走它；钉住的节点测不通时自动退回自动组 |
+| 浏览器能开、Release 资产与 `ghcr.io` 打不开 | 规则只按域名后缀匹配，`github-production-release-asset-*.s3.amazonaws.com` 这类老直链走的是别的域名 | 补 `DOMAIN-KEYWORD,github-production-release-asset` + `DOMAIN,github-cloud.s3.amazonaws.com` |
+| 换过 Clash / 别的客户端之后 git 全挂 | `git config --global http.proxy` 还指着 `127.0.0.1:7897`（那个端口现在被 svchost / WSL 转发占着，连上立刻 EOF） | 启动时对齐 git 全局代理到当前混合端口；只改「指向本机」的值，指向公司网关的外部件一律不碰 |
+| 「到底哪一环坏了」说不清 | 只有一个总开关，没有分层诊断 | 面板新增「GitHub 自检」：网页 / API / raw / Release 资产 / 容器镜像五项 + 真跑一次 `git ls-remote` |
+
+### 1. `GitHub 自动`：只从活节点里挑
+
+`GitHub 加速` 变成两层：外层还是 Selector（能钉节点），第一位是新的 fallback 组
+`GitHub 自动`。
+
+```yaml
+- name: GitHub 自动
+  type: fallback
+  url: https://github.com/robots.txt
+  interval: 180          # 每 3 分钟自己复查一次
+  timeout: 3000
+  lazy: false
+  proxies: [ 🇯🇵|日本原生-中转 01, 🇹🇼|台湾-中转 01, ... ]   # 只放测速通过的，按延迟升序
+- name: GitHub 加速
+  type: select
+  proxies: [ GitHub 自动, 🇭🇰|香港-IEPL 01, ... ]
+```
+
+- 成员来自上次测速结果（`data/delays.json`），**没测通的节点不进自动组** —— 这就是
+  「100 个节点只有 12 个活」时 GitHub 还能用的原因。
+- 一个活节点都没有时退回旧行为（全量成员），不至于因为「没测速数据」把专线弄没。
+- 启动时如果发现 `github_node` 钉着的节点已经不在测速结果里，直接改钉自动组并存盘，
+  不再死抱着那个挂掉的香港-IEPL 01。
+- 关掉「自动组」（`scene_auto: false`）就回到单层 Selector，行为和 2.4.0 完全一样。
+
+### 2. 面板上的 GitHub 自检
+
+「场景加速」下面多了一行 GitHub 体检框：
+
+- 五个探针：`github.com`（网页）、`api.github.com`、`raw.githubusercontent.com`、
+  `objects.githubusercontent.com`（Release 资产）、`ghcr.io/v2/`（容器镜像）。
+  判定标准是「TLS + HTTP 全程通了就算通」，所以 ghcr 返回 401、资产返回 404 **都算正常**
+  —— 只有超时、连接被重置、SSL EOF、5xx 才算坏。
+- 一段 `git ls-remote --heads https://github.com/git/git` 的真实结果（拿到几个 ref、耗时多少）。
+  浏览器能开不等于 git 能拉，这两个必须分开看。
+- 点「GitHub 自检」：发现某项不通，就用 GitHub 自己的地址给自动组重测一遍，把出口拉回
+  健康节点，然后**再测一次**给你看结果。
+- 点「对齐 git 代理」：立刻执行一次代理对齐（平时启动时已经自动做过）。
+
+```json
+// POST /api/github/check   → { ok, github: { ok, bad: [], git: {ok,refs,ms}, node, note, items[] } }
+// POST /api/git/proxy      → { ok, note, value }
+```
+
+### 3. git 代理对齐的边界
+
+只改这两种值：`http://127.0.0.1:<port>`、`http://localhost:<port>`、`http://[::1]:<port>`
+（含不带 scheme 的写法）。`socks5://...`、公司网关、PAC 一律不动，只在日志里写一句
+「指向外部代理，不自动改」。改写成功时面板会显示 `http.proxy http://127.0.0.1:7897 → 7891`。
+
+### 4. 配置项
+
+```json
+{
+  "github_enabled": true,
+  "scene_auto": true,        // 建「GitHub 自动」fallback 组（默认开）
+  "github_heal": true,       // 自检发现不通时自动换节点（默认开）
+  "git_proxy_sync": true     // 启动时对齐 git 全局代理（默认开）
+}
+```
+
+### 5. 实测（本机，2026-11-06）
+
+同一条订阅、同一时刻，对着出问题的 2.2.x 实例和 2.5.0 的配置各测一遍：
+
+| 项 | 2.2.x（组钉死在死节点） | 2.5.0（自动组） |
+|---|---|---|
+| `github.com` | 200 / 2510ms | 200 / 1307ms |
+| `api.github.com` | 200 / 1542ms | 200 / 1330ms |
+| `raw.githubusercontent.com` | 200 / 4892ms | 200 / 1048ms |
+| `objects.githubusercontent.com` | **SSL EOF** | 404（通） |
+| `ghcr.io/v2/` | **SSL EOF** | 401（通） |
+| `git ls-remote` | **失败** `TLS connect error: unexpected eof` | 8 refs / 2041ms |
+
+另外把 `GitHub 加速` 人为钉到 `🇭🇰|香港-IEPL 01`（已死），点一次自检：
+五项全断 → 组内重测选中 `🇯🇵|日本原生-直连`（141ms）→ 复测五项全绿、`git ls-remote` 8 refs。
+
+> 机场本身的问题这一版治不了：那天 100 个节点只有 12 个活。自动组能保证「活着的那个在
+> 干活」，但活节点数为 0 时它也只能告诉你「机场中转段整片失效」。
 
 ## 2.4.0：控制台重写（地图没了）
 

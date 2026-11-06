@@ -156,6 +156,10 @@ select.sel option{background:#15181b;color:#e9ecee}
 .srow .t em{font-style:normal;font-weight:400;color:var(--fg3);font-size:11.5px;display:block;margin-top:2px}
 .srow .sel{width:100%}
 .srow.off .t,.srow.off .sel{opacity:.5}
+.ghrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:10px}
+.ghpill{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line2);color:var(--fg3);white-space:nowrap}
+.ghpill.ok{color:var(--acc);border-color:rgba(94,234,212,.35);background:var(--acc-d)}
+.ghpill.bad{color:#fca5a5;border-color:rgba(248,113,113,.35)}
 .aibody{display:grid;gap:10px}
 .ailine{display:flex;align-items:center;gap:8px;font-size:12.5px}
 .ailine .k{color:var(--fg3);font-size:11.5px;min-width:52px}
@@ -422,7 +426,7 @@ details.fold > summary h2 .hint{margin-left:0;margin-right:2px}
 
 <script>
 
-const UI_VER = '2.4.0';
+const UI_VER = '2.5.0';
 
 /* ───────── 基础工具 ───────── */
 const $ = (s, r) => (r || document).querySelector(s);
@@ -699,18 +703,48 @@ function renderScenes() {
   const list = S.scenes || [];
   const h = list.map(sc => {
     const off = !sc.enabled;
+    const auto = !!(sc.auto && sc.auto_name && sc.node === sc.auto_name);
+    const exit = sc.exit || sc.node;
     const meta = [];
-    if (sc.node) meta.push('出口 ' + esc(sc.node));
+    if (auto) meta.push('自动（' + n(sc.auto_members || 0) + ' 个活节点里挑最快的）');
+    if (exit) meta.push('出口 ' + esc(exit));
     if (sc.delay) meta.push(Math.round(sc.delay) + ' ms');
     meta.push(n(sc.domains) + ' 个域名');
-    meta.push(sc.main && sc.node === sc.main ? '与主代理同一节点' : (sc.members ? n(sc.members) + ' 个候选' : '等待内核'));
+    meta.push(sc.main && exit === sc.main ? '与主代理同一节点' : (sc.members ? n(sc.members) + ' 个候选' : '等待内核'));
     return '<div class="srow' + (off ? ' off' : '') + '">'
       + '<div class="t">' + esc(sc.title) + '<em>' + esc(sc.desc || '') + ' · ' + meta.join(' · ') + '</em></div>'
       + '<select class="sel" data-scene="' + esc(sc.key) + '"' + (off ? ' disabled' : '') + '>' + nodeOptions(sc.node) + '</select>'
       + '<label class="sw"><input type="checkbox" data-scene-on="' + esc(sc.key) + '"' + (sc.enabled ? ' checked' : '') + '><i></i></label>'
       + '</div>';
   }).join('') || '<div class="dim">没有可用的场景配置</div>';
-  patch('#scenes', h, '#scenes select');
+  patch('#scenes', h + renderGithubBox(), '#scenes select');
+}
+
+/* GitHub 特化：自检结果 + git 代理 + 一键自检 */
+function renderGithubBox() {
+  const g = S.github || {};
+  const bits = [];
+  if (g.ts) {
+    const when = new Date(g.ts * 1000);
+    const hh = String(when.getHours()).padStart(2, '0') + ':' + String(when.getMinutes()).padStart(2, '0');
+    bits.push('<div class="ghrow"><span class="ghpill ' + (g.ok ? 'ok' : 'bad') + '">'
+      + (g.ok ? 'GitHub 全通' : '有链路不通') + ' · ' + hh + '</span>'
+      + (g.items || []).map(i => '<span class="ghpill ' + (i.ok ? 'ok' : 'bad') + '" title="' + esc(i.error || i.url) + '">'
+        + esc(i.label) + (i.ok ? ' ' + n(i.ms) + 'ms' : ' 失败') + '</span>').join('')
+      + (g.git ? '<span class="ghpill ' + (g.git.ok ? 'ok' : 'bad') + '" title="' + esc(g.git.error || '') + '">git '
+        + (g.git.ok ? g.git.refs + ' refs' : '拉不动') + '</span>' : '')
+      + '</div>');
+    if (g.note) bits.push('<div class="ainote warn">' + esc(g.note) + '</div>');
+  }
+  const gp = S.git_proxy || '';
+  const gnote = S.git_proxy_note || '';
+  bits.push('<div class="ghrow">'
+    + '<button class="btn" data-gh-check>GitHub 自检</button>'
+    + '<button class="btn" data-git-proxy title="把 git 的全局 http(s).proxy 指到当前混合端口">对齐 git 代理</button>'
+    + '<span class="ghpill">git 代理 ' + esc(gp || '未设置 / 不用代理') + '</span>'
+    + '</div>');
+  if (gnote) bits.push('<div class="ainote">启动时已修正：' + esc(gnote) + '</div>');
+  return bits.join('');
 }
 
 /* ───────── 渲染：AI ───────── */
@@ -888,6 +922,32 @@ document.addEventListener('click', async (e) => {
     const r = await run('/api/sub_url', { action: 'remove', index: n(del.dataset.subDel) }, '已删除');
     if (r && r.ok === false) toast(r.error || '失败', 'bad');
     setTimeout(refresh, 500);
+    return;
+  }
+
+  if (t.closest('[data-gh-check]')) {
+    const b = t.closest('[data-gh-check]');
+    b.disabled = true;
+    toast('正在自检 GitHub（网页 / API / raw / Release 资产 / 镜像 + git）…');
+    const r = await api('/api/github/check', {});
+    b.disabled = false;
+    if (r.ok === false) toast(r.error || '自检失败', 'bad');
+    else {
+      const g = r.github || {};
+      const bad = (g.items || []).filter(i => !i.ok).length;
+      const gitBad = g.git && !g.git.ok;
+      toast(bad ? ('GitHub 有 ' + bad + ' 项不通' + (g.note ? '：' + g.note : ''))
+                : (gitBad ? '网页全通，但 git 拉不动' : 'GitHub 全通，git 可用'),
+            (bad || gitBad) ? 'bad' : 'good');
+    }
+    setTimeout(refresh, 400);
+    return;
+  }
+  if (t.closest('[data-git-proxy]')) {
+    toast('正在对齐 git 代理…');
+    const r = await api('/api/git/proxy', {});
+    toast(r.note ? ('已修正：' + r.note) : ('git 代理已是 ' + (r.value || '当前端口')), 'good');
+    setTimeout(refresh, 300);
     return;
   }
 
