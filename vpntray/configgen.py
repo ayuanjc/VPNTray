@@ -26,6 +26,10 @@ LAN_RULES = [
     "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
     "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
     "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+    # 校园网用的是 172.32/16（Dr.COM 认证门户 172.32.253.17）和 172.50/16（客户端网段），
+    # 都不在 RFC1918 内；不显式直连的话，靠 GEOIP,CN 兜底，随时可能被发到境外节点。
+    "IP-CIDR,172.32.0.0/16,DIRECT,no-resolve",
+    "IP-CIDR,172.50.0.0/16,DIRECT,no-resolve",
     "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
     "IP-CIDR,169.254.0.0/16,DIRECT,no-resolve",
     "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
