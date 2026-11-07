@@ -62,6 +62,33 @@ def disable() -> None:
         log.warning("取消自启失败: %s", e)
 
 
+def refresh() -> bool:
+    """自启项里写的还是别的目录的 exe 时，改写成本进程的。
+
+    升级最容易踩的坑：新版解压到新目录，注册表里还是旧目录那个 exe，
+    下次开机启动的仍然是旧版本 —— 用户看到的就是「我明明更新了，界面没变」。
+    只修正「已经是开」的情况，绝不替用户打开自启。
+    """
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as k:
+            cur, _ = winreg.QueryValueEx(k, VALUE_NAME)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    cmd, target = _command()
+    if str(cur).strip() == cmd or not target.exists():
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, VALUE_NAME, 0, winreg.REG_SZ, cmd)
+    except OSError as e:
+        log.warning("修正自启路径失败: %s", e)
+        return False
+    log.info("自启路径已更新: %s → %s", cur, cmd)
+    return True
+
+
 def toggle(on: bool) -> bool:
     if on:
         enable()

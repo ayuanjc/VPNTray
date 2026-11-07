@@ -109,30 +109,48 @@ def has_motw(p: Path) -> bool:
         return False
 
 
+# 清理 MOTW 时跳过的目录：日志、订阅缓存、内核数据、61MB 的 mihomo，跟窗口无关
+SKIP_DIRS = {"data", "logs", "bin", "build", "release", "__pycache__", ".git"}
+# 单文件超过这个大小也跳过：MOTW 只挡 .NET 加载程序集，几十 MB 的 exe/资源扫它没意义
+UNBLOCK_MAX_BYTES = 8 * 1024 * 1024
+
+
 def unblock_tree(root: Path | None = None, limit: int = 4000) -> int:
     """清掉程序目录里所有文件的「来自 Internet」标记。返回清掉的数量。
 
     不用 subprocess 调 PowerShell（那要起一个进程、还可能被策略拦），
     直接删那个备用数据流：path:Zone.Identifier 在 Win32 层就是一个可删的文件名。
+
+    2.5.2 起剪枝：跳过 data/、bin/、build/、release/ 与 >8MB 的文件。
+    以前每次启动都 rglob 整个 onedir（200+ 文件），data/logs 里还有几十 MB 的
+    kernel.log，白扫一遍只是让启动慢半拍。
     """
     root = root or _app_root()
     removed = 0
     scanned = 0
     try:
-        for p in root.rglob("*"):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
+            for name in filenames:
+                if scanned >= limit:
+                    break
+                p = Path(dirpath) / name
+                try:
+                    if p.stat().st_size > UNBLOCK_MAX_BYTES:
+                        continue
+                except OSError:
+                    continue
+                scanned += 1
+                if not has_motw(p):
+                    continue
+                try:
+                    os.remove(_zone_stream_path(p))
+                    removed += 1
+                except OSError:
+                    pass
             if scanned >= limit:
                 log.warning("扫描 %d 个文件后停止清理 MOTW（目录过大）", limit)
                 break
-            if not p.is_file():
-                continue
-            scanned += 1
-            if not has_motw(p):
-                continue
-            try:
-                os.remove(_zone_stream_path(p))
-                removed += 1
-            except OSError:
-                pass
     except Exception as e:  # noqa: BLE001
         log.warning("清理 MOTW 时出错（已清理 %d 个）: %s", removed, e)
     if removed:

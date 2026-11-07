@@ -179,6 +179,13 @@ class App:
         log.info("VPNTray %s 启动（frozen=%s，Python %s）",
                  _version(), bool(getattr(sys, "frozen", False)),
                  ".".join(str(x) for x in sys.version_info[:3]))
+        # 新版解压到新目录后，注册表里的自启项还指着旧目录的 exe：
+        # 不修正的话，下次开机跑的还是旧版本（"我明明更新了却没用"）。
+        if self.settings.get("autostart", True):
+            try:
+                autostart.refresh()
+            except Exception:  # noqa: BLE001
+                log.warning("自启路径检查失败", exc_info=True)
         self._set(phase="准备配置", busy="启动中")
         ok = self.prepare_config(initial=True)
         if not ok:
