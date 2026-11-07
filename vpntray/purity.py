@@ -206,6 +206,80 @@ def fetch_exit_info(port: int, timeout: float = 9.0) -> dict[str, Any] | None:
 
 
 # ────────────────────────── 评分 ──────────────────────────
+# ──────────────── 评分权重 / 分档（想改行为只动这一块） ────────────────
+# 每个布尔标记命中一次的扣分。元组顺序 = 标签在面板上的出现顺序，
+# 以前这些数字散在 if 链里，改一个数就是改产品行为，却看不出它标定的是什么。
+_TAG_PENALTY: tuple[tuple[str, str, int], ...] = (
+    ("is_tor", "Tor出口", 45),
+    ("is_abuser", "被滥用", 40),
+    ("is_proxy", "代理标记", 28),
+    ("is_vpn", "VPN标记", 22),
+    ("is_crawler", "爬虫库", 15),
+    ("is_bogon", "保留地址", 30),
+)
+_HOSTING_PENALTY = 30   # 机房 / 数据中心出口
+_MISMATCH_PENALTY = 18  # 落地国家 ≠ 节点名标称国家
+_MAX_TAGS = 5           # 面板标签栏只放 5 个
+_DC_LABEL_MAX = 18      # 机房名超过这个长度截断（仅 trust 分支）
+# 分档阈值。45 这一档与 One-IP 官方分档（>=75 good / 45-74 moderate）同源。
+_GRADE_ROWS: tuple[tuple[int, str, str], ...] = (
+    (85, "极洁净", "ok"),
+    (75, "良好", "good"),
+    (45, "一般", "mid"),
+)
+
+
+def _dc_tag(dc: str, short: bool) -> str:
+    """机房标签。trust 分支截断到 18 字，扣分分支保留全名——两处历史行为不同，别统一。"""
+    if short and len(dc) > _DC_LABEL_MAX:
+        dc = dc[:_DC_LABEL_MAX] + "…"
+    return f"机房{('/' + dc) if dc else ''}"
+
+
+def _score_from_trust(trust: int, info: dict[str, Any], is_hosting: bool,
+                      dc: str, comp: dict[str, Any]) -> tuple[int, list[str]]:
+    """有 One-IP trust_score：直接用它的分，这里只补标签。"""
+    tags: list[str] = []
+    for key, tag, _penalty in _TAG_PENALTY:
+        if info.get(key):
+            tags.append(tag)
+    if is_hosting:
+        tags.append(_dc_tag(dc, short=True))
+    elif (info.get("is_residential") or info.get("is_mobile")
+          or str(comp.get("type", "")).lower() == "isp"):
+        tags.append("住宅/ISP")
+    elif comp.get("type"):
+        tags.append(str(comp["type"]))
+    return trust, tags
+
+
+def _score_from_tags(info: dict[str, Any], is_hosting: bool,
+                     dc: str, comp: dict[str, Any]) -> tuple[int, list[str]]:
+    """没有 trust_score：从 100 分往下扣。"""
+    s = 100
+    tags: list[str] = []
+    for key, tag, penalty in _TAG_PENALTY:
+        if info.get(key):
+            s -= penalty
+            tags.append(tag)
+    if is_hosting:
+        s -= _HOSTING_PENALTY
+        tags.append(_dc_tag(dc, short=False))
+    elif str(comp.get("type", "")).lower() == "isp" or info.get("is_mobile"):
+        tags.append("住宅/ISP")
+    elif comp.get("type"):
+        tags.append(str(comp["type"]))
+    return s, tags
+
+
+def _grade(s: int) -> tuple[str, str]:
+    """分数 → (档位名, 颜色键)。低于最后一档就是「较差」。"""
+    for floor, grade, color in _GRADE_ROWS:
+        if s >= floor:
+            return grade, color
+    return "较差", "bad"
+
+
 def score(info: dict[str, Any], node_name: str) -> dict[str, Any]:
     """0–100 的纯净度分，越高越干净。
 
@@ -215,6 +289,7 @@ def score(info: dict[str, Any], node_name: str) -> dict[str, Any]:
         更接近各家平台的实际判定。本地只补一条它看不到的：节点名标称的
         国家和实际落地区是否对得上。
       · 没有 → 退回按标记扣分的老算法（ipapi.is / ip-api 兜底时走这条）。
+    两条算路的标签顺序都在 _TAG_PENALTY 里定义。
     """
     if not isinstance(info, dict):
         info = {}
@@ -239,53 +314,14 @@ def score(info: dict[str, Any], node_name: str) -> dict[str, Any]:
     _t = info.get("trust_score")
     trust = int(round(float(_t))) if isinstance(_t, (int, float)) and 0 <= float(_t) <= 100 else None
 
-    tags: list[str] = []
     if trust is not None:
-        s = trust
-        for key, tag in (
-            ("is_tor", "Tor出口"),
-            ("is_abuser", "被滥用"),
-            ("is_proxy", "代理标记"),
-            ("is_vpn", "VPN标记"),
-            ("is_crawler", "爬虫库"),
-            ("is_bogon", "保留地址"),
-        ):
-            if info.get(key):
-                tags.append(tag)
-        if is_hosting:
-            # 机房名可能是一整串公司名（"ALLIANCE INTELLIGENT TECHNOLOGIES PTE. LTD."），
-            # 标签栏两三个字就够认了，长的直接截断
-            dc_short = (dc[:18] + "…") if len(dc) > 18 else dc
-            tags.append(f"机房{('/' + dc_short) if dc_short else ''}")
-        elif info.get("is_residential") or info.get("is_mobile") or str(comp.get("type", "")).lower() == "isp":
-            tags.append("住宅/ISP")
-        elif comp.get("type"):
-            tags.append(str(comp["type"]))
+        s, tags = _score_from_trust(trust, info, is_hosting, dc, comp)
     else:
-        s = 100
-        if info.get("is_tor"):
-            s -= 45; tags.append("Tor出口")
-        if info.get("is_abuser"):
-            s -= 40; tags.append("被滥用")
-        if info.get("is_proxy"):
-            s -= 28; tags.append("代理标记")
-        if info.get("is_vpn"):
-            s -= 22; tags.append("VPN标记")
-        if info.get("is_crawler"):
-            s -= 15; tags.append("爬虫库")
-        if info.get("is_bogon"):
-            s -= 30; tags.append("保留地址")
-        if is_hosting:
-            s -= 30
-            tags.append(f"机房{('/' + dc) if dc else ''}")
-        elif str(comp.get("type", "")).lower() == "isp" or info.get("is_mobile"):
-            tags.append("住宅/ISP")
-        elif comp.get("type"):
-            tags.append(str(comp["type"]))
+        s, tags = _score_from_tags(info, is_hosting, dc, comp)
 
     mismatch = bool(expect and cc and expect != cc)
     if mismatch:
-        s -= 18
+        s -= _MISMATCH_PENALTY
         tags.append(f"落地≠标称({cc})")
 
     # One-IP 的附加信号：Reddit 封不封这个段，以及它自己的 AI 判读
@@ -298,20 +334,13 @@ def score(info: dict[str, Any], node_name: str) -> dict[str, Any]:
             tags.append(f"AI:{lb[:10]}")
 
     s = max(0, min(100, int(s)))
-    if s >= 85:
-        grade, color = "极洁净", "ok"
-    elif s >= 75:
-        grade, color = "良好", "good"
-    elif s >= 45:
-        grade, color = "一般", "mid"
-    else:
-        grade, color = "较差", "bad"
+    grade, color = _grade(s)
 
     return {
         "score": s,
         "grade": grade,
         "color": color,
-        "tags": tags[:5],
+        "tags": tags[:_MAX_TAGS],
         "ip": info.get("ip"),
         "cc": cc,
         "lat": _f(loc.get("latitude") if loc.get("latitude") is not None else loc.get("lat")),
@@ -325,6 +354,7 @@ def score(info: dict[str, Any], node_name: str) -> dict[str, Any]:
         "trust": trust,
         "ts": time.time(),
     }
+
 
 
 def _f(v: Any) -> float | None:

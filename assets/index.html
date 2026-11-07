@@ -426,7 +426,7 @@ details.fold > summary h2 .hint{margin-left:0;margin-right:2px}
 
 <script>
 
-const UI_VER = '2.5.2';
+const UI_VER = '2.5.3';
 
 /* ───────── 基础工具 ───────── */
 const $ = (s, r) => (r || document).querySelector(s);
@@ -928,18 +928,29 @@ document.addEventListener('click', async (e) => {
   if (t.closest('[data-gh-check]')) {
     const b = t.closest('[data-gh-check]');
     b.disabled = true;
-    toast('正在自检 GitHub（网页 / API / raw / Release 资产 / 镜像 + git）…');
+    toast('正在自检 GitHub（网页 / API / raw / Release 资产 / 镜像 + git），约 30 秒…');
+    // 自检在后台线程跑：接口只回 queued，结果靠轮询 gh_busy 收尾
     const r = await api('/api/github/check', {});
-    b.disabled = false;
-    if (r.ok === false) toast(r.error || '自检失败', 'bad');
-    else {
-      const g = r.github || {};
-      const bad = (g.items || []).filter(i => !i.ok).length;
-      const gitBad = g.git && !g.git.ok;
-      toast(bad ? ('GitHub 有 ' + bad + ' 项不通' + (g.note ? '：' + g.note : ''))
-                : (gitBad ? '网页全通，但 git 拉不动' : 'GitHub 全通，git 可用'),
-            (bad || gitBad) ? 'bad' : 'good');
+    if (r.ok === false) {
+      b.disabled = false;
+      toast(r.error || '自检失败', 'bad');
+      return;
     }
+    let g = {};
+    const t0 = Date.now();
+    while (Date.now() - t0 < 120000) {
+      await new Promise(done => setTimeout(done, 1200));
+      const st = await api('/api/state');
+      if (!st || st.ok === false) break;
+      if (!st.gh_busy) { g = st.github || {}; break; }
+    }
+    b.disabled = false;
+    if (!g.ts) { toast('自检没有结果，看一下日志', 'bad'); setTimeout(refresh, 400); return; }
+    const bad = (g.items || []).filter(i => !i.ok).length;
+    const gitBad = g.git && !g.git.ok;
+    toast(bad ? ('GitHub 有 ' + bad + ' 项不通' + (g.note ? '：' + g.note : ''))
+              : (gitBad ? '网页全通，但 git 拉不动' : 'GitHub 全通，git 可用'),
+          (bad || gitBad) ? 'bad' : 'good');
     setTimeout(refresh, 400);
     return;
   }

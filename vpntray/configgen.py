@@ -292,24 +292,30 @@ def _scene_layout(sc: dict[str, Any], node_names: list[str], settings,
     return members, list(members)
 
 
-def build(sub: dict[str, Any], settings,
-          delays: dict[str, Any] | None = None) -> dict[str, Any]:
-    """sub: subscription.normalize() 的结果。"""
-    if not sub.get("proxy-groups"):
-        raise ValueError("订阅里没有可用的策略组")
+def _main_group(sub: dict[str, Any], settings) -> str:
+    """主策略组。settings 里记的那个不在订阅里，就退回第一个 select 并写回 settings。"""
     main_group = settings.get("main_group") or "节点选择"
-    group_names = {g["name"] for g in sub["proxy-groups"]}
-    if main_group not in group_names:
-        selects = [g["name"] for g in sub["proxy-groups"] if g.get("type") == "select"]
-        main_group = selects[0] if selects else sub["proxy-groups"][0]["name"]
-        settings["main_group"] = main_group
-        log.warning("主策略组回退为 %s", main_group)
+    if main_group in {g["name"] for g in sub["proxy-groups"]}:
+        return main_group
+    selects = [g["name"] for g in sub["proxy-groups"] if g.get("type") == "select"]
+    main_group = selects[0] if selects else sub["proxy-groups"][0]["name"]
+    settings["main_group"] = main_group
+    log.warning("主策略组回退为 %s", main_group)
+    return main_group
 
-    # —— 自动测速组的健康检查改成 HTTPS ——
-    # 机场默认常用 http://cp.cloudflare.com，很多节点会偶发 HEAD 失败被误判，
-    # 表现为「自动选择」一会儿通一会儿不通。
-    probe_url = settings.get("delay_url") or "https://www.gstatic.com/generate_204"
-    probe_url = probe_url.replace("http://www.gstatic.com", "https://www.gstatic.com")
+
+def _probe_url(settings) -> str:
+    """自动测速组的健康检查地址。
+
+    机场默认常用 http://cp.cloudflare.com，很多节点会偶发 HEAD 失败被误判，
+    表现为「自动选择」一会儿通一会儿不通。
+    """
+    url = settings.get("delay_url") or "https://www.gstatic.com/generate_204"
+    return url.replace("http://www.gstatic.com", "https://www.gstatic.com")
+
+
+def _subscription_groups(sub: dict[str, Any], probe_url: str) -> list[dict[str, Any]]:
+    """订阅自带的组；自动测速类统一改成 HTTPS 探测。"""
     groups: list[dict[str, Any]] = []
     for g in sub["proxy-groups"]:
         g = dict(g)
@@ -319,35 +325,37 @@ def build(sub: dict[str, Any], settings,
             g["tolerance"] = 50
             g["lazy"] = False
         groups.append(g)
+    return groups
 
-    # —— AI 专用组（放在最前面，方便 UI 里找到）——
-    # 注意：建组与插规则必须用同一个条件。曾经节点全被剔成空列表时组没建、
-    # 规则却还在引用它，mihomo 直接报 group not found，内核起不来。
-    node_names = [p["name"] for p in sub["proxies"]]
-    ai_on = bool(settings.get("ai_enabled", True)) and bool(node_names)
-    if ai_on:
-        from . import hotspot as _hots
-        ai_node = str(settings.get("ai_node") or "")
-        # 只把「不会被 OpenAI 拒绝」的地区放进 AI 组。
-        # 香港节点延迟再低也过不去：api.openai.com 在握手阶段就被 RST，
-        # 表现出来是 SSL EOF，而 google / github 全通 —— 所以必须按地区剔。
-        pool = [n for n in node_names if not _hots.is_blocked_region(n, settings)]
-        if len(pool) < 2:            # 剔空了就别剔，否则组是空的、规则还引用它
-            pool = list(node_names)
-        # 组内顺序 = 界面里从上到下的顺序。按偏好地区排，让「能用的」
-        # 全堆在最上面，手动切的时候不用在 100 个节点里翻。
-        pool.sort(key=lambda x: _hots.region_rank(x, settings))
-        members = ([ai_node] if ai_node in pool else []) + \
-                  [x for x in pool if x != ai_node]
-        groups.insert(0, {
-            "name": AI_GROUP,
-            "type": "select",
-            "proxies": members,
-        })
 
-    # —— 场景加速组（Steam / GitHub）——
-    # 和 AI 组一样有「建了组却没插规则 / 插了规则却没建组」的坑：
-    # mihomo 遇到引用不存在的组会直接起不来，所以两边用同一个 scene_on 判断。
+def _ai_group(node_names: list[str], settings) -> dict[str, Any] | None:
+    """AI 专用组（插在组列表最前面，方便 UI 里找到）。没开 / 没节点就返回 None。
+
+    只把「不会被 OpenAI 拒绝」的地区放进 AI 组。香港节点延迟再低也过不去：
+    api.openai.com 在握手阶段就被 RST，表现出来是 SSL EOF，而 google / github
+    全通 —— 所以必须按地区剔。
+    """
+    if not bool(settings.get("ai_enabled", True)) or not node_names:
+        return None
+    from . import hotspot as _hots
+
+    ai_node = str(settings.get("ai_node") or "")
+    pool = [n for n in node_names if not _hots.is_blocked_region(n, settings)]
+    if len(pool) < 2:            # 剔空了就别剔，否则组是空的、规则还引用它
+        pool = list(node_names)
+    # 组内顺序 = 界面里从上到下的顺序。按偏好地区排，让「能用的」全堆在最上面，
+    # 手动切的时候不用在 100 个节点里翻。
+    pool.sort(key=lambda x: _hots.region_rank(x, settings))
+    members = ([ai_node] if ai_node in pool else []) + [x for x in pool if x != ai_node]
+    return {"name": AI_GROUP, "type": "select", "proxies": members}
+
+
+def _scene_groups(node_names: list[str], settings, delays) -> tuple[list[dict[str, Any]], set[str]]:
+    """Steam / GitHub 场景组，外加「哪几个场景真的建了组」。
+
+    返回的 set 必须同时喂给规则拼装：mihomo 遇到引用不存在的组会直接起不来，
+    所以「建组」和「插规则」只能用同一个判断。
+    """
     scene_on: set[str] = set()
     scene_groups: list[dict[str, Any]] = []
     for sc in SCENES:
@@ -380,14 +388,12 @@ def build(sub: dict[str, Any], settings,
         else:
             scene_groups.append({"name": sc["title"], "type": "select", "proxies": members})
         scene_on.add(sc["title"])
-    for i, g in enumerate(scene_groups):
-        groups.insert((1 if ai_on else 0) + i, g)
-    if scene_on:
-        log.info("场景加速：%s", "、".join(sorted(scene_on)))
+    return scene_groups, scene_on
 
-    sub = {**sub, "proxy-groups": groups}
 
-    # —— 规则拼装 ——
+def _rules(sub: dict[str, Any], main_group: str, ai_on: bool,
+           scene_on: set[str]) -> list[str]:
+    """规则拼装：本地规则 → AI → 场景 → 国内补充 → 订阅规则 → GEOSITE/GEOIP → MATCH。"""
     sub_rules = [r for r in sub["rules"] if not r.upper().startswith("MATCH")]
     out_rules: list[str] = []
     out_rules += LAN_RULES
@@ -413,12 +419,18 @@ def build(sub: dict[str, Any], settings,
     if not any(r.upper().startswith("GEOIP,CN") for r in out_rules):
         out_rules.append("GEOIP,CN,DIRECT")
     out_rules.append(f"MATCH,{main_group}")
+    return out_rules
 
-    # —— DNS ——
+
+_DNS_KEYS = ("default-nameserver", "nameserver", "proxy-server-nameserver", "enhanced-mode",
+             "fake-ip-range", "fake-ip-filter", "ipv6", "use-hosts")
+
+
+def _dns(sub: dict[str, Any]) -> dict[str, Any]:
+    """本地 DNS 基线 + 订阅覆盖。"""
     dns = dict(DEFAULT_DNS)
     sub_dns = sub.get("dns") or {}
-    for k in ("default-nameserver", "nameserver", "proxy-server-nameserver", "enhanced-mode",
-              "fake-ip-range", "fake-ip-filter", "ipv6", "use-hosts"):
+    for k in _DNS_KEYS:
         if sub_dns.get(k):
             dns[k] = sub_dns[k]
     if not dns.get("fake-ip-filter"):
@@ -426,9 +438,15 @@ def build(sub: dict[str, Any], settings,
     # 境外 DoH 在国内网络上会先卡超时，统一交给国内 DNS + fake-ip
     if dns.pop("nameserver-policy", None):
         log.info("已移除订阅中的 nameserver-policy（避免境外 DoH 卡顿）")
+    return dns
 
+
+def _assemble(sub: dict[str, Any], settings, dns: dict[str, Any],
+              groups: list[dict[str, Any]], rules: list[str]) -> dict[str, Any]:
+    """把各部分拼成最终配置：端口 / 档位参数 / 面板 / geodata 兜底。"""
     # —— 链路档位（hotspot.py）：手机热点下换保守参数 ——
     from . import hotspot as _hs
+
     prof = _hs.profile(settings)
     if prof["tier"] == "hotspot":
         log.info("检测到手机热点，使用保守档：tcp-concurrent=%s find-process=%s",
@@ -464,8 +482,8 @@ def build(sub: dict[str, Any], settings,
             "dns-hijack": ["any:53"],
         },
         "proxies": sub["proxies"],
-        "proxy-groups": sub["proxy-groups"],
-        "rules": out_rules,
+        "proxy-groups": groups,
+        "rules": rules,
     }
 
     # 本地 Web 控制面板（若已放置 metacubexd / yacd）
@@ -482,13 +500,35 @@ def build(sub: dict[str, Any], settings,
     return cfg
 
 
-def _port(settings, key: str, default: int) -> int:
-    """端口必须是 1024..65535 的整数，脏值回落默认值。"""
-    try:
-        v = int(settings.get(key, default))
-    except (TypeError, ValueError):
-        return default
-    return v if 1024 <= v <= 65535 else default
+def build(sub: dict[str, Any], settings,
+          delays: dict[str, Any] | None = None) -> dict[str, Any]:
+    """sub: subscription.normalize() 的结果。
+
+    只负责串流程，具体职责在下面几个私有函数里：
+    主组回退 / 探测地址 / 订阅组 / AI 组 / 场景组 / 规则 / DNS / 最终拼装。
+    """
+    if not sub.get("proxy-groups"):
+        raise ValueError("订阅里没有可用的策略组")
+    main_group = _main_group(sub, settings)
+    node_names = [p["name"] for p in sub["proxies"]]
+
+    groups = _subscription_groups(sub, _probe_url(settings))
+    ai = _ai_group(node_names, settings)
+    if ai:
+        groups.insert(0, ai)
+    # AI 组占了第 0 位，场景组从 1 开始插，顺序即面板顺序
+    scene_groups, scene_on = _scene_groups(node_names, settings, delays)
+    for i, g in enumerate(scene_groups):
+        groups.insert((1 if ai else 0) + i, g)
+    if scene_on:
+        log.info("场景加速：%s", "、".join(sorted(scene_on)))
+
+    rules = _rules(sub, main_group, ai is not None, scene_on)
+    return _assemble({**sub, "proxy-groups": groups}, settings, _dns(sub), groups, rules)
+
+
+
+from .settings import port_setting as _port  # 端口收敛的唯一实现
 
 
 def write(cfg: dict[str, Any]) -> str:

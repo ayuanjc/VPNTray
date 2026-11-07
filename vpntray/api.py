@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 import requests
@@ -17,17 +18,29 @@ class MihomoAPI:
     def __init__(self, host: str = "127.0.0.1", port: int = 9091, secret: str = "") -> None:
         self.base = f"http://{host}:{port}"
         self.secret = secret
-        self.s = requests.Session()
-        self.s.trust_env = False
-        self.s.headers.update({"Content-Type": "application/json"})
+        # requests.Session 不是线程安全的，而这里是共用入口：面板线程、七个
+        # 后台循环、纯检/测速/自检线程全在调。共用一份会串连接池与 cookie 状态。
+        self._local = threading.local()
+        self.s = self._session()   # 构造线程那份；保留这个名字给外部脚本用
 
     # ——— 基础 ———
+    def _session(self) -> requests.Session:
+        """每个线程一份 Session（首次用到时创建）。"""
+        s = getattr(self._local, "session", None)
+        if s is None:
+            s = requests.Session()
+            s.trust_env = False   # 内核 API 在本机回环，绝不走系统代理
+            s.headers.update({"Content-Type": "application/json"})
+            self._local.session = s
+        return s
+
     def _req(self, method: str, path: str, timeout: float = 3.0, **kw) -> Any:
-        headers = dict(self.s.headers)
+        sess = self._session()
+        headers = dict(sess.headers)
         if self.secret:
             headers["Authorization"] = f"Bearer {self.secret}"
         try:
-            r = self.s.request(method, self.base + path, headers=headers, timeout=timeout, **kw)
+            r = sess.request(method, self.base + path, headers=headers, timeout=timeout, **kw)
         except requests.RequestException as e:
             raise ApiError(f"{method} {path} 连接失败: {e}") from e
         if r.status_code >= 400:

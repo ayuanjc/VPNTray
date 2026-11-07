@@ -24,6 +24,8 @@ DEFAULTS: dict[str, Any] = {
     "sub_active": 0,                # 当前用的订阅下标
     "sub_update_hours": 6,          # 定时更新间隔（小时）；0=关闭
     "sub_ua": "clash.meta/v1.19.32",
+    "sub_mode": "single",           # single = 只用当前订阅；merge = 多条订阅节点合并
+    "sub_hash": "",                 # 上次成功下载的订阅指纹，用来判断要不要重建配置
 
     # ——— 端口 ———
     "mixed_port": 7891,             # 本地 HTTP/SOCKS 混合端口
@@ -46,6 +48,7 @@ DEFAULTS: dict[str, Any] = {
     "auto_best": False,             # 定时把主组切到延迟最低节点
     "auto_best_interval_min": 30,
     "heal": True,                   # 节点失效时自动换到可用节点
+    "probe_on_select": True,        # 手动切节点后自动查一次出口 IP/纯净度
 
     # ——— 移动热点特化（本版内置）———
     "mobile_aware": True,           # 认得出手机热点就切保守档 mihomo 参数
@@ -83,7 +86,20 @@ DEFAULTS: dict[str, Any] = {
     # ——— 其它 ———
     "log_level": "warning",
     "notify": True,
+    "agreed_version": "",           # 用户点过「知道了」的版本号，只用于首次提示
 }
+
+
+def port_setting(settings, key: str, default: int) -> int:
+    """端口必须是 1024..65535 的整数，脏值回落默认值。
+
+    kernel / configgen 以前各抄了一份一模一样的实现，改端口规则要改两处。
+    """
+    try:
+        v = int(settings.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return v if 1024 <= v <= 65535 else default
 
 
 def _deep_merge(base: dict, over: dict) -> dict:

@@ -18,13 +18,9 @@ CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
-def _port(settings, key: str, default: int) -> int:
-    """端口必须是 1024..65535 的整数，脏值回落默认值。"""
-    try:
-        v = int(settings.get(key, default))
-    except (TypeError, ValueError):
-        return default
-    return v if 1024 <= v <= 65535 else default
+# 端口收敛只有一处实现（settings.port_setting），这里保留 _port 这个名字
+# 供既有调用点使用。
+from .settings import port_setting as _port
 
 
 def port_free(port: int, host: str = "127.0.0.1") -> bool:
@@ -81,8 +77,10 @@ def _kill_pid_from_hint(hint: str) -> None:
     if len(parts) < 2 or parts[0] != "PID" or not parts[1].isdigit():
         return
     name = parts[2].lower() if len(parts) > 2 else ""
-    if name and not name.startswith("mihomo"):
-        log.warning("端口被 %s 占用（PID %s），不是本程序的内核，不处理", name, parts[1])
+    if not name.startswith("mihomo"):
+        # 名字查不到（tasklist 失败 / 权限不足）时以前会盲杀，可能干掉用户自己的程序
+        log.warning("端口被 %s 占用（PID %s），不是本程序的内核，不处理",
+                    name or "未知进程", parts[1])
         return
     pid = parts[1]
     try:
@@ -108,6 +106,30 @@ def ensure_geo_assets() -> None:
         if not dst.exists() or dst.stat().st_size != src.stat().st_size:
             shutil.copyfile(src, dst)
             log.info("地理数据就位: %s", dst.name)
+
+
+KERNEL_LOG_MAX = 8 * 1024 * 1024   # kernel.log 超过这个大小就在启动前滚走
+
+
+def _rotate_kernel_log() -> None:
+    """mihomo 每条失败连接都写一行 warning，日志能长到几十 MB。
+
+    子进程持有写句柄，运行中不能改名，所以只在启动前滚一次；滚不动就继续写
+    原文件，绝不因为日志问题挡住内核启动。
+    """
+    try:
+        if not KERNEL_LOG.exists() or KERNEL_LOG.stat().st_size <= KERNEL_LOG_MAX:
+            return
+        old = KERNEL_LOG.with_name(KERNEL_LOG.name + ".1")
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            pass
+        KERNEL_LOG.replace(old)
+        log.info("kernel.log 超过 %d MB，已轮转为 %s",
+                 KERNEL_LOG_MAX // (1024 * 1024), old.name)
+    except OSError as e:
+        log.warning("kernel.log 轮转失败（继续写原文件）: %s", e)
 
 
 class Kernel:
@@ -138,40 +160,47 @@ class Kernel:
 
     # ——— 生命周期 ———
     def start(self, _from_watchdog: bool = False) -> bool:
+        # 锁只保护 self.proc 的读写：端口探测要跑两次 netstat（各 8s 超时），
+        # 就绪等待最长 20s —— 这些都在锁里做的话，退出/重启会被硬拖住。
         with self._lock:
             if self.proc and self.proc.poll() is None:
                 return True
-            if not MIHOMO.exists():
-                self.last_error = f"内核不存在: {MIHOMO}"
-                log.error(self.last_error)
-                return False
-            if not CONFIG.exists():
-                self.last_error = "配置尚未生成"
-                log.error(self.last_error)
-                return False
+        if not MIHOMO.exists():
+            self.last_error = f"内核不存在: {MIHOMO}"
+            log.error(self.last_error)
+            return False
+        if not CONFIG.exists():
+            self.last_error = "配置尚未生成"
+            log.error(self.last_error)
+            return False
 
-            port = _port(self.settings, "mixed_port", 7891)
-            ctrl = _port(self.settings, "controller_port", 9091)
-            for p_, why in ((port, "混合端口"), (ctrl, "控制端口")):
+        port = _port(self.settings, "mixed_port", 7891)
+        ctrl = _port(self.settings, "controller_port", 9091)
+        for p_, why in ((port, "混合端口"), (ctrl, "控制端口")):
+            if not port_free(p_):
+                owner = port_owner_hint(p_)
+                # 上一次异常退出（强杀/崩溃）会留下孤儿的 mihomo 占着端口，直接清掉
+                if "mihomo" in owner.lower():
+                    log.warning("%s %s 被残留内核占用（%s），清理后重启", why, p_, owner)
+                    _kill_pid_from_hint(owner)
+                    for _ in range(20):
+                        if port_free(p_):
+                            break
+                        time.sleep(0.25)
                 if not port_free(p_):
-                    owner = port_owner_hint(p_)
-                    # 上一次异常退出（强杀/崩溃）会留下孤儿的 mihomo 占着端口，直接清掉
-                    if "mihomo" in owner.lower():
-                        log.warning("%s %s 被残留内核占用（%s），清理后重启", why, p_, owner)
-                        _kill_pid_from_hint(owner)
-                        for _ in range(20):
-                            if port_free(p_):
-                                break
-                            time.sleep(0.25)
-                    if not port_free(p_):
-                        self.last_error = f"{why} {p_} 已被占用（{owner}），请关掉占用程序后重试"
-                        log.error(self.last_error)
-                        return False
+                    self.last_error = f"{why} {p_} 已被占用（{owner}），请关掉占用程序后重试"
+                    log.error(self.last_error)
+                    return False
 
-            ensure_geo_assets()
-            LOGS.mkdir(parents=True, exist_ok=True)
-            args = [str(MIHOMO), "-d", str(DATA), "-f", str(CONFIG)]
-            logf = None
+        ensure_geo_assets()
+        LOGS.mkdir(parents=True, exist_ok=True)
+        _rotate_kernel_log()
+        args = [str(MIHOMO), "-d", str(DATA), "-f", str(CONFIG)]
+        logf = None
+        with self._lock:
+            # 端口检查到 Popen 之间可能被别的线程抢先起好，进锁后再确认一次
+            if self.proc and self.proc.poll() is None:
+                return True
             try:
                 logf = open(KERNEL_LOG, "ab", buffering=0)
                 logf.write(f"\n\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} start =====\n".encode())
@@ -195,20 +224,21 @@ class Kernel:
                         logf.close()
                     except Exception:  # noqa: BLE001
                         pass
-
             self._stop.clear()
-            if not self._wait_ready(20.0):
-                self.last_error = "内核启动后 API 无响应，请查看 data/logs/kernel.log"
-                log.error(self.last_error)
-                self._kill()
-                return False
+            pid = self.proc.pid if self.proc else 0
 
-            if not _from_watchdog:
-                self._restarts = 0     # 只有用户/程序主动启动成功才清零崩溃计数
-            self.last_error = ""
-            log.info("内核已就绪 pid=%s", self.proc.pid)
-            self._ensure_watch()
-            return True
+        if not self._wait_ready(20.0):
+            self.last_error = "内核启动后 API 无响应，请查看 data/logs/kernel.log"
+            log.error(self.last_error)
+            self._kill()
+            return False
+
+        if not _from_watchdog:
+            self._restarts = 0     # 只有用户/程序主动启动成功才清零崩溃计数
+        self.last_error = ""
+        log.info("内核已就绪 pid=%s", pid)
+        self._ensure_watch()
+        return True
 
     def _ensure_watch(self) -> None:
         """看门狗只能有一个：重启路径反复 start() 绝不能把线程越堆越多。"""
@@ -270,26 +300,27 @@ class Kernel:
                     self.proc = None
             if self._stop.is_set():
                 return
-            self._restarts += 1
-            if self._restarts > 6:
-                self.last_error = "内核连续崩溃，已停止自动重启，请查看 kernel.log"
-                log.error(self.last_error)
-                return
-            # 退避用 Event.wait 而不是 sleep，退出时能立刻响应
-            if self._stop.wait(min(30, 2 ** self._restarts)):
-                return
-            with self._lock:
-                if self._stop.is_set():
+            # 以前一次 start() 失败就 return，看门狗线程随之结束：内核死了没人管，
+            # 系统代理还指着死端口 = 全网黑洞。这里重试到 _restarts 上限。
+            while True:
+                self._restarts += 1
+                if self._restarts > 6:
+                    self.last_error = "内核连续崩溃，已停止自动重启，请查看 kernel.log"
+                    log.error(self.last_error)
+                    return
+                backoff = min(30, 2 ** self._restarts)
+                if self._stop.wait(backoff):   # Event.wait：退出时立刻响应
                     return
                 try:
                     ok = self.start(_from_watchdog=True)
                 except Exception as e:  # noqa: BLE001
                     log.error("自动重启失败: %s", e)
                     ok = False
-                if not ok or not self.running():
-                    if self.last_error:
-                        log.error("自动重启放弃: %s", self.last_error)
-                    return
+                if ok and self.running():
+                    log.info("内核已自动重启（第 %d 次尝试）", self._restarts)
+                    break
+                log.warning("第 %d 次自动重启失败，%s 秒后重试: %s",
+                            self._restarts, backoff, self.last_error or "原因未知")
 
 
 __all__ = ["Kernel", "port_free", "port_owner_hint", "ensure_geo_assets"]

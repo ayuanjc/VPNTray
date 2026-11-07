@@ -16,7 +16,7 @@ from typing import Any, Callable
 import requests
 
 from . import __version__ as _VERSION
-from . import autostart, configgen, disguise, hotspot, kernel as kernel_mod, netguard, purity, subscription, sysproxy
+from . import autostart, configgen, disguise, github_ops, hotspot, kernel as kernel_mod, netguard, purity, subscription, sysproxy
 from .api import ApiError, MihomoAPI
 from .kernel import Kernel
 from .paths import CONFIG, DELAYS, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
@@ -69,7 +69,7 @@ class App:
         ensure_dirs()
         self.settings = Settings()
         self.api = MihomoAPI(
-            port=int(self.settings["controller_port"]),
+            port=_int(self.settings.get("controller_port"), 9091, 1024, 65535),
             secret=self.settings.get("secret", ""),
         )
         self.kernel = Kernel(self.api, self.settings)
@@ -111,7 +111,11 @@ class App:
             "github": {},                   # 最近一次 GitHub 链路自检结果
             "git_proxy": "",                # git 全局 http.proxy 的当前值
             "git_proxy_note": "",           # 本次启动有没有帮用户纠正过
+            "gh_busy": False,               # GitHub 自检在后台跑（前端据此转圈）
+            "conflict": {},                 # 最近一次代理冲突扫描结果（net_scan 写入）
+            "sysproxy_hold": False,         # 用户手动关过系统代理：别再自动打开
         }
+        self.gh = github_ops.GithubOps(self)   # GitHub 自检/git 代理（实现见 github_ops.py）
         self._last_conn = (0, 0, 0.0)  # up, down, ts
         self._delays_ts = 0.0
         self._loops_started = False
@@ -122,6 +126,9 @@ class App:
         self._update_busy = False
         self._task_lock = threading.Lock()   # 检测类长任务的互斥
         self._power_busy = False             # 总开关防连点
+        self._github_busy = False
+        self._gh_lock = threading.Lock()    # 自检本身要几十秒，check-then-set 必须原子
+        self._shutting = False
         # 上次测出来的延迟直接读回来：重启程序 / 刷新面板不该是一片空白
         self._load_delays()
 
@@ -233,7 +240,7 @@ class App:
         self.sync_git_proxy()
         self._start_loops()
         self._set(phase="运行中", busy="")
-        log.info("启动完成，端口 %s", self.settings["mixed_port"])
+        log.info("启动完成，端口 %s", _int(self.settings.get("mixed_port"), 7891, 1024, 65535))
         return True
 
     # ══════════ 总开关（连接 / 断开，不退出进程）══════════
@@ -558,200 +565,58 @@ class App:
                 log.info("%s 选节点失败: %s", sc["title"], e)
 
     # ══════════ GitHub 特化：自检 + git 代理对齐 ══════════
-    # 探针按「GitHub 实际会走到的域名」排：网页、API、raw 源文件、Release
-    # 资产、容器镜像。只 ping github.com 是不够的 —— 这台机器上就出现过
-    # 网页 200、raw 全 reset（hosts 固定 IP）的情况。
-    GITHUB_PROBES = (
-        ("web", "网页", "https://github.com/"),
-        ("api", "API", "https://api.github.com/"),
-        ("raw", "raw 源文件", "https://raw.githubusercontent.com/git/git/master/README.md"),
-        ("assets", "Release 资产", "https://objects.githubusercontent.com/"),
-        ("ghcr", "容器镜像", "https://ghcr.io/v2/"),
-    )
-    # git 的代理只改「指向本机」的那种；公司网关之类的外部件一律不碰
-    _GIT_PROXY_RE = re.compile(r"^(?:https?://)?(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?/?$", re.I)
+    # 实现整体搬到 vpntray/github_ops.GithubOps（约 200 行），这里只保留原有
+    # 入口名做转发：webui / 测试 / 外部脚本调的还是 App.github_check 等，
+    # 公开 API 一个都没变。
+    GITHUB_PROBES = github_ops.GITHUB_PROBES
+    _GIT_PROXY_RE = github_ops.GIT_PROXY_RE
 
     def _git_exe(self) -> str:
-        return shutil.which("git") or ""
+        return self.gh.git_exe()
 
     def _git_env(self, port: int) -> dict[str, str]:
-        """git 子进程只走我们的代理，别继承 shell 里的坏代理变量。"""
-        env = {k: v for k, v in os.environ.items()
-               if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
-        env["NO_PROXY"] = "127.0.0.1,localhost"
-        env["GIT_TERMINAL_PROMPT"] = "0"     # 要账号就直接失败，别把线程挂住
-        return env
+        return self.gh.git_env(port)
 
     def git_probe(self, port: int | None = None) -> dict[str, Any]:
-        """真的跑一次 git ls-remote —— 浏览器能开不等于 git 能拉。"""
-        exe = self._git_exe()
-        if not exe:
-            return {"ok": False, "refs": 0, "error": "没装 git（PATH 里找不到）"}
-        port = port or _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
-        px = f"http://127.0.0.1:{port}"
-        cmd = [exe, "-c", f"http.proxy={px}", "-c", f"https.proxy={px}",
-               "-c", "http.sslVerify=true",
-               "ls-remote", "--heads", "https://github.com/git/git"]
-        t0 = time.time()
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=25,
-                               env=self._git_env(port), encoding="utf-8",
-                               errors="replace", creationflags=CREATE_NO_WINDOW)
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "refs": 0, "ms": 25000, "error": "git 25s 没拉完（链路太慢或断流）"}
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "refs": 0, "error": f"{type(e).__name__}: {e}"}
-        out = (p.stdout or "").strip()
-        refs = len([x for x in out.splitlines() if x.strip()])
-        err = (p.stderr or "").strip().splitlines()
-        return {
-            "ok": p.returncode == 0 and refs > 0,
-            "refs": refs,
-            "ms": int((time.time() - t0) * 1000),
-            "error": "" if p.returncode == 0 else (err[-1][:160] if err else f"exit {p.returncode}"),
-        }
+        return self.gh.git_probe(port)
 
     def _probe_github(self, port: int) -> list[dict[str, Any]]:
-        s = requests.Session()
-        s.trust_env = False          # 别让系统 http_proxy 变量二次套娃
-        px = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
-        out: list[dict[str, Any]] = []
-        for key, label, url in self.GITHUB_PROBES:
-            t0 = time.time()
-            code, err = 0, ""
-            try:
-                r = s.get(url, proxies=px, timeout=8, allow_redirects=False,
-                          headers={"User-Agent": "VPNTray-github-check",
-                                   "Cache-Control": "no-store"})
-                code = int(r.status_code)
-            except Exception as e:  # noqa: BLE001
-                err = f"{type(e).__name__}: {e}"[:140]
-            ms = int((time.time() - t0) * 1000)
-            # 401 / 403 / 404 也说明 TCP + TLS + HTTP 全程通了，只有 5xx 和
-            # 异常才算这条链路坏 —— 用「必须 200」判会把 ghcr 永远判成失败。
-            out.append({"key": key, "label": label, "url": url,
-                        "ok": bool(code and code < 500), "code": code,
-                        "ms": ms, "error": err})
-        return out
+        return self.gh.probe_web(port)
 
     def github_check(self, heal: bool = True) -> dict[str, Any]:
-        """GitHub 专项自检：探针 + git 实测，坏了就地换节点。
-
-        这台机器上的典型故障是「GitHub 组钉在一个已经死掉的节点上」：
-        浏览器打不开、git 报 unexpected eof，但内核本身活着、其他站都通。
-        自检发现网页探针失败时，会用 GitHub 自己的地址给自动组重测一遍，
-        把出口拉回健康节点，再复测一次 —— 用户点一下就好，不用手工试 100 个。
-        """
-        port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
-        items = self._probe_github(port)
-        bad = [i["key"] for i in items if not i["ok"]]
-        switched = ""
-        note = ""
-        # 别用 state["proxies"]：那是刷新循环的缓存，可能落后好几秒，也可能还没跑过。
-        # 自检要的是「此刻内核里到底有哪些组」，只能现查。
-        try:
-            live = self.api.proxies() or {}
-            live_ok = bool(live)
-        except Exception:  # noqa: BLE001
-            live, live_ok = dict(self.state.get("proxies") or {}), False
-        sc = configgen.scene_by_key("github")
-        grp = (sc["title"] if sc else "") or "GitHub 加速"
-        aname = configgen.auto_name(sc) if sc else ""
-        if heal and bad:
-            # 能查到组才谈得上换节点；只看 kernel.running() 会把「API 已死但进程还在」漏掉
-            if not live_ok:
-                note = "内核没响应，自动换节点这一步跳过"
-            else:
-                target = aname if (aname and aname in live) else grp
-                try:
-                    d = self.api.group_delay(
-                        target, (sc or {}).get("probe") or "https://github.com/robots.txt", 3000)
-                except Exception as e:  # noqa: BLE001
-                    d = {}
-                    log.info("GitHub 自检组测速异常: %s", e)
-                if d:
-                    best = min(d, key=lambda k: d[k])
-                    # 有自动组就切回自动组（它自己会挑最快的），否则直接钉最快那个
-                    want = aname if (aname and aname in live) else best
-                    try:
-                        self.api.select(grp, want)
-                        switched = want if want != aname else f"{aname} → {best}"
-                        note = f"已切到 {best}（{d[best]}ms）"
-                    except ApiError as e:
-                        note = f"切换失败：{e}"
-                    if switched:
-                        items = self._probe_github(port)
-                        bad = [i["key"] for i in items if not i["ok"]]
-                        if bad:
-                            note += f"，换完仍有 {len(bad)} 项不通"
-                        try:
-                            live = self.api.proxies() or live
-                        except Exception:  # noqa: BLE001
-                            pass
-                else:
-                    note = "自动组里没有能连上 github.com 的节点（机场中转段可能整片失效）"
-        git = self.git_probe(port)
-        res = {
-            "ts": time.time(),
-            "ok": not bad and git["ok"],
-            "port": port,
-            "items": items,
-            "bad": bad,
-            "git": git,
-            "switched": switched,
-            "note": note,
-            "node": "",
-        }
-        g = (live.get(grp) or {})
-        res["node"] = str(g.get("now") or "")
-        self._set(github=res)
-        log.info("GitHub 自检：%s，git %s，%s",
-                 "通" if not bad else "断(" + ",".join(bad) + ")",
-                 "ok" if git["ok"] else "fail", note or "未动")
-        return res
+        return self.gh.check(heal)
 
     def sync_git_proxy(self) -> str:
-        """把 git 全局代理对齐到当前混合端口，返回给人看的变更说明。
+        return self.gh.sync_proxy()
 
-        典型症状：git 的 http.proxy 还指着上一次装的 Clash（127.0.0.1:7897），
-        那个端口现在被 svchost / WSL 转发占着，连上去立刻 EOF —— 表现就是
-        「GitHub 网页能开，git clone 报 unexpected eof while reading」。
-        只改指向本机端口的配置；指向公司网关的外部件不动。
+    def github_check_bg(self, heal: bool | None = None) -> dict[str, Any]:
+        """异步版自检：五条链路 + git 实测要跑几十秒，不能占着 HTTP 线程。
+
+        前端拿到 {ok: True, queued: True} 后轮询 /api/state 的 gh_busy，
+        结果照旧落在 state["github"] 里（字段没变，前端渲染逻辑不用改）。
         """
-        if not bool(self.settings.get("git_proxy_sync", True)):
-            return ""
-        exe = self._git_exe()
-        if not exe:
-            return ""
-        port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
-        want = f"http://127.0.0.1:{port}"
-        changed: list[str] = []
-        for key in ("http.proxy", "https.proxy"):
+        with self._gh_lock:
+            if self._github_busy:
+                return {"ok": False, "busy": True, "error": "自检正在进行，稍等"}
+            self._github_busy = True
+        self._set(gh_busy=True)
+
+        def run() -> None:
             try:
-                cur = subprocess.run([exe, "config", "--global", "--get", key],
-                                     capture_output=True, text=True, timeout=8,
-                                     encoding="utf-8", errors="replace",
-                                     creationflags=CREATE_NO_WINDOW).stdout.strip()
+                res = self.github_check(
+                    heal=bool(self.settings.get("github_heal", True)) if heal is None else heal)
+                bad = [i for i in (res.get("items") or []) if not i.get("ok")]
+                log.info("GitHub 自检完成：ok=%s，不通 %d 项", res.get("ok"), len(bad))
             except Exception as e:  # noqa: BLE001
-                log.info("读 git %s 失败，跳过: %s", key, e)
-                continue
-            if not cur or cur.rstrip("/") == want:
-                continue
-            if not self._GIT_PROXY_RE.match(cur):
-                log.info("git %s 指向外部代理 %s，不自动改", key, cur)
-                continue
-            try:
-                subprocess.run([exe, "config", "--global", key, want],
-                               capture_output=True, text=True, timeout=8,
-                               creationflags=CREATE_NO_WINDOW)
-            except Exception as e:  # noqa: BLE001
-                log.info("git %s 改写失败: %s", key, e)
-                continue
-            changed.append(f"{key} {cur} → {want}")
-        if changed:
-            log.info("git 代理已对齐：%s", "；".join(changed))
-        self._set(git_proxy=want, git_proxy_note="；".join(changed))
-        return "；".join(changed)
+                log.exception("GitHub 自检失败: %s", e)
+            finally:
+                with self._gh_lock:
+                    self._github_busy = False
+                self._set(gh_busy=False)
+
+        self._spawn("github-check", run)
+        return {"ok": True, "queued": True}
+
 
     def subscriptions(self) -> list[dict[str, Any]]:
         """订阅列表（老版本只有 sub_url，这里自动迁移成一条）。"""
@@ -842,7 +707,7 @@ class App:
         if not subs:
             return 0
         ua = self.settings.get("sub_ua", "clash.meta")
-        port = int(self.settings.get("mixed_port", 7891))
+        port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
         changed = 0
         for i, s in enumerate(subs):
             url = (s.get("url") or "").strip()
@@ -998,6 +863,11 @@ class App:
         return True, ""
 
     def shutdown(self) -> None:
+        with self._lock:
+            if self._shutting:
+                log.info("退出流程已经在跑了，忽略重复调用")
+                return
+            self._shutting = True
         log.info("开始退出流程")
         self._stop.set()
         if self.settings.get("system_proxy", True):
@@ -1041,7 +911,7 @@ class App:
             raw = subscription.fetch(
                 url,
                 self.settings.get("sub_ua", "clash.meta"),
-                int(self.settings["mixed_port"]),
+                _int(self.settings.get("mixed_port"), 7891, 1024, 65535),
             )
             parsed = subscription.parse(raw)
             new_hash = subscription.save_cache(raw, parsed)
@@ -1434,7 +1304,7 @@ class App:
 
         group = self.settings.get("main_group") or "节点选择"
         origin = self.state.get("group_now") or ""
-        port = int(self.settings["mixed_port"])
+        port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
         ok = 0
         fail = 0
         total = len(targets)
@@ -1473,15 +1343,15 @@ class App:
                     log.exception("检测 %d/%d %s 出错: %s: %s", i, total, name, type(e).__name__, e)
                     continue
                 self._changed()
-        except BaseException as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             log.exception("纯净度检测循环异常终止: %s", e)
         finally:
             self._set_progress()
             if origin:
                 try:
                     self.api.select(group, origin)
-                except ApiError:
-                    pass
+                except ApiError as e:
+                    log.warning("任务结束还原节点 %s 失败: %s", origin, e)
             self._purity_running = False
             self._set(busy="")
             self.refresh_now()
@@ -1515,7 +1385,7 @@ class App:
 
         group = self.settings.get("main_group") or "节点选择"
         origin = self.state.get("group_now") or ""
-        port = int(self.settings["mixed_port"])
+        port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
         ok = 0
         total = len(targets)
         log.info("开始带宽测速：%d 个节点", total)
@@ -1542,8 +1412,8 @@ class App:
             if origin:
                 try:
                     self.api.select(group, origin)
-                except ApiError:
-                    pass
+                except ApiError as e:
+                    log.warning("任务结束还原节点 %s 失败: %s", origin, e)
             self._speed_running = False
             self._set(busy="")
             self.refresh_now()
@@ -1623,7 +1493,7 @@ class App:
 
     def _probe_detail(self, timeout: float = 6.0) -> tuple[bool, str]:
         """同上，但把失败原因带出来 —— 排查「节点到底怎么挂的」全靠这个。"""
-        port = int(self.settings["mixed_port"])
+        port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
         p = f"http://127.0.0.1:{port}"
         s = requests.Session()
         s.trust_env = False
@@ -1674,7 +1544,7 @@ class App:
         """
         if not self.settings.get("ai_enabled", True):
             return True, ""
-        port = int(self.settings["mixed_port"])
+        port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
         p = f"http://127.0.0.1:{port}"
         s = requests.Session()
         s.trust_env = False
@@ -1920,113 +1790,147 @@ class App:
             self._spawn("update", self._loop_update)
 
     def _loop_health(self) -> None:
-        """每 20 秒做一次系统代理看护 + 每 45 秒轻量探测节点。"""
+        """每 20 秒做一次系统代理看护 + 每 45 秒轻量探测节点。
+
+        节拍在这里，具体动作在 _tick_net/_tick_sysproxy/_tick_ai/_tick_probe：
+        一轮的固定顺序是 ⓪ 网络变化 → ① 系统代理 → ②-a AI → ② 节点。
+        """
         tick = 0
         while not self._stop.wait(20):
             tick += 1
-            # ⓪ 网络换了（热点重连 / 切 WiFi / 换 SIM 卡）就重建内核。
-            # iPhone 热点每次重连本地 IP 都会变（.2 ~ .14），旧内核还绑在
-            # 上一个地址上，表现就是「看着连着但什么都没速度」。
-            if tick % 3 == 0 and self.settings.get("net_change_restart", True) \
-                    and self.kernel.running() and not self.state.get("busy"):
+            self._tick_net(tick)
+            if self._tick_sysproxy():
+                # 校园网还没认证：这一轮谁都别碰，等下一轮再说
+                continue
+            self._tick_ai(tick)
+            self._tick_probe(tick)
+
+    def _tick_net(self, tick: int) -> None:
+        """⓪ 网络换了（热点重连 / 切 WiFi / 换 SIM 卡）就重建内核。
+
+        iPhone 热点每次重连本地 IP 都会变（.2 ~ .14），旧内核还绑在
+        上一个地址上，表现就是「看着连着但什么都没速度」。
+        """
+        if not (tick % 3 == 0 and self.settings.get("net_change_restart", True)
+                and self.kernel.running() and not self.state.get("busy")):
+            return
+        try:
+            nid = tuple(hotspot.net_id())
+        except Exception:  # noqa: BLE001
+            nid = ()
+        prev = getattr(self, "_net_id", ())
+        if nid and prev and nid != prev:
+            # 热点/校园网会在两个地址之间来回横跳，旧逻辑一看到不同就
+            # 重建内核，跳一次断流几秒，用户感觉就是「网络忽好忽坏」。
+            # 现在要连续两轮采样都指向同一个新地址才重建，并且距上次
+            # 重建不足 2 分钟就先忍一轮。
+            stable = nid == getattr(self, "_net_pending", ())
+            self._net_pending = nid
+            since = time.time() - float(getattr(self, "_net_restart_at", 0.0))
+            if not stable:
+                log.info("网络地址 %s → %s，先等下一轮确认", prev, nid)
+            elif since < 120:
+                log.info("网络地址仍在变（%s），距上次重建仅 %.0fs，暂不重建", nid, since)
+            else:
+                log.warning("网络变化 %s → %s（连续两轮稳定），重建内核", prev, nid)
+                self._net_id = nid
+                self._net_restart_at = time.time()
+                self._ai_fail = 0
                 try:
-                    nid = tuple(hotspot.net_id())
-                except Exception:  # noqa: BLE001
-                    nid = ()
-                prev = getattr(self, "_net_id", ())
-                if nid and prev and nid != prev:
-                    # 热点/校园网会在两个地址之间来回横跳，旧逻辑一看到不同就
-                    # 重建内核，跳一次断流几秒，用户感觉就是「网络忽好忽坏」。
-                    # 现在要连续两轮采样都指向同一个新地址才重建，并且距上次
-                    # 重建不足 2 分钟就先忍一轮。
-                    stable = nid == getattr(self, "_net_pending", ())
-                    self._net_pending = nid
-                    since = time.time() - float(getattr(self, "_net_restart_at", 0.0))
-                    if not stable:
-                        log.info("网络地址 %s → %s，先等下一轮确认", prev, nid)
-                    elif since < 120:
-                        log.info("网络地址仍在变（%s），距上次重建仅 %.0fs，暂不重建", nid, since)
-                    else:
-                        log.warning("网络变化 %s → %s（连续两轮稳定），重建内核", prev, nid)
-                        self._net_id = nid
-                        self._net_restart_at = time.time()
-                        self._ai_fail = 0
-                        try:
-                            self.restart_kernel()
-                            self.notify("网络已切换，内核已重建")
-                        except Exception as e:  # noqa: BLE001
-                            log.warning("网络切换后重建内核失败: %s", e)
-                elif nid:
-                    self._net_id = nid
-                    self._net_pending = nid
-            # ① 系统代理看护：别的代理客户端会偷偷把注册表改回去
-            if self.settings.get("system_proxy") and self.kernel.running():
-                server = f"127.0.0.1:{self.settings['mixed_port']}"
-                if not sysproxy.is_enabled_to(server):
-                    # 抢回来之前必须先确认「现在接管是帮忙而不是添乱」。
-                    # 校园网没认证时，代理被清掉恰恰是用户自己修的（或火绒修的），
-                    # 我们每 20 秒抢一次，用户就永远进不了认证页。
-                    blocked, why = netguard.portal_status()
-                    if blocked:
-                        if not self.state.get("sysproxy_hold"):
-                            log.info("网络尚未就绪（%s），暂不接管系统代理", why)
-                            self._set(sysproxy_hold=True, sysproxy=False)
-                        continue
-                    if self.state.get("sysproxy_hold"):
-                        self._set(sysproxy_hold=False)
-                    log.warning("系统代理被其它程序改动，重新接管回 %s", server)
-                    try:
-                        sysproxy.enable(server)
-                        self._set(sysproxy=True)
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("重新接管系统代理失败: %s", e)
+                    self.restart_kernel()
+                    self.notify("网络已切换，内核已重建")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("网络切换后重建内核失败: %s", e)
+        elif nid:
+            self._net_id = nid
+            self._net_pending = nid
 
-            # ②-a AI 通道单独看护（每 3 轮 = 60 秒）。主节点正常不代表 AI 那条线正常，
-            # 而 codex/claude 只走 AI 那条线 —— 只测主节点会让「AI 挂了」完全隐形。
-            # 注意：self.state 里没有 "ai" 这个键（前端那份是 build_state 现算的），
-            # 判据必须读 settings，否则这个分支永远不会进。
-            if tick % 3 == 0 and self.settings.get("ai_enabled", True) \
-                    and self.kernel.running() and not self.state.get("busy"):
-                ok_ai, why_ai = self._probe_ai(8.0)
-                if ok_ai:
-                    if getattr(self, "_ai_fail", 0):
-                        log.info("AI 通道恢复正常")
-                    self._ai_fail = 0
-                else:
-                    self._ai_fail = getattr(self, "_ai_fail", 0) + 1
-                    log.warning("AI 通道探测失败（连续 %d 次）：%s", self._ai_fail, why_ai)
-                    if self._ai_fail >= 2:
-                        self._ai_fail = 0
-                        try:
-                            self._heal_ai()
-                        except Exception as e:  # noqa: BLE001
-                            log.warning("AI 通道自愈失败: %s", e)
+    def _tick_sysproxy(self) -> bool:
+        """① 系统代理看护：别的代理客户端会偷偷把注册表改回去。
 
-            # ② 节点健康探测
-            if tick % 2 or not self.settings.get("heal", True) or not self.kernel.running():
-                continue
-            if self.state.get("busy") or self._stop.is_set():
-                continue  # 正在测速/切换，或正在退出，别干扰
+        返回 True 表示「这一轮网络还没就绪、外层应直接跳过后续探测」
+        （原实现用 continue 表达，拆分后必须原样保留这个短路）。
+        """
+        if not (self.settings.get("system_proxy") and self.kernel.running()):
+            return False
+        server = f"127.0.0.1:{self.settings['mixed_port']}"
+        if sysproxy.is_enabled_to(server):
+            return False
+        # 抢回来之前必须先确认「现在接管是帮忙而不是添乱」。
+        # 校园网没认证时，代理被清掉恰恰是用户自己修的（或火绒修的），
+        # 我们每 20 秒抢一次，用户就永远进不了认证页。
+        blocked, why = netguard.portal_status()
+        if blocked:
+            if not self.state.get("sysproxy_hold"):
+                log.info("网络尚未就绪（%s），暂不接管系统代理", why)
+                self._set(sysproxy_hold=True, sysproxy=False)
+            return True
+        if self.state.get("sysproxy_hold"):
+            self._set(sysproxy_hold=False)
+        log.warning("系统代理被其它程序改动，重新接管回 %s", server)
+        try:
+            sysproxy.enable(server)
+            self._set(sysproxy=True)
+        except Exception as e:  # noqa: BLE001
+            log.warning("重新接管系统代理失败: %s", e)
+        return False
 
-            ok, why = self._probe_detail(4.0)
-            if ok:
-                if self._health_fail:
-                    log.info("节点恢复正常（之前连续失败 %d 次）", self._health_fail)
-                self._health_fail = 0
-                continue
-            self._health_fail = getattr(self, "_health_fail", 0) + 1
-            log.warning("健康探测失败（连续 %d 次）：%s", self._health_fail, why)
-            # 机场节点抖 30–60 秒很正常。2 次（约 80 秒）就换节点太急，
-            # 换节点本身要断流几秒，一到两次重选叠加起来，用户会以为「整个软件坏了」。
-            if self._health_fail < 3:
-                continue
+    def _tick_ai(self, tick: int) -> None:
+        """②-a AI 通道单独看护（每 3 轮 = 60 秒）。
+
+        主节点正常不代表 AI 那条线正常，而 codex/claude 只走 AI 那条线 ——
+        只测主节点会让「AI 挂了」完全隐形。注意：self.state 里没有 "ai" 这个
+        键（前端那份是 build_state 现算的），判据必须读 settings，否则这个
+        分支永远不会进。连续 2 次失败才自愈，避免一次抖动就换节点。
+        """
+        if not (tick % 3 == 0 and self.settings.get("ai_enabled", True)
+                and self.kernel.running() and not self.state.get("busy")):
+            return
+        ok_ai, why_ai = self._probe_ai(8.0)
+        if ok_ai:
+            if getattr(self, "_ai_fail", 0):
+                log.info("AI 通道恢复正常")
+            self._ai_fail = 0
+            return
+        self._ai_fail = getattr(self, "_ai_fail", 0) + 1
+        log.warning("AI 通道探测失败（连续 %d 次）：%s", self._ai_fail, why_ai)
+        if self._ai_fail < 2:
+            return
+        self._ai_fail = 0
+        try:
+            self._heal_ai()
+        except Exception as e:  # noqa: BLE001
+            log.warning("AI 通道自愈失败: %s", e)
+
+    def _tick_probe(self, tick: int) -> None:
+        """② 节点健康探测（每 2 轮 = 40 秒）。
+
+        机场节点抖 30–60 秒很正常。2 次（约 80 秒）就换节点太急，
+        换节点本身要断流几秒，一到两次重选叠加起来，用户会以为「整个软件坏了」，
+        所以连续 3 次失败才自动换节点。
+        """
+        if tick % 2 or not self.settings.get("heal", True) or not self.kernel.running():
+            return
+        if self.state.get("busy") or self._stop.is_set():
+            return  # 正在测速/切换，或正在退出，别干扰
+        ok, why = self._probe_detail(4.0)
+        if ok:
+            if self._health_fail:
+                log.info("节点恢复正常（之前连续失败 %d 次）", self._health_fail)
             self._health_fail = 0
-            try:
-                picked = self.ensure_usable()
-                if picked:
-                    self.notify(f"节点已自动切换：{picked}")
-            except Exception as e:  # noqa: BLE001
-                log.warning("自动切换失败: %s", e)
+            return
+        self._health_fail = getattr(self, "_health_fail", 0) + 1
+        log.warning("健康探测失败（连续 %d 次）：%s", self._health_fail, why)
+        if self._health_fail < 3:
+            return
+        self._health_fail = 0
+        try:
+            picked = self.ensure_usable()
+            if picked:
+                self.notify(f"节点已自动切换：{picked}")
+        except Exception as e:  # noqa: BLE001
+            log.warning("自动切换失败: %s", e)
+
 
     def _boot_verify(self) -> None:
         """启动后确认当前节点真能上网；不行就自动换个能用的。"""
@@ -2042,6 +1946,9 @@ class App:
             log.warning("启动自检异常: %s", e)
 
     def _spawn(self, name: str, fn) -> None:
+        # 这个列表只在 shutdown 时 join 用；跑完的及时摘掉，否则像 GitHub 自检
+        # 这种「点一次起一个」的任务会让列表无限涨。
+        self._threads = [t for t in self._threads if t.is_alive()]
         t = threading.Thread(target=fn, name=f"loop-{name}", daemon=True)
         t.start()
         self._threads.append(t)
@@ -2318,7 +2225,7 @@ class App:
         if not repo:
             info = {"ok": False, "error": "未配置 update_repo", "current": cur}
         else:
-            port = int(self.settings.get("mixed_port", 7891) or 7891)
+            port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
             try:
                 info = updater.check(repo, cur, local_port=port)
             except Exception as e:  # noqa: BLE001
@@ -2336,13 +2243,13 @@ class App:
 
         整段在后台跑：安装包 70MB 起步，不能堵住 HTTP 线程。
         """
-        if self._update_busy:
-            return {"ok": False, "error": "已经在更新中了"}
         with self._lock:
+            if self._update_busy:
+                return {"ok": False, "error": "已经在更新中了"}
             info = dict(self.state.get("update") or {})
-        if not info.get("has_update") or not info.get("zip_url"):
-            return {"ok": False, "error": "当前没有可安装的新版本"}
-        self._update_busy = True
+            if not info.get("has_update") or not info.get("zip_url"):
+                return {"ok": False, "error": "当前没有可安装的新版本"}
+            self._update_busy = True      # 与判断同一把锁，防双击下两份包
         self._spawn("update-apply", lambda: self._do_update(info))
         return {"ok": True, "queued": info.get("latest")}
 
@@ -2354,7 +2261,7 @@ class App:
 
         try:
             self._set(busy="更新中")
-            port = int(self.settings.get("mixed_port", 7891) or 7891)
+            port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
             payload = updater.prepare(info, local_port=port, on_progress=prog)
             self._set_progress("update", 1, 1, "覆盖文件")
             bat = updater.stage(payload, updater.update_workdir())

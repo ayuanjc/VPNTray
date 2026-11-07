@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "2.5.2"
+UI_VER = "2.5.3"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -215,6 +215,7 @@ def build_state(app) -> dict[str, Any]:
         "scenes": app.scenes_status(),
         # GitHub 特化：最近一次自检结果 + git 全局代理当前指向
         "github": st.get("github") or {},
+        "gh_busy": bool(st.get("gh_busy") or getattr(app, "_github_busy", False)),
         "git_proxy": str(st.get("git_proxy") or ""),
         "git_proxy_note": str(st.get("git_proxy_note") or ""),
         "update": st.get("update") or {},
@@ -260,6 +261,7 @@ class WebUI:
         self._thread: threading.Thread | None = None
         self._index = asset("index.html")
         self._log_lines: list[str] = []
+        self._route_table: dict[str, Callable[[dict], Any]] | None = None
 
     # —— 生命周期 ——
     def start(self) -> bool:
@@ -295,9 +297,41 @@ class WebUI:
 
     # —— 后台动作 ——
     def _bg(self, fn, *a, **kw) -> None:
-        threading.Thread(target=fn, args=a, kwargs=kw, daemon=True).start()
+        """后台动作：异常一律落日志。
+
+        以前线程体直接抛，pythonw 下 stderr 是 None，异常连 traceback 都不留，
+        面板只会「点了没反应」。这里统一兜住并记到 app.log。
+        """
+        name = getattr(fn, "__name__", "task")
+
+        def run() -> None:
+            try:
+                fn(*a, **kw)
+            except Exception:  # noqa: BLE001
+                log.exception("后台任务 %s 失败", name)
+
+        threading.Thread(target=run, name=f"bg-{name}", daemon=True).start()
+
+    def _table(self) -> dict[str, Callable[[dict], Any]]:
+        """路由表只算一次：每个 POST 重建 41 条闭包纯属浪费。"""
+        if self._route_table is None:
+            self._route_table = self._routes()
+        return self._route_table
 
     def _routes(self) -> dict[str, Callable[[dict], Any]]:
+        """路由表：合并下面按功能域拆开的五张子表。
+
+        注意：路径字符串是与 assets/index.html 的硬编码契约，改名等于静默 404；
+        合并顺序保持与历史一致（同一批路径的注册先后不变）。
+        """
+        table: dict[str, Callable[[dict], Any]] = {}
+        for part in (self._routes_node, self._routes_sub, self._routes_probe,
+                     self._routes_scene, self._routes_misc):
+            table.update(part())
+        return table
+
+    # ── 节点 / 连接 / 系统开关 ──
+    def _routes_node(self) -> dict[str, Callable[[dict], Any]]:
         app = self.app
 
         def select(body):
@@ -321,6 +355,10 @@ class WebUI:
             self._bg(app.set_autostart, on)
             return {"ok": True}
 
+        def power(body):
+            on = bool((body or {}).get("on", True))
+            return app.power(on)
+
         def best(_):
             self._bg(app.auto_pick_best)
             return {"ok": True, "queued": "auto_best"}
@@ -328,6 +366,20 @@ class WebUI:
         def test(_):
             self._bg(app.test_delays)
             return {"ok": True, "queued": "delay_test"}
+
+        return {
+            "/api/select": select,
+            "/api/power": power,
+            "/api/mode": mode,
+            "/api/sysproxy": sysproxy,
+            "/api/autostart": autostart,
+            "/api/best": best,
+            "/api/test": test,
+        }
+
+    # ── 订阅 ──
+    def _routes_sub(self) -> dict[str, Callable[[dict], Any]]:
+        app = self.app
 
         def sub(_):
             self._bg(app.update_subscription, True)
@@ -359,14 +411,24 @@ class WebUI:
                 "ok": True,
                 "list": [
                     {
-                        "name": sub.get("name"), "url": sub.get("url"),
-                        "nodes": sub.get("nodes"), "updated": sub.get("updated"),
-                        "info": sub.get("info") or {},
+                        "name": s.get("name"), "url": s.get("url"),
+                        "nodes": s.get("nodes"), "updated": s.get("updated"),
+                        "info": s.get("info") or {},
                     }
-                    for sub in app.subscriptions()
+                    for s in app.subscriptions()
                 ],
                 "active": _active(app.settings),
             }
+
+        return {
+            "/api/sub": sub,
+            "/api/sub_url": set_sub_url,
+            "/api/subs": sub_info,
+        }
+
+    # ── 纯净度 / 带宽 ──
+    def _routes_probe(self) -> dict[str, Callable[[dict], Any]]:
+        app = self.app
 
         def check_purity(body):
             scope = str((body or {}).get("scope", "current"))
@@ -406,7 +468,15 @@ class WebUI:
             self._bg(app.check_speed, names, 0 if scope == "current" else limit)
             return {"ok": True, "queued": scope}
 
-        # ── AI 专项（Claude Code / Codex）──
+        return {
+            "/api/purity": check_purity,
+            "/api/speed": check_speed,
+        }
+
+    # ── 场景加速 + AI 专项 + GitHub ──
+    def _routes_scene(self) -> dict[str, Callable[[dict], Any]]:
+        app = self.app
+
         def ai_node(body):
             name = str((body or {}).get("name", "")).strip()
             ok, err = app.set_ai_node(name)
@@ -417,7 +487,6 @@ class WebUI:
             ok, err = app.set_ai_enabled(on)
             return {"ok": ok, "error": err}
 
-        # ── 场景加速（Steam / GitHub）──
         def scene_node(body):
             b = body or {}
             ok, err = app.set_scene_node(str(b.get("key", "")).strip(),
@@ -433,25 +502,16 @@ class WebUI:
             return {"ok": ok, "error": err}
 
         def github_check(_body):
-            """GitHub 专项自检（网页 / API / raw / Release / 镜像 + git 实测）。"""
-            if getattr(app, "_github_busy", False):
-                return {"ok": False, "error": "自检正在进行，稍等"}
-            app._github_busy = True
-            try:
-                res = app.github_check(heal=bool(app.settings.get("github_heal", True)))
-            except Exception as e:  # noqa: BLE001
-                log.exception("GitHub 自检失败")
-                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-            finally:
-                app._github_busy = False
-            return {"ok": True, "github": res}
+            """GitHub 专项自检：五条链路 + git 实测要 30~40 秒。
+
+            同步跑会把面板 HTTP 线程按住（前端转圈、浏览器还可能先超时），
+            所以只排队，结果写 state["github"]，前端轮询 gh_busy 取。
+            """
+            return app.github_check_bg()
 
         def git_proxy_fix(_body):
             note = app.sync_git_proxy()
             return {"ok": True, "note": note, "value": str(app.state.get("git_proxy") or "")}
-
-        def topo(_):
-            return {"ok": True, "topo": app.topo()}
 
         def ai_fingerprint(_):
             cc = (app.ai_status() or {}).get("exit_cc") or ""
@@ -485,6 +545,27 @@ class WebUI:
             self._bg(app.check_purity, [node], 0)
             return {"ok": True, "queued": node}
 
+        return {
+            "/api/ai/node": ai_node,
+            "/api/ai/toggle": ai_toggle,
+            "/api/scene/node": scene_node,
+            "/api/scene/toggle": scene_toggle,
+            "/api/github/check": github_check,
+            "/api/git/proxy": git_proxy_fix,
+            "/api/ai/fingerprint": ai_fingerprint,
+            "/api/ai/align": ai_align,
+            "/api/ai/restore_tz": ai_restore_tz,
+            "/api/ai/launcher": ai_launcher,
+            "/api/ai/probe": ai_probe,
+        }
+
+    # ── 杂项：拓扑 / 内核 / 连接 / 更新 / 冲突清理 / 反馈 ──
+    def _routes_misc(self) -> dict[str, Callable[[dict], Any]]:
+        app = self.app
+
+        def topo(_):
+            return {"ok": True, "topo": app.topo()}
+
         def restart(_):
             self._bg(app.restart_kernel)
             return {"ok": True, "queued": "restart"}
@@ -505,10 +586,6 @@ class WebUI:
             app.settings.save()
             return {"ok": True, "heal": on}
 
-        def power(body):
-            on = bool((body or {}).get("on", True))
-            return app.power(on)
-
         def quit(_):
             self._bg(self._do_quit)
             return {"ok": True}
@@ -521,7 +598,6 @@ class WebUI:
             except Exception as e:  # noqa: BLE001
                 return {"ok": False, "lines": [f"读取日志失败: {e}"]}
 
-        # ── 自动更新 ──
         def update_check(body):
             force = bool((body or {}).get("force"))
             return app.update_check(force=force)
@@ -529,7 +605,6 @@ class WebUI:
         def update_apply(_):
             return app.update_apply()
 
-        # ── 代理冲突清理 ──
         def net_scan(_):
             return app.net_scan()
 
@@ -552,7 +627,6 @@ class WebUI:
                      if isinstance(x, (str, int)) and str(x).strip()]
             return app.net_fix(target, _pids(b.get("pids")), names[:16])
 
-        # ── 反馈 / 用户协议 ──
         def feedback_send(body):
             b = body or {}
             title = str(b.get("title") or "").strip()
@@ -568,7 +642,6 @@ class WebUI:
         def agree(body):
             return app.agree(str((body or {}).get("version") or ""))
 
-        # ── 实时连接 / TUN ──
         def connections(body):
             b = body or {}
             return app.connections(_int(b.get("limit"), 200, 1, 1000))
@@ -587,29 +660,6 @@ class WebUI:
             return app.set_tun(v)
 
         return {
-            "/api/select": select,
-            "/api/power": power,
-            "/api/mode": mode,
-            "/api/sysproxy": sysproxy,
-            "/api/autostart": autostart,
-            "/api/best": best,
-            "/api/test": test,
-            "/api/sub": sub,
-            "/api/sub_url": set_sub_url,
-            "/api/subs": sub_info,
-            "/api/purity": check_purity,
-            "/api/speed": check_speed,
-            "/api/ai/node": ai_node,
-            "/api/ai/toggle": ai_toggle,
-            "/api/scene/node": scene_node,
-            "/api/scene/toggle": scene_toggle,
-            "/api/github/check": github_check,
-            "/api/git/proxy": git_proxy_fix,
-            "/api/ai/fingerprint": ai_fingerprint,
-            "/api/ai/align": ai_align,
-            "/api/ai/restore_tz": ai_restore_tz,
-            "/api/ai/launcher": ai_launcher,
-            "/api/ai/probe": ai_probe,
             "/api/topo": topo,
             "/api/kernel/restart": restart,
             "/api/connections/close": close_conns,
@@ -629,6 +679,7 @@ class WebUI:
             "/api/conn/clear": conn_close_all,
             "/api/tun": tun,
         }
+
 
     def _do_quit(self) -> None:
         try:
@@ -743,7 +794,7 @@ class WebUI:
                     return self._json({"ok": False, "error": "bad json"}, 400)
                 if not isinstance(body, dict):
                     return self._json({"ok": False, "error": "body must be object"}, 400)
-                fn = webui._routes().get(path)
+                fn = webui._table().get(path)
                 if not fn:
                     return self._json({"ok": False, "error": "unknown endpoint"}, 404)
                 try:

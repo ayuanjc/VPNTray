@@ -220,10 +220,25 @@ def fetch(url: str, ua: str, local_port: int, timeout: int = 25) -> bytes:
             with requests.Session() as s:
                 s.trust_env = False  # 不读环境变量里的系统代理
                 s.proxies.update(prox)
-                with s.get(url, headers=headers, timeout=timeout) as r:
+                with s.get(url, headers=headers, timeout=timeout, stream=True) as r:
                     if r.status_code != 200:
                         raise SubscriptionError(f"HTTP {r.status_code}")
-                    content = r.content
+                    # 以前只在 parse() 里检查上限，但那时整包已经读进内存了：
+                    # 一个 800MB 的订阅能先把机器拖死。边读边卡。
+                    limit = MAX_SUB_BYTES
+                    declared = r.headers.get("Content-Length") or ""
+                    if declared.isdigit() and int(declared) > limit:
+                        raise SubscriptionError(
+                            f"订阅过大：{int(declared) / 1024 / 1024:.1f} MB")
+                    buf = bytearray()
+                    for chunk in r.iter_content(65536):
+                        if not chunk:
+                            continue
+                        buf += chunk
+                        if len(buf) > limit:
+                            raise SubscriptionError(
+                                f"订阅过大：超过 {limit // 1024 // 1024} MB")
+                    content = bytes(buf)
             if len(content) < 64:
                 raise SubscriptionError(f"内容过短: {len(content)} bytes")
             via = prox.get("http_proxy") or "direct"
