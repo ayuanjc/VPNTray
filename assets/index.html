@@ -87,8 +87,8 @@ button,input,select,textarea{font:inherit;color:inherit}
 .side{width:222px;flex:0 0 222px;background:var(--side);border-right:1px solid var(--line);
   display:flex;flex-direction:column;padding:20px 12px 14px;position:sticky;top:0;height:100vh}
 .brand{display:flex;align-items:center;gap:10px;padding:0 10px 20px}
-.logo{width:28px;height:28px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;
-  color:var(--acc-ink);background:var(--acc)}
+.logo{width:28px;height:28px;flex:0 0 auto;border-radius:9px;display:grid;place-items:center;
+  background:var(--acc)}
 .brand .bt{min-width:0}
 .brand b{display:block;font-family:var(--serif);font-size:15px;font-weight:600;letter-spacing:-.01em;line-height:1.2}
 .brand em{display:block;font-style:normal;font-size:10.5px;color:var(--ink3);margin-top:2px;letter-spacing:.02em}
@@ -320,8 +320,9 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
   <aside class="side">
     <div class="brand">
       <span class="logo">
-        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 2.7l7 2.8v5.6c0 4.4-2.9 7.9-7 9.8-4.1-1.9-7-5.4-7-9.8V5.5z"/><path d="M8.8 12.1l2.2 2.2 4.3-4.6"/>
+        <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 2.6l7.2 2.9v5.6c0 4.4-2.9 7.9-7.2 9.8-4.3-1.9-7.2-5.4-7.2-9.8V5.5z" fill="#fff"/>
+          <path d="M8.7 12.2l2.3 2.3 4.4-4.7" fill="none" stroke="var(--acc)" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
       </span>
       <span class="bt"><b>VPNTray</b><em id="ver">v—</em></span>
@@ -578,7 +579,7 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
 </div>
 
 <script>
-var UI_VER = '2.5.4';
+var UI_VER = '2.5.5';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 var sig = {};
 var S = null;
