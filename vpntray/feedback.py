@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-import platform
 import re
 import time
 from datetime import datetime
@@ -102,6 +101,50 @@ def _tail_log(lines: int = MAX_LOG_LINES) -> str:
         return f"（读日志失败：{e}）"
 
 
+def _os_info() -> str:
+    """拼系统版本，只读注册表，不碰 platform。
+
+    本机实测（2026-11-08）：winmgmt 卡死时 platform.system() → uname() →
+    _win32_ver() → _wmi.exec_query() 会永久阻塞，整个反馈面板跟着卡住。
+    注册表这条路没有 WMI 依赖，卡死的机器上也能立刻返回。
+    """
+    try:
+        import winreg
+
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        )
+        try:
+            name = str(winreg.QueryValueEx(key, "ProductName")[0])
+            build = str(winreg.QueryValueEx(key, "CurrentBuild")[0])
+            disp = ""
+            for k in ("DisplayVersion", "ReleaseId"):
+                try:
+                    disp = str(winreg.QueryValueEx(key, k)[0])
+                    break
+                except OSError:
+                    continue
+        finally:
+            key.Close()
+        arch = os.environ.get("PROCESSOR_ARCHITECTURE") or ""
+        parts = [name]
+        if disp:
+            parts.append(disp)
+        if build:
+            parts.append("build " + build)
+        if arch:
+            parts.append(arch)
+        return " ".join(parts)
+    except Exception:  # noqa: BLE001
+        return "Windows（版本读取失败）"
+
+
+def _py_version() -> str:
+    import sys
+
+    return "%d.%d.%d" % sys.version_info[:3]
+
+
 def _version() -> str:
     try:
         from . import __version__
@@ -121,8 +164,8 @@ def collect(app) -> str:
     rows = [
         ("版本", _version()),
         ("界面", st.get("ui") or "?"),
-        ("系统", f"{platform.system()} {platform.release()} ({platform.machine()})"),
-        ("Python", platform.python_version()),
+        ("系统", _os_info()),
+        ("Python", _py_version()),
         ("时区", st.get("tz") or "?"),
         ("阶段", st.get("phase") or "?"),
         ("内核", "运行中" if (kernel and kernel.running()) else "未运行"),

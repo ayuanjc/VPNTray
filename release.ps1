@@ -19,6 +19,13 @@ Write-Host "[1/5] 生成图标" -ForegroundColor Cyan
 $icon = Join-Path $PSScriptRoot 'assets\app.ico'
 if (-not (Test-Path $icon)) { python -X utf8 tools\make_icon.py }
 
+# ⚠ setuptools / pkg_resources / _distutils_hack 必须排除（2026-11-08 血案）：
+#   PyInstaller 只要打包到 setuptools，就会注入 pyi_rth_setuptools 运行时钩子，
+#   它在**任何应用代码之前**执行：_distutils_hack.do_override() → 导入 distutils →
+#   pkg_resources → platform.system() → Windows 的 _wmi_query。
+#   本机 WMI 服务一旦卡死，进程就永久阻塞在这一行：没有窗口、没有日志、没有端口，
+#   任务管理器里只剩 0 CPU 的空壳，用户看到的就是「VPN 软件没了」。
+#   排除这三个模块，钩子不再注入，这条 WMI 依赖也就没了。
 Write-Host "[2/5] PyInstaller onedir 打包" -ForegroundColor Cyan
 $raw = Join-Path $PSScriptRoot 'release\VPNTray'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
@@ -34,6 +41,9 @@ python -m PyInstaller --noconfirm --clean --onedir --windowed `
     --hidden-import pythonnet `
     --collect-data webview `
     --exclude-module tkinter `
+    --exclude-module setuptools `
+    --exclude-module pkg_resources `
+    --exclude-module _distutils_hack `
     --distpath (Join-Path $PSScriptRoot 'release') `
     --workpath (Join-Path $PSScriptRoot 'build') `
     --specpath (Join-Path $PSScriptRoot 'build') `

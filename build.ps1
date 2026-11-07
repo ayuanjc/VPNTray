@@ -26,6 +26,9 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
     --hidden-import pythonnet `
     --collect-data webview `
     --exclude-module tkinter `
+    --exclude-module setuptools `
+    --exclude-module pkg_resources `
+    --exclude-module _distutils_hack `
     --distpath $PSScriptRoot `
     --workpath (Join-Path $PSScriptRoot 'build') `
     --specpath (Join-Path $PSScriptRoot 'build') `

@@ -17,6 +17,14 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+
+# winmgmt（WMI 服务）卡死时，setuptools 的 distutils hack 会在导入期去查
+# platform.system() → WMI，进程从此永久阻塞：没窗口、没日志、没端口，看起来就是
+# 「软件点了没反应」（2026-11-08 实测，4 个僵尸进程全卡在 _wmi_query）。
+# frozen 版的运行时钩子比这行更早跑，真正生效的是打包时排除
+# setuptools / pkg_resources / _distutils_hack（见 release.ps1）；
+# 这行是源码运行和开发机上的兜底。
+os.environ.setdefault("SETUPTOOLS_USE_DISTUTILS", "stdlib")
 import threading
 import time
 import traceback

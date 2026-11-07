@@ -956,6 +956,46 @@ INFO app: VPNTray 2.2.2 启动（frozen=True，Python 3.12.10）
 覆盖安装后 `data/` 保留。如果日志里出现「图标文件缺失（打包时漏了 assets）」，说明手上
 那份包不完整 —— 换回官方 zip（`VPNTray-<版本>-win64.zip`）即可。
 
+## 2.5.6：点了没反应 —— WMI 卡死时进程永久阻塞（真凶是 setuptools 钩子）
+
+2026-11-08 现场：梯子用着用着没了，双击图标毫无反应。任务管理器里躺着 **4 个 VPNTray.exe，CPU 都是 0，没有窗口、没有托盘、没有端口**，`app.log` 一行没写，事件日志也没有崩溃记录。
+
+py-spy 抓栈定案（4 个进程一模一样）：
+
+```
+_wmi_query (platform.py:327)
+_win32_ver (platform.py:388)
+win32_ver (platform.py:450)
+uname (platform.py:922) → system (platform.py:987)
+robust_remover (_distutils_hack/__init__.py:207)
+<module> (_distutils_hack/__init__.py:230)
+... distutils → pkg_resources → setuptools
+pyi_rth_setuptools (PyInstaller 运行时钩子)
+```
+
+链条：PyInstaller 只要打进 setuptools，就会注入 `pyi_rth_setuptools` 运行时钩子，它在**任何应用代码之前**执行；`_distutils_hack.do_override()` 导入 distutils → pkg_resources → `platform.system()` → Windows 的 `_wmi_query`。本机 WMI 服务（winmgmt）已经卡死，这一句查询永不返回 —— 进程就死在那儿。它死得比 `paths.ensure_dirs()` 还早，所以连 boot.log 都留不下来。
+
+同一台机器上 `platform.system()` 直接卡住（`timeout 12 python -c "import platform;print(platform.system())"` → rc=124），PyInstaller 自己也构建不动，最后靠 `sitecustomize` 把 `platform._wmi_query` 换成抛 OSError 才把包打出来。
+
+修法：
+
+| 改动 | 位置 | 作用 |
+| --- | --- | --- |
+| 打包排除 `setuptools` / `pkg_resources` / `_distutils_hack` | `release.ps1`、`build.ps1` | 钩子不再注入，启动路径没有 WMI 依赖 |
+| 反馈面板不再用 `platform.system()` | `vpntray/feedback.py` `_os_info()` | 改读注册表 `CurrentVersion`，卡死的机器上也能立刻返回 |
+| 启动时兜底 `SETUPTOOLS_USE_DISTUTILS=stdlib` | `run.pyw` 顶部 | 源码运行/开发机保险（frozen 钩子更早，真正靠的是上面那条） |
+
+验证（同一台 WMI 卡死的机器）：
+
+- 2.5.5 的 exe 里有 `pyi_rth_setuptools`（998 字节）；2.5.6 的 PKG 里没有（`pyi-archive_viewer -l` 对比）
+- 2.5.6 不设任何环境变量冷启动 → `boot.log` 正常写满，7892/7891/9091 三个端口全起
+- 面板 `/api/state` → `ver=2.5.6`；google 204 / baidu 200
+
+顺带修的两处（这次现场暴露的）：
+
+- 开始菜单里躺着两个指向 **旧版 `E:\VPNTray-2.5.1`** 的快捷方式，双击就是那个卡死的老版本 —— 已清掉重复项并改指当前安装。
+- 系统代理开关还指着 `127.0.0.1:7891`，而进程已死 = 全网黑洞。判断实例身份要看 pid，别只看端口。
+
 ## 2.5.5：换了一套图标（橙底白盾，跟面板是一家人）
 
 旧图标是 2024 年那版深墨绿的方块，跟 2.5.4 之后的面板配色完全不搭；托盘里 16px 那个尺寸还糊成一团。2.5.5 重画了一整套：
