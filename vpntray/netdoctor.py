@@ -23,6 +23,7 @@ import re
 import socket
 import struct
 import subprocess
+import threading
 import time
 from typing import Any
 
@@ -81,7 +82,11 @@ def _ping(host: str, count: int = 3) -> dict[str, Any]:
         avg = int(m.group(1))
     elif times:
         avg = sum(times) // len(times)
-    return {"ok": bool(times) and loss in (0, None), "loss": loss, "avg": avg,
+    # ran=False：这条 ping 根本没跑出可解析的结果（既没有 time/时间，也没有丢包率）。
+    # 命令缺失、被安全软件拦、目标把 ICMP 丢光都会这样；这时既不能说通，
+    # 也不能断言「网关不通」—— 那是把权限/拦截问题误判成网络故障。
+    ran = bool(times) or loss is not None
+    return {"ok": bool(times) and loss in (0, None), "ran": ran, "loss": loss, "avg": avg,
             "times": times[:6], "cmd": f"ping -n {count} -w 1200 {host}", "raw": out[:1200]}
 
 
@@ -155,6 +160,134 @@ def _dns_servers() -> dict[str, Any]:
     return {"servers": servers, "per_if": per_if,
             "static": any(i["static"] for i in per_if),
             "cmd": "netsh interface ipv4 show dnsservers", "raw": out[:1600]}
+
+
+# netsh interface show interface 的列头是「Admin State / State / Type / Interface Name」，
+# 中文系统是「管理状态 / 状态 / 类型 / 接口名称」。老代码用「跳掉前四列」的正则
+# （^\s*\S+\s+\S+\s+\d+\s+\d+\s+）去切，列宽或语言一变就错位 ——
+# 于是网卡名永远取不到，fix_dns / fix_dns_keep_local 两个动作 100% 失败。
+_NETSH_STATE_WORDS = frozenset({
+    "enabled", "disabled", "connected", "disconnected",
+    "已启用", "已禁用", "已连接", "已断开",
+})
+_NETSH_TYPE_WORDS = frozenset({
+    "dedicated", "internal", "loopback", "lookback",
+    "专用", "内部", "回环",
+})
+
+
+def _parse_netsh_interfaces(out: str) -> list[str]:
+    """从 netsh interface show interface 的输出里取「已连接」的网卡名。
+
+    不按字符列位切，而是按词剥掉前面的「管理状态 状态 类型」三列：
+    中文列头里 CJK 是双宽字符，任何按字符下标切的办法在不同语言下都会错。
+    """
+    names: list[str] = []
+    for raw in (out or "").splitlines():
+        s = raw.strip()
+        if not s or s.startswith("-"):
+            continue
+        toks = s.split()
+        head = [t.lower() for t in toks]
+        if "interface" in head or "名称" in head or "接口名称" in head:
+            continue                        # 表头行
+        i = 0
+        while i < len(toks) and (head[i] in _NETSH_STATE_WORDS
+                                 or head[i] in _NETSH_TYPE_WORDS):
+            i += 1
+        if i == 0:
+            continue                        # 第一个词不是状态/类型词 → 不是数据行
+        name = " ".join(toks[i:]).strip()
+        if not name:
+            continue
+        if any(t in ("connected", "已连接") for t in head[:i]) and name not in names:
+            names.append(name)
+    return names
+
+
+def _active_ifaces() -> list[str]:
+    """当前「已连接」的网卡名：优先 PowerShell，netsh 兜底。
+
+    为什么优先 PowerShell：Get-NetAdapter 给的是结构化字段（Name 就是 netsh 认的
+    name），不受排版/语言影响；netsh 的文本输出只能靠解析，属于兜底。
+    """
+    names: list[str] = []
+    ps = ("Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | "
+          "Select-Object -ExpandProperty Name")
+    r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=10)
+    for line in (r.get("out") or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("<") or s.lower() in ("name", "名称"):
+            continue
+        if s not in names:
+            names.append(s)
+    if names:
+        return names
+    r = _run(["netsh", "interface", "show", "interface"], timeout=8)
+    return _parse_netsh_interfaces(r.get("out") or "")
+
+
+def _port_from(obj: Any, key: str, default: int) -> int:
+    """从一个类 settings 的对象/字典里取端口，取不到或越界就回落默认值。"""
+    try:
+        val = obj[key] if hasattr(obj, "__getitem__") else getattr(obj, key, None)
+    except Exception:  # noqa: BLE001 —— Settings.__getitem__ 缺键会抛 KeyError
+        val = None
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return default
+    return n if 0 < n < 65536 else default
+
+
+def _ports(app: Any) -> dict[str, int]:
+    """内核/解析端口：从 settings 读，读不到回落默认值。
+
+    写死 7891/9091 有个坑：用户在设置里改过端口之后，体检会去检查两个没人用的
+    端口，然后报「内核没起来」，再引导用户去重启一个其实正常的进程。
+    """
+    st = getattr(app, "settings", None) if app is not None else None
+    if st is None:
+        return {"mixed": 7891, "controller": 9091, "dns": 53}
+    return {
+        "mixed": _port_from(st, "mixed_port", 7891),
+        "controller": _port_from(st, "controller_port", 9091),
+        "dns": _port_from(st, "dns_port", 53),
+    }
+
+
+def _idna(name: str) -> str:
+    """探测域名转 IDNA：中文域名/超长标签直接交给解析器会抛 UnicodeError。"""
+    try:
+        return name.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        return name
+
+
+def _gai(name: str, timeout: float = 3.0) -> dict[str, Any]:
+    """带超时的 getaddrinfo：系统解析半死时不能把整轮体检钉在这里。
+
+    返回 {"ms": int} 或 {"ms": None, "error": str}。
+    """
+    res: dict[str, Any] = {"ms": None, "error": "超时"}
+
+    def work() -> None:
+        try:
+            t0 = time.time()
+            socket.getaddrinfo(name, None, socket.AF_INET, socket.SOCK_STREAM)
+            res["ms"] = int((time.time() - t0) * 1000)
+            res["error"] = ""
+        except OSError as e:
+            res["error"] = type(e).__name__
+        except Exception as e:  # noqa: BLE001 —— UnicodeError 之类也要收住
+            res["error"] = type(e).__name__
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return {"ms": None, "error": "超时"}
+    return res
 
 
 def _build_query(name: str, qtype: int = 1) -> bytes:
@@ -243,11 +376,34 @@ def _hosts_path() -> str:
                              "System32", "drivers", "etc", "hosts")
 
 
+def _read_hosts_text(path: str) -> tuple[str, str, bool]:
+    """读 hosts，返回 (文本, 写回时该用的编码, 是否是「解不开」的脏解码)。
+
+    编码必须跟着原文件走：中文 Windows 上用户手写的注释常常是 GBK。
+    以前一律按 UTF-8 + errors="replace" 读、再按 UTF-8 写回，
+    等于把那些字节永久替换成 U+FFFD —— 一次「修复」就把用户的文件毁了。
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        try:
+            return raw.decode("utf-8-sig"), "utf-8-sig", False
+        except UnicodeDecodeError:
+            pass
+    try:
+        return raw.decode("utf-8"), "utf-8", False
+    except UnicodeDecodeError:
+        pass
+    try:
+        return raw.decode("gbk"), "gbk", False
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", "replace"), "utf-8", True
+
+
 def _hosts() -> dict[str, Any]:
     path = _hosts_path()
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            raw = f.read()
+        raw, _enc, _dirty = _read_hosts_text(path)
         size = os.path.getsize(path)
         writable = os.access(path, os.W_OK)
     except OSError as e:
@@ -339,6 +495,13 @@ def _chk_gateway(_app: Any) -> dict[str, Any]:
         return _ck("gateway", "网关连通", "skip", "没有网关可测")
     p = _ping(gw, 3)
     detail = f"{p['cmd']}\n丢包: {p['loss']}%  平均: {p['avg']}ms\n\n{p['raw']}"
+    if not p.get("ran", True):
+        # ping 命令本身没跑成（缺命令 / 被安全软件拦 / ICMP 被丢光）：
+        # 报「网关不通」会把人引去重启网卡，白折腾还真的断网几秒。
+        return _ck("gateway", "网关连通", "skip",
+                   "ping 无法执行（可能被安全软件拦），无法判定",
+                   detail + "\n\n允许 ping.exe 出站后再测，或改看「直连出口」那一项。",
+                   data=p)
     if p["loss"] == 100 or not p["times"]:
         return _ck("gateway", "网关连通", "bad", f"网关 {gw} 完全不通",
                    detail + "\n\n网关都不通，问题在本机到路由器这一段：Wi-Fi 信号、网线、路由器本身。",
@@ -379,9 +542,10 @@ def _chk_dns_local(app: Any) -> dict[str, Any]:
     """本机解析：系统 DNS 指着 127.0.0.1 时，这里必须有东西在听。"""
     d = _dns_servers()
     points_local = any(s in LOOPBACK_DNS for s in d["servers"])
-    busy = dnsguard.port_busy(53)
+    dns_port = _ports(app)["dns"]
+    busy = dnsguard.port_busy(dns_port)
     detail = (f"系统 DNS 是否指向本机: {'是' if points_local else '否'}"
-              f"\n127.0.0.1:53 监听: {'是' if busy else '否'}")
+              f"\n127.0.0.1:{dns_port} 监听: {'是' if busy else '否'}")
     if busy:
         pr = dnsguard.probe() if hasattr(dnsguard, "probe") else {}
         ms = pr.get("ms") if isinstance(pr, dict) else None
@@ -403,14 +567,17 @@ def _chk_dns_public(_app: Any) -> dict[str, Any]:
     rows: list[str] = []
     bad_sys = 0
     for name, tag in PROBE_NAMES:
-        t0 = time.time()
+        # 先转 IDNA：中文域名 / 超长标签直接丢给 getaddrinfo 会抛 UnicodeError，
+        # 那不是 OSError，以前会把整轮体检在这一项上直接炸掉。
         try:
-            socket.getaddrinfo(name, None, socket.AF_INET, socket.SOCK_STREAM)
-            ms = int((time.time() - t0) * 1000)
-            rows.append(f"{tag} {name}: {ms}ms")
-        except OSError as e:
+            r = _gai(_idna(name))
+        except Exception as e:  # noqa: BLE001 —— 任何解析异常都只算这一项失败
+            r = {"ms": None, "error": type(e).__name__}
+        if r.get("ms") is None:
             bad_sys += 1
-            rows.append(f"{tag} {name}: 失败 {type(e).__name__}")
+            rows.append(f"{tag} {name}: 失败 {r.get('error') or '未知'}")
+        else:
+            rows.append(f"{tag} {name}: {r['ms']}ms")
     pub: list[str] = []
     pub_ok = 0
     for srv in DNS_FALLBACK[:2]:
@@ -464,15 +631,17 @@ def _chk_sysproxy(app: Any) -> dict[str, Any]:
 
 
 def _chk_kernel(app: Any) -> dict[str, Any]:
+    cfg = _ports(app)
     ports = []
-    for name, port in (("混合口", 7891), ("控制口", 9091)):
+    for name, port in (("混合口", cfg["mixed"]), ("控制口", cfg["controller"])):
         ports.append((name, int(port), _listen(int(port))))
     alive = [p for p in ports if p[2]]
     detail = "\n".join(f"{n} {p}: {'LISTEN' if ok else '未监听'}" for n, p, ok in ports)
     if alive:
         return _ck("kernel", "代理内核", "ok", f"{len(alive)}/{len(ports)} 个端口在听", detail,
                    data={"ports": [{"name": n, "port": p, "ok": ok} for n, p, ok in ports]})
-    return _ck("kernel", "代理内核", "bad", "7891 / 9091 都没监听（内核没起来）",
+    return _ck("kernel", "代理内核", "bad",
+               f"{cfg['mixed']} / {cfg['controller']} 都没监听（内核没起来）",
                detail + "\n\n内核没起来时，系统代理指过来就是断网。要么重启内核，要么关掉系统代理。",
                fix="restart_kernel", fix_title="重启内核", data={"ports": []})
 
@@ -653,27 +822,31 @@ def _set_adapter_dns(servers: list[str], iface: str = "") -> dict[str, Any]:
     """把 DNS 写到网卡上；iface 为空时挨个试「已连接」的网卡。"""
     if not netguard.is_admin():
         return {"ok": False, "out": "需要管理员权限", "need_admin": True}
-    names = [iface] if iface else []
-    if not names:
-        r = _run(["netsh", "interface", "show", "interface"], timeout=8)
-        for line in r["out"].splitlines():
-            if "已连接" in line or "Connected" in line:
-                name = re.sub(r"^\s*\S+\s+\S+\s+\d+\s+\d+\s+", "", line).strip()
-                if name:
-                    names.append(name)
+    names = [iface] if iface else _active_ifaces()
     outs = []
     ok_any = False
     for name in names[:3]:
-        _run(["netsh", "interface", "ipv4", "set", "dnsservers", f"name={name}",
-              "source=static", f"address={servers[0]}", "register=primary"], timeout=8)
+        r1 = _run(["netsh", "interface", "ipv4", "set", "dnsservers", f"name={name}",
+                   "source=static", f"address={servers[0]}", "register=primary"], timeout=8)
         for extra in servers[1:]:
             _run(["netsh", "interface", "ipv4", "add", "dnsservers", f"name={name}",
                   f"address={extra}", "index=2"], timeout=8)
+        # 复核必须落到「这张网卡」上：只看全局 servers 列表时，多网卡机器上
+        # 另一张网卡本来就有的 DNS 会把这次失败盖成成功。
         cur = _dns_servers()
-        hit = set(cur["servers"])
-        if servers[0] in hit:
+        got: list[str] = []
+        for item in cur.get("per_if") or []:
+            if str(item.get("iface") or "").strip().lower() == name.strip().lower():
+                got = [str(x) for x in (item.get("servers") or [])]
+                break
+        if not got:
+            got = [str(x) for x in (cur.get("servers") or [])]
+        if servers[0] in got:
             ok_any = True
             outs.append(f"{name}: 已设为 {', '.join(servers)}")
+        else:
+            err = (r1.get("err") or "").strip() or f"rc={r1.get('code')}"
+            outs.append(f"{name}: 设置未生效（{err[:120]}）")
     return {"ok": ok_any, "out": "\n".join(outs) or "没有找到已连接的网卡"}
 
 
@@ -736,7 +909,7 @@ def fix(app: Any, action: str) -> dict[str, Any]:
                 res = fn(True)
                 steps.append({"step": "启动本机解析", "ok": bool(res) if isinstance(res, bool) else True,
                               "out": str(res)[:300]})
-            elif dnsguard.port_busy(53):
+            elif dnsguard.port_busy(_ports(app)["dns"]):
                 steps.append({"step": "启动本机解析", "ok": True, "out": "53 已有服务在听"})
             else:
                 steps.append({"step": "启动本机解析", "ok": False,
@@ -746,8 +919,15 @@ def fix(app: Any, action: str) -> dict[str, Any]:
             fn = getattr(app, "restart_kernel", None)
             if callable(fn):
                 res = fn()
-                steps.append({"step": "重启内核", "ok": bool(res) if isinstance(res, bool) else True,
-                              "out": str(res)[:300]})
+                # app.restart_kernel() 现在返回真布尔：端口真的起来了才 True。
+                # 以前这里「不是 bool 就当成功」，None（抢不到工作锁 / 旧实现）也被判成功，
+                # 于是内核根本没起来界面上照样显示「已修复」，用户下一次还是断网。
+                ok = bool(res)
+                out = "内核端口已就绪" if ok else "内核未能启动"
+                err = _app_error(app)
+                if not ok and err:
+                    out += f"：{err}"
+                steps.append({"step": "重启内核", "ok": ok, "out": out})
             else:
                 steps.append({"step": "重启内核", "ok": False, "out": "没有 restart_kernel 接口"})
 
@@ -771,8 +951,13 @@ def fix(app: Any, action: str) -> dict[str, Any]:
                     time.sleep(1.5)
                     e = _run(["netsh", "interface", "set", "interface", f"name={iface}",
                               "admin=enable"], timeout=12)
-                    steps.append({"step": f"重启网卡 {iface}", "ok": e["ok"],
-                                  "out": f"disable rc={d['code']} / enable rc={e['code']}"})
+                    # 只看 enable 的返回码不够：netsh 常常 rc=0 但网卡还停在禁用，
+                    # 那样用户就真的没网了，必须复核一次「这张网卡现在是不是 Up」。
+                    alive = {n.strip().lower() for n in _active_ifaces()}
+                    back = iface.strip().lower() in alive
+                    steps.append({"step": f"重启网卡 {iface}", "ok": bool(e["ok"]) and back,
+                                  "out": f"disable rc={d['code']} / enable rc={e['code']}"
+                                         f" / 复核 {'已恢复' if back else '未恢复（网卡可能仍是禁用）'}"})
 
         elif action == "winsock_reset":
             if not netguard.is_admin():
@@ -816,6 +1001,22 @@ def fix(app: Any, action: str) -> dict[str, Any]:
     return out
 
 
+def _app_error(app: Any) -> str:
+    """从 app.state 里捞最近一次错误文案（app 用 _set(error=...) 记的）。
+
+    restart_kernel() 只回布尔，失败原因在 state["error"]（"内核启动失败" 这类）。
+    修完只看 ok=False 等于让用户「知道失败但不知道为什么」，所以顺手带出来。
+    """
+    st = getattr(app, "state", None) if app is not None else None
+    if st is None:
+        return ""
+    try:
+        val = st.get("error") if hasattr(st, "get") else getattr(st, "error", "")
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(val or "")[:300]
+
+
 def _default_iface_name() -> str:
     """从默认网关反查网卡名（给重启网卡用）。"""
     gw = str(hotspot.identity().get("gw") or "")
@@ -856,10 +1057,15 @@ def fix_hosts(apply: bool = True, admin: bool | None = None) -> dict[str, Any]:
         return {"step": "修复 hosts", "ok": False, "need_admin": True,
                 "out": "需要管理员权限（hosts 在 System32\\drivers\\etc 下）"}
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
+        raw_text, enc, dirty = _read_hosts_text(path)
+        lines = raw_text.splitlines()
     except OSError as e:
         return {"step": "修复 hosts", "ok": False, "out": f"{type(e).__name__}: {e}"}
+    if dirty:
+        # 两种编码都解不开：只报告，绝不写回。用 errors="replace" 读出来的内容
+        # 再写回去，会把原来的字节永久变成 U+FFFD —— 那才是真正的弄坏文件。
+        return {"step": "修复 hosts", "ok": False, "path": path,
+                "out": "hosts 编码无法识别（既不是 UTF-8 也不是 GBK），为避免写坏文件已中止"}
 
     kept: list[str] = []
     dropped: list[str] = []
@@ -910,17 +1116,40 @@ def fix_hosts(apply: bool = True, admin: bool | None = None) -> dict[str, Any]:
 
     bak = ""
     try:
+        mode = os.stat(path).st_mode & 0o7777
+    except OSError:
+        mode = 0
+    tmp = path + ".vpntray.tmp"
+    try:
         bak = _hosts_backup(path)
-        if not os.access(path, os.W_OK):
-            os.chmod(path, 0o666)               # 被破解补丁设成只读的老坑
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            f.write(text)
+        # 原子写：先写同目录临时文件再 os.replace。以前直接 open(path,"w") 会先截断，
+        # 中途出错（磁盘满 / 进程被杀）就把用户的 hosts 变成 0 字节 —— 全机解析当场崩。
+        with open(tmp, "wb") as f:
+            f.write(text.encode(enc, "replace"))
+            f.flush()
+            os.fsync(f.fileno())
+        if mode:
+            os.chmod(tmp, mode)                 # 原文件权限位原样带到新文件
+        try:
+            os.replace(tmp, path)
+        except PermissionError:
+            # hosts 常被破解补丁/安全软件设成只读：临时放开写位再换一次，换完恢复原样。
+            if mode:
+                os.chmod(path, mode | 0o200)
+            os.replace(tmp, path)
+            if mode:
+                os.chmod(path, mode)
     except OSError as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
         return {"step": "修复 hosts", "ok": False, "out": f"{type(e).__name__}: {e}",
                 "backup": bak, "path": path}
     r = _run(["ipconfig", "/flushdns"], timeout=10)
     return {"step": "修复 hosts", "ok": True, "path": path, "backup": bak,
-            "dropped": dropped[:40], "merged": merged,
+            "encoding": enc, "dropped": dropped[:40], "merged": merged,
             "out": (f"备份 {bak}\n删除屏蔽 {len(dropped)} 条："
                     f"{', '.join(dropped[:5]) or '无'}\n合并重复 {merged} 条\n"
                     f"补回标准回环 localhost\nflushdns rc={r['code']}")}
@@ -946,7 +1175,9 @@ def repair(app: Any, actions: list[str] | None = None) -> dict[str, Any]:
         before_level = (probe(app) or {}).get("level")
     except Exception:  # noqa: BLE001
         pass
-    ok = any(s.get("ok") for s in steps)
+    # 全部成功才算成功。以前用 any()：4 步里 1 步成功就显示「修复完成」，
+    # 用户以为好了，实际 DNS / 系统代理还坏着，下次还是断网。
+    ok = bool(steps) and all(bool(s.get("ok")) for s in steps)
     pending = sorted({s.get("need_admin") and s.get("action") for s in steps if s.get("need_admin")})
     return {"ok": ok, "steps": steps, "level_after": before_level,
             "pending_admin": [a for a in pending if a],

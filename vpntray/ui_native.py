@@ -251,6 +251,11 @@ def available() -> tuple[bool, str]:
         import webview  # noqa: F401
     except Exception as e:  # noqa: BLE001
         return False, f"没装 pywebview（{type(e).__name__}: {e}）"
+    if not webview2_version():
+        # 缺 WebView2 时必失败，还要白等 2.5s 才在日志里猜原因；直接点名，调用方
+        # 会立刻退到 Edge/Chrome 窗口那条路
+        return False, ("缺 WebView2 运行时（原生窗口依赖它）：请安装 "
+                       "Microsoft Edge WebView2 Runtime，或改用 Edge/Chrome 窗口")
     return True, ""
 
 
@@ -360,6 +365,107 @@ def _wait_browser_window(before: dict[int, str], wait: float) -> tuple[bool, str
     return False, ""
 
 
+class SpawnResult(tuple):
+    """spawn() 的返回值：仍是 (ok, msg) 二元组，另外挂了 pending / proc。
+
+    为什么还要保留二元组：run.pyw、app.py、webui 都在按 `ok, msg = spawn()`
+    解包，改成三元组会把别人的代码全打挂；tuple 子类既能照旧解包，又能让
+    调用方拿到「其实还没确认窗口出现」这个事实和可 kill 的 Popen 句柄。
+    """
+
+    def __new__(cls, ok: bool, msg: str, pending: bool = False, proc=None):
+        inst = super().__new__(cls, (bool(ok), msg))
+        inst.pending = bool(pending)
+        inst.proc = proc
+        return inst
+
+
+# 超时但还没确认窗口出现的那些启动尝试：留着句柄，别让它们变成看不见的
+# pythonw.exe —— 用户再点一次控制台，进程就再多一个
+_PENDING: dict[int, object] = {}
+_PENDING_LOCK = threading.Lock()
+
+_WEBVIEW2_GUID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+
+
+def webview2_version() -> str:
+    """本机 WebView2 运行时版本；没有则返回空串。
+
+    原生窗口（pywebview 的 edgechromium 后端）完全依赖它。缺的时候 pythonnet
+    抛的异常跟 WebView2 毫无字面关系，用户只看到「窗口无法启动」，根因还得
+    翻日志。读注册表就能直接点名，代价是一次本地查询。
+    """
+    if sys.platform != "win32":
+        return ""
+    try:
+        import winreg
+    except Exception:  # noqa: BLE001
+        return ""
+    probes = [
+        (winreg.HKEY_LOCAL_MACHINE,
+         rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_GUID}"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_GUID}"),
+        (winreg.HKEY_CURRENT_USER,
+         rf"Software\Microsoft\EdgeUpdate\Clients\{_WEBVIEW2_GUID}"),
+    ]
+    for root, sub in probes:
+        try:
+            with winreg.OpenKey(root, sub) as k:
+                pv, _ = winreg.QueryValueEx(k, "pv")
+        except Exception:  # noqa: BLE001
+            continue
+        if str(pv).strip():
+            return str(pv).strip()
+    # 固定版本（fixed version）部署不一定写注册表，安装目录也算数
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                 os.environ.get("LOCALAPPDATA")):
+        if not base:
+            continue
+        try:
+            if (Path(base) / "Microsoft" / "EdgeWebView" / "Application").is_dir():
+                return "unknown"
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+def _webview2_short() -> str:
+    """失败信息里的一句话后缀；没缺就返回空串。"""
+    return "" if webview2_version() else "（本机缺 WebView2 运行时）"
+
+
+def _webview2_hint() -> str:
+    """对话框用的完整提示；没缺就返回空串。"""
+    if webview2_version():
+        return ""
+    return ("\n\n本机没检测到 WebView2 运行时 —— 原生窗口必须依赖它。\n"
+            "装 Microsoft Edge WebView2 Runtime 后重试即可，"
+            "或者直接用下面的 Edge/Chrome 窗口打开控制台。")
+
+
+def pending_processes() -> list:
+    """spawn() 超时那批「还在启动」的窗口进程（仍然活着的 Popen 句柄）。"""
+    with _PENDING_LOCK:
+        return [x for x in _PENDING.values() if getattr(x, "poll", lambda: 0)() is None]
+
+
+def kill_pending() -> int:
+    """结束这些还没确认出现的窗口进程，返回真杀掉的个数。"""
+    killed = 0
+    with _PENDING_LOCK:
+        procs = list(_PENDING.values())
+        _PENDING.clear()
+    for x in procs:
+        try:
+            if x.poll() is None:
+                x.kill()
+                killed += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return killed
+
+
 def spawn(port: int = 7892, wait: float = SPAWN_WAIT) -> tuple[bool, str]:
     """另起一个窗口进程，并**确认它真的活下来了**。
 
@@ -400,15 +506,23 @@ def spawn(port: int = 7892, wait: float = SPAWN_WAIT) -> tuple[bool, str]:
     while time.time() < deadline:
         time.sleep(0.25)
         if _find_console_window():
-            return True, ""
+            return SpawnResult(True, "")
         rc = proc.poll()
         if rc is not None:
             # 秒退：多半是程序集加载失败，把退出码带回去便于排查
-            return False, f"窗口进程立即退出（exit={rc}）"
-    # 超时但进程还活着：慢机器上首次加载 WebView2 可能要几秒，先算成功
+            return SpawnResult(False, f"窗口进程立即退出（exit={rc}）{_webview2_short()}")
+    # 超时但进程还活着：慢机器上首次加载 WebView2 可能要几秒。
+    # 这时**不能再报成功**（父进程会以为窗口已开，于是既不开浏览器也不报错，
+    # 用户看到的就是「点了没反应」），也不能报失败（会再开第二个窗口）。
+    # 折中：ok 仍是 True 免得重复开窗，pending=True 表示还没确认，句柄留着重试/兜杀。
     if proc.poll() is None:
-        return True, "（启动较慢）"
-    return False, f"窗口进程退出（exit={proc.returncode}）"
+        with _PENDING_LOCK:
+            _PENDING[proc.pid] = proc
+        log.info("窗口进程 PID %s 已启动，但 %ss 内没出现窗口，标记 pending",
+                 proc.pid, wait)
+        return SpawnResult(True, f"（窗口进程 PID {proc.pid} 仍在启动）",
+                           pending=True, proc=proc)
+    return SpawnResult(False, f"窗口进程退出（exit={proc.returncode}）{_webview2_short()}")
 
 
 def _browser_candidates() -> list[tuple[str, Path]]:
@@ -526,8 +640,13 @@ def open_console(port: int = 7892) -> str:
 
     ok, why = available()
     if ok and not _native_known_bad():
-        good, err = spawn(port)
+        res = spawn(port)
+        good, err = res
         if good:
+            if getattr(res, "pending", False):
+                # 进程还在启动：别当失败（会再开一个），也别当「已打开」，
+                # 只把 PID 记进日志，必要时 kill_pending() 兜杀
+                log.info("原生窗口仍在启动中：%s（可 kill_pending() 兜杀）", err)
             return "window"
         log.warning("原生窗口起不来：%s", err)
         # 大概率是 MOTW 拦住了程序集，清一次再试
@@ -688,7 +807,8 @@ def run(port: int = 7892, title: str = TITLE_PREFIX) -> int:
             "控制台窗口无法启动：\n\n"
             f"{type(e).__name__}: {e}\n\n"
             "常见原因：pythonnet/.NET 被安全软件挡住、文件被标记为「来自 Internet」，"
-            "或缺少 WebView2 运行时。\n"
+            "或缺少 WebView2 运行时。"
+            f"{_webview2_hint()}\n"
             f"关掉本提示后程序会自动改用 Edge/Chrome 窗口打开 "
             f"http://127.0.0.1:{port}/ 。",
         )

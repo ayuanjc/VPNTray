@@ -40,7 +40,64 @@ CACHE_MIN = 5
 CACHE_MAX = 600
 CACHE_MAX_ITEMS = 2000
 MAX_INFLIGHT = 32
+MAX_TCP_CONNS = 16
 PROBE_HOST = "www.baidu.com"
+
+
+def _bind_exclusive(sock: socket.socket) -> None:
+    """按平台选绑定选项：Windows 用独占，其它平台用可复用。
+
+    Windows 上只设 SO_REUSEADDR 是危险的：别的进程可以抢同一个端口并「共享」它，
+    内核按到达顺序把包分给其中一个 socket —— 表现为端口看起来在监听、一半查询
+    却石沉大海。SO_EXCLUSIVEADDRUSE 能保证「要么我独占，要么我绑不上」，
+    于是 port_busy() 也能说实话。
+    """
+    opt = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if opt is not None:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, 1)
+            return
+        except OSError:
+            pass          # 老系统/受限环境不支持时退回下面的可复用写法
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
+def _recv_exact(sock: socket.socket, need: int) -> bytes | None:
+    """读满 need 字节；对端提前关闭返回 None（TCP 长度前缀协议要用）。"""
+    buf = b""
+    while len(buf) < need:
+        chunk = sock.recv(need - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _reply_ok(query: bytes, resp: bytes) -> bool:
+    """应答是不是「这次查询」的有效回答：ID 对得上、QR=1、头部完整。
+
+    不校验就等于把第一个到达的包当答案：本机别的解析器、上一个超时请求的
+    迟到应答都会串进来，客户端拿到 ID 不对的包直接丢弃 —— 用户看到的是
+    「偶尔解析不出来」，而日志里一片正常。
+    """
+    if len(resp) < 12:
+        return False
+    if resp[:2] != query[:2]:
+        return False
+    return bool(resp[2] & 0x80)
+
+
+def _servfail(query: bytes) -> bytes:
+    """上游全挂时给客户端一个规范 SERVFAIL。
+
+    以前是干脆不回包，客户端要干等到自己的超时（有的实现 5 秒以上），
+    而且分辨不出是本机解析器坏了还是网断了。回 SERVFAIL 至少立刻结束等待。
+    """
+    if len(query) < 12:
+        return b""
+    flags = 0x8182                       # QR=1 RD=1 RA=1 rcode=2(SERVFAIL)
+    return (query[:2] + struct.pack("!H", flags) + query[4:6]
+            + b"\x00\x00" * 3 + query[12:])
 
 
 def _build_query(name: str, qtype: int = 1) -> tuple[int, bytes]:
@@ -130,7 +187,7 @@ def port_busy(port: int = DEFAULT_PORT) -> bool:
     """53 上是不是已经有人在服务（别的软件、或者本程序上一次的实例）。"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _bind_exclusive(sock)
         sock.bind((LISTEN_HOST, port))
         return False
     except OSError:
@@ -153,6 +210,7 @@ class DnsGuard:
         self._running = False
         self._threads: list[threading.Thread] = []
         self._inflight = threading.Semaphore(MAX_INFLIGHT)
+        self._tcp_conns = threading.Semaphore(MAX_TCP_CONNS)
         self.queries = 0
         self.hits = 0
         self.errors = 0
@@ -170,7 +228,7 @@ class DnsGuard:
         if self._running:
             return True
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _bind_exclusive(udp)
         try:
             udp.bind((LISTEN_HOST, self.port))
         except OSError as e:
@@ -179,7 +237,7 @@ class DnsGuard:
             log.info("DNS 兜底未启动：%s", self.reason)
             return False
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _bind_exclusive(tcp)
         try:
             tcp.bind((LISTEN_HOST, self.port))
             tcp.listen(16)
@@ -210,6 +268,12 @@ class DnsGuard:
             except OSError:
                 pass
         self._udp = self._tcp = None
+        # 关 socket 只会让 recvfrom/accept 抛错退出，线程本身还要一小会儿才结束；
+        # 不等它们，紧随其后的 start() 会在旧线程还持着循环变量时重新绑端口。
+        for t in self._threads:
+            if t is not threading.current_thread() and t.is_alive():
+                t.join(timeout=1.0)
+        self._threads = []
         if self.started_at:
             log.info("DNS 兜底已停止（共 %d 次查询，命中缓存 %d 次）",
                      self.queries, self.hits)
@@ -226,28 +290,75 @@ class DnsGuard:
                 return data[:2] + hit[1][2:]
             if hit:
                 self._cache.pop(key, None)
+        last = ""
         for host in self.upstreams:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(QUERY_TIMEOUT)
-            try:
-                sock.sendto(data, (host, 53))
-                resp, _ = sock.recvfrom(4096)
-                if len(resp) < 12:
-                    continue
-                self.upstream_ok += 1
-                ttl = _read_ttl(resp)
-                with self._lock:
-                    if len(self._cache) >= CACHE_MAX_ITEMS:
-                        self._cache.clear()
-                    self._cache[key] = (now + ttl, resp)
-                return resp
-            except OSError:
+            resp = self._query_udp(host, data)
+            if resp is None:
+                last = f"{host} 无应答"
                 continue
-            finally:
-                sock.close()
+            if resp[2] & 0x02:
+                # TC 位置位：UDP 装不下完整应答，按协议必须改走 TCP 重查，
+                # 否则客户端拿到的是被截断的包，等于解析失败。
+                tcp = self._query_tcp(host, data)
+                if tcp is None:
+                    last = f"{host} 应答被截断且 TCP 重查失败"
+                    continue
+                resp = tcp
+            rcode = resp[3] & 0x0F
+            if rcode in (2, 5):
+                # SERVFAIL / REFUSED 是「这家上游自己有问题」，不是答案；
+                # 以前把它当成功应答缓存下来，用户会连续几分钟解析到 SERVFAIL。
+                last = f"{host} 返回 rcode={rcode}"
+                continue
+            self.upstream_ok += 1
+            ttl = _read_ttl(resp)
+            with self._lock:
+                if len(self._cache) >= CACHE_MAX_ITEMS:
+                    self._cache.clear()
+                self._cache[key] = (now + ttl, resp)
+            return resp
         self.errors += 1
-        self.last_error = "上游全部无应答（" + ", ".join(self.upstreams) + "）"
+        self.last_error = "上游全部不可用（" + (last or "无应答") + "）"
         return None
+
+    def _query_udp(self, host: str, data: bytes) -> bytes | None:
+        """向单个上游查一次，带来源与报文校验（见 _reply_ok）。"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(QUERY_TIMEOUT)
+        try:
+            sock.sendto(data, (host, 53))
+            deadline = time.time() + QUERY_TIMEOUT
+            while time.time() < deadline:
+                resp, addr = sock.recvfrom(4096)
+                if addr[0] != host:      # 不是我们问的那台，多半是串包
+                    continue
+                if not _reply_ok(data, resp):
+                    continue
+                return resp
+        except OSError:
+            return None
+        finally:
+            sock.close()
+        return None
+
+    def _query_tcp(self, host: str, data: bytes) -> bytes | None:
+        """TCP 重查（RFC 1035：2 字节长度前缀）。只在 TC 置位时用。"""
+        try:
+            with socket.create_connection((host, 53), timeout=QUERY_TIMEOUT) as sock:
+                sock.settimeout(QUERY_TIMEOUT)
+                sock.sendall(struct.pack("!H", len(data)) + data)
+                head = _recv_exact(sock, 2)
+                if head is None:
+                    return None
+                need = struct.unpack("!H", head)[0]
+                if need <= 0:
+                    return None
+                body = _recv_exact(sock, need)
+                if body is None or not _reply_ok(data, body):
+                    return None
+                return body
+        except OSError:
+            return None
 
     def _udp_loop(self) -> None:
         udp = self._udp
@@ -265,6 +376,8 @@ class DnsGuard:
             def handle(payload: bytes = data, peer: Any = addr) -> None:
                 try:
                     resp = self._resolve(payload)
+                    if not resp:
+                        resp = _servfail(payload)
                     if resp:
                         udp.sendto(resp, peer)
                 except OSError:
@@ -281,9 +394,18 @@ class DnsGuard:
                 conn, _addr = tcp.accept()
             except OSError:
                 break
+            # 连接数上限：以前每个连接一个线程且不设上限，一个死循环客户端
+            # 就能把线程数堆到几千，进程直接被拖死。
+            if not self._tcp_conns.acquire(blocking=False):
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
 
             def handle(c: socket.socket = conn) -> None:
                 try:
+                    # 空闲超时：客户端连上却不发数据时，不能让它一直占着一个线程。
                     c.settimeout(QUERY_TIMEOUT + 3)
                     head = b""
                     while len(head) < 2:
@@ -300,6 +422,8 @@ class DnsGuard:
                         body += chunk
                     self.queries += 1
                     resp = self._resolve(body)
+                    if not resp:
+                        resp = _servfail(body)
                     if resp:
                         c.sendall(struct.pack("!H", len(resp)) + resp)
                 except OSError:
@@ -309,6 +433,7 @@ class DnsGuard:
                         c.close()
                     except OSError:
                         pass
+                    self._tcp_conns.release()
 
             threading.Thread(target=handle, daemon=True).start()
 
@@ -392,8 +517,13 @@ def watch(interval: float = 20.0, enabled=None) -> None:
 
 def unwatch() -> None:
     global _watch_thread
+    t = _watch_thread
     _watch_stop.set()
     _watch_thread = None
+    # 必须 join：不 join 的话快速开关会留下两个 watch 线程 —— 旧的还在 sleep，
+    # 新的已经起来，同一时刻两个线程各自动 stop/start 同一个 guard。
+    if t is not None and t is not threading.current_thread() and t.is_alive():
+        t.join(timeout=3.0)
 
 
 def stop() -> None:

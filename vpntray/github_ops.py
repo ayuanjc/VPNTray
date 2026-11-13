@@ -26,6 +26,7 @@ from .api import ApiError
 # 和 app.py 共用同一个 logger 名字，日志才落在同一份 app.log 里
 log = logging.getLogger("app")
 CREATE_NO_WINDOW = 0x08000000
+_UA = "VPNTray-github-check/1.0"   # 固定 UA：默认的 python-requests 会被部分节点风控
 
 # 探针按「GitHub 实际会走到的域名」排：网页、API、raw 源文件、Release
 # 资产、容器镜像。只 ping github.com 是不够的 —— 这台机器上就出现过
@@ -61,11 +62,18 @@ class GithubOps:
         return shutil.which("git") or ""
 
     def git_env(self, port: int) -> dict[str, str]:
-        """git 子进程只走我们的代理，别继承 shell 里的坏代理变量。"""
+        """git 子进程只走我们的代理，别继承 shell 里的坏代理变量。
+
+        port 目前不参与过滤，保留参数是为了和调用点一致（代理地址由 -c 传）。
+        """
         env = {k: v for k, v in os.environ.items()
                if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
         env["NO_PROXY"] = "127.0.0.1,localhost"
         env["GIT_TERMINAL_PROMPT"] = "0"     # 要账号就直接失败，别把线程挂住
+        # 带凭据管理器的 git 会弹 GUI 登录框：后台线程里弹窗等于把整个自检挂死，
+        # 用户还看不到是谁弹出的。这两项把它按住。
+        env["GCM_INTERACTIVE"] = "never"
+        env["GIT_ASKPASS"] = "echo"
         return env
 
     def git_probe(self, port: int | None = None) -> dict[str, Any]:
@@ -80,11 +88,11 @@ class GithubOps:
                "ls-remote", "--heads", "https://github.com/git/git"]
         t0 = time.time()
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=25,
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
                                env=self.git_env(port), encoding="utf-8",
                                errors="replace", creationflags=CREATE_NO_WINDOW)
         except subprocess.TimeoutExpired:
-            return {"ok": False, "refs": 0, "ms": 25000, "error": "git 25s 没拉完（链路太慢或断流）"}
+            return {"ok": False, "refs": 0, "ms": 15000, "error": "git 15s 没拉完（链路太慢或断流）"}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "refs": 0, "error": f"{type(e).__name__}: {e}"}
         out = (p.stdout or "").strip()
@@ -99,26 +107,28 @@ class GithubOps:
 
     # ── 五链探针 ─────────────────────────────────────────
     def probe_web(self, port: int) -> list[dict[str, Any]]:
-        s = requests.Session()
-        s.trust_env = False          # 别让系统 http_proxy 变量二次套娃
+        """五项链路探针。成功只看 HTTP 状态码，不看「有没有抛异常」。"""
         px = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
         out: list[dict[str, Any]] = []
-        for key, label, url in GITHUB_PROBES:
-            t0 = time.time()
-            code, err = 0, ""
-            try:
-                r = s.get(url, proxies=px, timeout=8, allow_redirects=False,
-                          headers={"User-Agent": "VPNTray-github-check",
-                                   "Cache-Control": "no-store"})
-                code = int(r.status_code)
-            except Exception as e:  # noqa: BLE001
-                err = f"{type(e).__name__}: {e}"[:140]
-            ms = int((time.time() - t0) * 1000)
-            # 401 / 403 / 404 也说明 TCP + TLS + HTTP 全程通了，只有 5xx 和
-            # 异常才算这条链路坏 —— 用「必须 200」判会把 ghcr 永远判成失败。
-            out.append({"key": key, "label": label, "url": url,
-                        "ok": bool(code and code < 500), "code": code,
-                        "ms": ms, "error": err})
+        # with：自检是 40 秒一轮的轮询，Session 不关会一路涨句柄和 keep-alive 连接
+        with requests.Session() as s:
+            s.trust_env = False      # 别让系统 http_proxy 变量二次套娃
+            for key, label, url in GITHUB_PROBES:
+                t0 = time.time()
+                code, err = 0, ""
+                try:
+                    with s.get(url, proxies=px, timeout=8, allow_redirects=False,
+                               headers={"User-Agent": _UA,
+                                        "Cache-Control": "no-store"}) as r:
+                        code = int(r.status_code)
+                except Exception as e:  # noqa: BLE001
+                    err = f"{type(e).__name__}: {e}"[:140]
+                ms = int((time.time() - t0) * 1000)
+                # 401 / 403 / 404 也说明 TCP + TLS + HTTP 全程通了，只有 5xx 和
+                # 异常才算这条链路坏 —— 用「必须 200」判会把 ghcr 永远判成失败。
+                out.append({"key": key, "label": label, "url": url,
+                            "ok": bool(code and 0 < code < 500), "code": code,
+                            "ms": ms, "error": err})
         return out
 
     def check(self, heal: bool = True) -> dict[str, Any]:
@@ -216,12 +226,16 @@ class GithubOps:
         port = _mix_port(app.settings)
         want = f"http://127.0.0.1:{port}"
         changed: list[str] = []
+        # 必须带 git_env：不带的话 git 会用用户环境里的凭据管理器弹 GUI 登录框，
+        # 而后台线程里没人能点它，自检就一直卡在这里。
+        genv = self.git_env(port)
         for key in ("http.proxy", "https.proxy"):
             try:
-                cur = subprocess.run([exe, "config", "--global", "--get", key],
-                                     capture_output=True, text=True, timeout=8,
-                                     encoding="utf-8", errors="replace",
-                                     creationflags=CREATE_NO_WINDOW).stdout.strip()
+                p = subprocess.run([exe, "config", "--global", "--get", key],
+                                   capture_output=True, text=True, timeout=8,
+                                   env=genv, encoding="utf-8", errors="replace",
+                                   creationflags=CREATE_NO_WINDOW)
+                cur = (p.stdout or "").strip()
             except Exception as e:  # noqa: BLE001
                 log.info("读 git %s 失败，跳过: %s", key, e)
                 continue
@@ -231,11 +245,16 @@ class GithubOps:
                 log.info("git %s 指向外部代理 %s，不自动改", key, cur)
                 continue
             try:
-                subprocess.run([exe, "config", "--global", key, want],
-                               capture_output=True, text=True, timeout=8,
-                               creationflags=CREATE_NO_WINDOW)
+                p = subprocess.run([exe, "config", "--global", key, want],
+                                   capture_output=True, text=True, timeout=8,
+                                   env=genv, creationflags=CREATE_NO_WINDOW)
             except Exception as e:  # noqa: BLE001
                 log.info("git %s 改写失败: %s", key, e)
+                continue
+            # 以前不看返回码：git 配置写不进去也当成改好了，界面显示已对齐，
+            # 用户下次 clone 照样 unexpected eof。
+            if p.returncode != 0:
+                log.info("git %s 改写失败（exit %s）", key, p.returncode)
                 continue
             changed.append(f"{key} {cur} → {want}")
         if changed:

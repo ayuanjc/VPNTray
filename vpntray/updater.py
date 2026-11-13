@@ -6,8 +6,13 @@
 - **替换交给外部 bat**。onedir 打包后主进程正占着 VPNTray.exe 和 _internal 里
   几百个文件，运行中覆盖自己一定失败。所以下载解压都做完，最后写一个等待脚本
   丢给系统执行，主进程正常退出（这样 mihomo 和系统代理才会被清干净）。
-- **覆盖不删除**。robocopy /E 只写同名文件，用户的 data/ 里那些订阅、日志、
-  纯净度缓存不会被新包里的 data/purity.json 顺手带走。
+- **镜像覆盖但保住 data/，并留一份回滚**。robocopy /MIR 会把新包里没有的旧文件
+  删掉（只覆盖不删的话，换过一版以后残留的旧模块还会被加载，出问题极难排查）；
+  data/ 用 /XD 排除在外，订阅、设置、日志、纯净度缓存都不参与镜像。覆盖前先把
+  旧版本整份镜像到 data/update/rollback，镜像失败就从那里恢复，用户不会面对一个
+  打不开的软件。
+- **没有 SHA256 的包一律不装**。哈希取不到时自动更新直接拒绝：缺哈希等于允许
+  任何人中途换一个 exe 上来。只有用户手动确认（confirm=True）才继续。
 """
 from __future__ import annotations
 
@@ -18,11 +23,12 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import requests
 
@@ -38,6 +44,15 @@ ALLOWED_HOSTS = {"github.com", "api.github.com", "objects.githubusercontent.com"
 
 MAX_ZIP_BYTES = 300 * 1024 * 1024     # 发布包 70MB 上下，留足余量
 MAX_JSON_BYTES = 4 * 1024 * 1024
+# 解压后的字节预算。只卡条目数挡不住 zip 炸弹：单个条目声明的 file_size
+# 就能是几十 GB，真写下去磁盘直接满，托盘程序表现为「更新卡死」。
+MAX_UNPACKED_BYTES = 1200 * 1024 * 1024
+MAX_FILE_UNPACKED = 400 * 1024 * 1024
+
+# 所有网络请求共用的超时：GitHub 在国内要借内核的代理口出去，卡住时必须
+# 自己断开，不能让一次「检查更新」把后台线程长期占住。
+NET_TIMEOUT = 12.0
+MAX_REDIRECTS = 5
 
 # owner/name 只允许 GitHub 的合法字符，禁止斜杠以外的路径、空格、协议头。
 # 用户从设置页手填时最容易写成 https://github.com/owner/name 或 owner/name/ ，
@@ -70,7 +85,8 @@ def normalize_repo(raw: Any) -> tuple[bool, str, str]:
         return False, s, "owner/name 里有非法字符"
     return True, s, ""
 
-REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9._-]{1,100}$")
+# 以前 REPO_RE 在这里被重新定义过一次：两份规则不一样（第一份允许 - 或 . 开头），
+# 后者把前者盖掉了，看代码时永远只改到「看起来在用」的那个。只留上面一份。
 # tag 常带后缀：v1.8.0-beta、1.8.0+build7、v2.0.0-rc1。后缀不参与比较，
 # 否则一个 -beta 后缀就能让「有没有新版本」整个判定失效。
 VER_RE = re.compile(r"^v?(\d+(?:\.\d+)*)(?:[-+~][0-9A-Za-z.\-+]*)?$")
@@ -119,12 +135,53 @@ def _proxies(local_port: int | None) -> dict[str, str] | None:
     return {"http": p, "https": p}
 
 
-def _get(url: str, proxies: dict[str, str] | None, timeout: float = 12.0) -> requests.Response:
+def _check_host(url: str) -> None:
     host = (urlparse(url).hostname or "").lower()
     if host not in ALLOWED_HOSTS:
-        raise UpdateError(f"拒绝从非 GitHub 地址下载：{host or url}")
-    r = requests.get(url, headers={"User-Agent": UA, "Accept": "application/vnd.github+json"},
-                     proxies=proxies, timeout=timeout, stream=True)
+        raise UpdateError(f"拒绝访问非 GitHub 地址：{host or url}")
+
+
+def _request(url: str, proxies: dict[str, str] | None, timeout: float,
+             method: str = "GET") -> requests.Response:
+    """手动跟重定向的请求：每一跳都过一遍 GitHub 白名单。
+
+    以前只校验首跳域名，然后 allow_redirects=True 让 requests 自己跟：一个被污染
+    的 302 就能把请求带去任意主机（顺走 token，或者直接下一个 exe 回来覆盖自己）。
+    顺带在这里做重试：只对连接层的瞬时故障重试 2 次，指数退避。
+    """
+    cur = url
+    hops = 0
+    while True:
+        _check_host(cur)
+        r = None
+        for attempt in range(3):
+            try:
+                r = requests.request(
+                    method, cur,
+                    headers={"User-Agent": UA, "Accept": "application/vnd.github+json"},
+                    proxies=proxies, timeout=timeout, allow_redirects=False, stream=True,
+                )
+                break
+            except requests.RequestException:
+                # 403/404 之类的业务错误交给调用方判断，这里只兜连接抖动
+                if attempt >= 2:
+                    raise
+                time.sleep(0.6 * (2 ** attempt))
+        if r is None:      # 理论上到不了，兜底免得 mypy/人读代码时猜
+            raise UpdateError("请求未能发出")
+        loc = r.headers.get("Location") or ""
+        if r.status_code in (301, 302, 303, 307, 308) and loc:
+            r.close()
+            hops += 1
+            if hops > MAX_REDIRECTS:
+                raise UpdateError("GitHub 重定向次数过多")
+            cur = urljoin(cur, loc)
+            continue
+        return r
+
+
+def _get(url: str, proxies: dict[str, str] | None, timeout: float = NET_TIMEOUT) -> requests.Response:
+    r = _request(url, proxies, timeout)
     if r.status_code == 404:
         r.close()
         raise UpdateError("仓库或 Release 不存在（404）")
@@ -163,6 +220,7 @@ def check(repo: str, current: str, local_port: int | None = None,
                f"/VPNTray-{latest}-win64.zip")
     size = _head_size(zip_url, proxies, timeout)
     page = f"{GH}/{repo}/releases/tag/{quote(tag, safe='')}"
+    sha = ""
 
     if size == 0:
         # 约定名不存在（手动发布的包名不统一）：退回 API 找资产
@@ -171,6 +229,7 @@ def check(repo: str, current: str, local_port: int | None = None,
             zip_url = fallback.get("zip_url") or zip_url
             size = fallback.get("zip_size") or 0
             page = fallback.get("page") or page
+            sha = str(fallback.get("zip_sha256") or "").lower()
         if not size:
             return {"ok": True, "has_update": False, "current": current,
                     "latest": latest, "tag": tag,
@@ -180,9 +239,22 @@ def check(repo: str, current: str, local_port: int | None = None,
     if size < 0:
         size = 0      # 资产在，但服务端没给 Content-Length（chunked）；大小只用于显示
 
+    # is_newer 做的是数字分段比较：3.0.10 > 3.0.9 成立，而服务器给的版本比本地
+    # 低（回滚过一版）时永远是 False —— 不能把「降级」当成「有更新」推给用户。
+    has_update = is_newer(latest, current)
+    if has_update and not sha:
+        # 自动更新必须有哈希；这里就把发布方给的哈希找出来，找不到让前端直接
+        # 看到原因，而不是等到 prepare 下载完 70MB 才拒。
+        sha = _resolve_zip_sha(repo, tag, zip_url, proxies, timeout)
+    if has_update and not sha:
+        # 最后一条路：API 资产的 digest（可能撞 60 次/时限流，所以放到最后）
+        api = _api_release(repo, proxies, timeout)
+        if api and str(api.get("zip_url") or "") == zip_url:
+            sha = str(api.get("zip_sha256") or "").lower()
+
     return {
         "ok": True,
-        "has_update": is_newer(latest, current),
+        "has_update": has_update,
         "current": current,
         "latest": latest,
         "tag": tag,
@@ -190,7 +262,9 @@ def check(repo: str, current: str, local_port: int | None = None,
         "page": page,
         "zip_url": zip_url,
         "zip_size": size,
-        "zip_sha256": "",      # 不走 API 就没有 digest，靠解压后 UI_VER 自证
+        # 空串 = 发布方没提供哈希。前端可以照常提示有新版本，但 prepare 会拒绝
+        # 自动安装（缺哈希等于没有完整性校验）。
+        "zip_sha256": sha,
         "published": "",
     }
 
@@ -202,13 +276,13 @@ def _req_raw(url: str, proxies: dict[str, str] | None, timeout: float,
     和 _get 的区别：_get 是给下载用的（必须 200 且校验大小），这里是给
     「看 302」和「读 header」用的，非 200 也是有效信息。
     """
-    host = (urlparse(url).hostname or "").lower()
-    if host not in ALLOWED_HOSTS:
-        raise UpdateError(f"拒绝访问非 GitHub 地址：{host or url}")
+    if allow_redirects:
+        return _request(url, proxies, timeout, method=method)
+    _check_host(url)
     return requests.request(
         method, url,
         headers={"User-Agent": UA, "Accept": "application/vnd.github+json"},
-        proxies=proxies, timeout=timeout, allow_redirects=allow_redirects, stream=True,
+        proxies=proxies, timeout=timeout, allow_redirects=False, stream=True,
     )
 
 
@@ -246,9 +320,18 @@ def _head_size(url: str, proxies: dict[str, str] | None, timeout: float) -> int:
     早期版本把「没有 Content-Length」当成「资产不存在」，结果一出新版本
     自动更新就报「没挂 VPNTray-x-win64.zip」——大小只是用来显示的，不能当存在性判据。
     """
-    try:
-        r = _req_raw(url, proxies, timeout)
+    # 先打 HEAD：只是想知道大小，没必要把整个 zip 拉下来。
+    # 有的 CDN 对 HEAD 回 403/405，那种情况再退回 GET（stream=True，读完 header 就关）。
+    for method in ("HEAD", "GET"):
         try:
+            r = _req_raw(url, proxies, timeout, method=method)
+        except (UpdateError, requests.RequestException):
+            if method == "HEAD":
+                continue
+            return 0
+        try:
+            if r.status_code in (403, 405) and method == "HEAD":
+                continue
             if r.status_code != 200:
                 return 0
             raw = r.headers.get("Content-Length")
@@ -260,8 +343,7 @@ def _head_size(url: str, proxies: dict[str, str] | None, timeout: float) -> int:
                 return -1
         finally:
             r.close()
-    except (UpdateError, requests.RequestException):
-        return 0
+    return 0
 
 
 def _html_text(s: str) -> str:
@@ -343,9 +425,73 @@ def _api_release(repo: str, proxies: dict[str, str] | None,
     }
 
 
+# `sha256sum` 的输出：<hex>  <name>；单文件 .sha256 里可能只有哈希
+_SHA_LINE = re.compile(r"\b([0-9a-fA-F]{64})\b")
+
+
+def _fetch_text(url: str, proxies: dict[str, str] | None, timeout: float,
+                limit: int = 64 * 1024) -> str:
+    """取一小段文本（.sha256 / SHA256SUMS.txt）。取不到返回空串，不抛。"""
+    try:
+        r = _req_raw(url, proxies, timeout)
+        try:
+            if r.status_code != 200:
+                return ""
+            raw = r.raw.read(limit + 1, decode_content=True)
+        finally:
+            r.close()
+    except (UpdateError, requests.RequestException, OSError):
+        return ""
+    if len(raw) > limit:
+        return ""
+    return raw.decode("utf-8", "replace")
+
+
+def _sha_from_text(text: str, name: str) -> str:
+    """从 sha256sum 格式里挑出 name 这一行的哈希。
+
+    发布脚本写的是 `hash  VPNTray.exe` 这种「哈希 + 文件名」，不同人手工上传时
+    文件名可能带路径，所以按 basename 比。整份文件只有一个哈希且没写文件名时
+    （单文件 .sha256）也认。
+    """
+    want = unquote(name or "").lower()
+    fallback = ""
+    for line in (text or "").splitlines():
+        m = _SHA_LINE.search(line)
+        if not m:
+            continue
+        got = m.group(1).lower()
+        rest = line[m.end():].strip().lstrip("*").strip()
+        if not rest:
+            # 只有哈希：单文件摘要，先记着，后面没有匹配到文件名就用它
+            fallback = fallback or got
+            continue
+        if rest.replace("\\", "/").rsplit("/", 1)[-1].lower() == want:
+            return got
+    return fallback
+
+
+def _resolve_zip_sha(repo: str, tag: str, zip_url: str,
+                    proxies: dict[str, str] | None, timeout: float) -> str:
+    """找发布包自己的 SHA256：`<zip>.sha256` → `SHA256SUMS.txt` → 空串。
+
+    release.ps1 的 SHA256SUMS.txt 只写 VPNTray.exe 和 mihomo.exe（包里的文件），
+    zip 自身的哈希写在 release/<zip>.sha256 里、由发布者贴到 release notes。所以
+    两种都试；只在真的匹配到 zip 文件名时才采信，避免把 exe 的哈希当成 zip 的。
+    """
+    name = zip_url.rsplit("/", 1)[-1]
+    base = f"{GH}/{repo}/releases/download/{quote(tag, safe='')}"
+    for url in (f"{zip_url}.sha256", f"{base}/SHA256SUMS.txt"):
+        got = _sha_from_text(_fetch_text(url, proxies, timeout), name)
+        if got:
+            log.info("更新包 SHA256 取自 %s", url)
+            return got
+    return ""
+
+
 def download(url: str, dest: Path, local_port: int | None = None,
              on_progress: Callable[[int, int], None] | None = None,
-             timeout: float = 20.0) -> Path:
+             timeout: float = NET_TIMEOUT) -> Path:
     """下载 zip 到 dest，返回 dest。超过上限直接中断。"""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -407,22 +553,37 @@ def extract(zip_path: Path, workdir: Path, expect_version: str) -> Path:
 
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            names = zf.namelist()
-            if len(names) > 20000:
+            infos = zf.infolist()
+            if len(infos) > 20000:
                 raise UpdateError("安装包内文件数异常")
-            for info in zf.infolist():
+            # 声明大小之和先卡一道：真实的炸弹包在声明上就已经超了
+            declared = sum(max(0, i.file_size) for i in infos)
+            if declared > MAX_UNPACKED_BYTES:
+                raise UpdateError(f"安装包解压后过大：{declared / 1048576:.0f} MB")
+            root_abs = payload.resolve()
+            for info in infos:
                 raw = info.filename.replace("\\", "/")
                 if raw.startswith("/") or ".." in raw.split("/"):
                     raise UpdateError(f"安装包内有可疑路径：{raw[:80]}")
+                # 字符串 startswith 会放过 `payload-evil/` 这种同前缀目录，用
+                # commonpath 比真实路径；跨盘符时 commonpath 抛 ValueError，也算越界。
                 target = (payload / raw).resolve()
-                if not str(target).startswith(str(payload.resolve())):
+                if not _inside(target, root_abs):
                     raise UpdateError("安装包路径越界")
+                if info.file_size > MAX_FILE_UNPACKED:
+                    raise UpdateError(f"安装包内单个文件过大：{raw[:60]}")
                 if info.is_dir():
                     target.mkdir(parents=True, exist_ok=True)
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
+                # 声明值不可信，写出时再数一遍实际字节
+                written = 0
                 with zf.open(info) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst, 256 * 1024)
+                    for chunk in iter(lambda: src.read(256 * 1024), b""):
+                        written += len(chunk)
+                        if written > MAX_FILE_UNPACKED:
+                            raise UpdateError(f"安装包内文件实际大小超限：{raw[:60]}")
+                        dst.write(chunk)
     except zipfile.BadZipFile as e:
         raise UpdateError(f"安装包不是有效的 zip：{e}") from e
 
@@ -441,11 +602,25 @@ def extract(zip_path: Path, workdir: Path, expect_version: str) -> Path:
             text = ""
         m = re.search(r"const\s+UI_VER\s*=\s*['\"]([^'\"]+)['\"]", text)
         found = m.group(1) if m else ""
-        if found and not found.startswith(expect_version.split(".")[0]):
-            raise UpdateError(f"安装包版本对不上：期望 {expect_version}，包里是 {found}")
-        if found and found != expect_version and not expect_version.startswith(found):
-            log.warning("安装包 UI_VER=%s，Release 标的是 %s", found, expect_version)
+        if found:
+            # 以前只比主版本前缀：3.0.9 的包能被当成 3.0.10 装上，装完还是旧
+            # 版本，界面却显示已是最新。改成逐段数字比较（补 0 对齐）。
+            fv, ev = parse_version(found), parse_version(expect_version)
+            if fv is None or ev is None:
+                raise UpdateError(f"安装包版本号无法解析：包里是 {found}")
+            width = max(len(fv), len(ev))
+            if _pad(fv, width) != _pad(ev, width):
+                raise UpdateError(f"安装包版本对不上：期望 {expect_version}，包里是 {found}")
     return root
+
+
+def _inside(path: Path, root: Path) -> bool:
+    """path 是否在 root 之内（两者都已 resolve）。"""
+    try:
+        return os.path.commonpath([str(path), str(root)]) == str(root)
+    except ValueError:
+        # 不同盘符（C: / D:）commonpath 直接抛，这种情况一定是越界
+        return False
 
 
 def find_exe_root(base: Path, exe_name: str = "VPNTray.exe") -> Path | None:
@@ -462,58 +637,96 @@ def find_exe_root(base: Path, exe_name: str = "VPNTray.exe") -> Path | None:
 
 BAT = """@echo off
 chcp 65001 >nul
-setlocal
-set "TARGET={target}"
-set "PAYLOAD={payload}"
-set "EXE={exe}"
-rem log goes to TEMP (workdir gets deleted below)
+setlocal EnableExtensions
+rem 路径一律由 launch() 通过环境变量注入：以前是把路径 format 进 .cmd 源码，
+rem 安装目录里只要出现 & % ^ 或空格，cmd 解析到那一行就会把命令拆开（把程序装在
+rem D:\\VPN & Tools\\ 这种目录下时更新必然失败）。环境变量在 set "X=%Y%" 的
+rem 引号里展开，这些字符都不会被当成控制符。
+set "TARGET=%VPNTRAY_TARGET%"
+set "PAYLOAD=%VPNTRAY_PAYLOAD%"
+set "EXE=%VPNTRAY_EXE%"
+set "WORKDIR=%VPNTRAY_WORKDIR%"
+set "ROLLBACK=%VPNTRAY_ROLLBACK%"
+rem log 写 TEMP：workdir 里的 payload 会被删掉
 set "LOG=%TEMP%\\vpntray-update.log"
 echo [%DATE% %TIME%] ==== start ==== > "%LOG%"
 echo target=%TARGET% >> "%LOG%"
 echo payload=%PAYLOAD% >> "%LOG%"
+if "%TARGET%"=="" goto noenv
+if not exist "%PAYLOAD%\\%EXE%" goto noenv
 rem 等上一份进程退出 + 让系统释放文件句柄。
-rem 这里刻意不用 tasklist：update.cmd 是用 DETACHED_PROCESS 起的，没有控制台，
-rem tasklist 在那种环境里会卡死（实测：纯 for+ping 正常，加 tasklist 一行输出都没有，
-rem 2.0.2 之前所有人卡在「更新器已启动」之后就再也没动静，就是这个原因）。
-rem 主进程那边是 os._exit(0)，进程立刻消失，固定等 3 秒足够；
-rem 万一文件还被占着，交给 robocopy 自己重试（/R:10 /W:1 = 最多 10 次、每次隔 1 秒）。
+rem 刻意不用 tasklist：update.cmd 是用 DETACHED_PROCESS 起的，没有控制台，
+rem tasklist 在那种环境里会卡死（实测纯 for+ping 正常，加 tasklist 一行输出都没有；
+rem 2.0.2 之前所有人卡在「更新器已启动」之后就没动静，就是这个原因）。
+rem 主进程那边是 os._exit(0)，进程立刻消失，固定等 3 秒足够；文件还被占着就交给
+rem robocopy 自己重试（/R:10 /W:1 = 最多 10 次、每次隔 1 秒）。
 ping -n 4 127.0.0.1 >nul
+echo backup >> "%LOG%"
+rem 覆盖前先整份备份旧版本（跳过 data：那是用户数据）。备份失败不致命，只是
+rem 覆盖失败时没有回滚点，最多让用户重下一份安装包。
+if exist "%ROLLBACK%" rmdir /s /q "%ROLLBACK%"
+robocopy "%TARGET%" "%ROLLBACK%" /E /XD "%TARGET%\\data" /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >> "%LOG%" 2>&1
+echo backup rc=%ERRORLEVEL% >> "%LOG%"
 echo copying >> "%LOG%"
-rem /E 递归  /IS 覆盖同名  /IT 保留文件属性  /NP 不刷进度
-robocopy "%PAYLOAD%" "%TARGET%" /E /IS /IT /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >> "%LOG%" 2>&1
+rem /MIR：新包里没有的旧文件要删掉。只覆盖不删的话，换过一版以后残留的旧模块、
+rem 旧 DLL 还会被加载，出问题极难查。
+rem /XD data：用户数据不参与镜像 —— 订阅、设置、日志、纯净度缓存都在 data 下。
+robocopy "%PAYLOAD%" "%TARGET%" /MIR /XD "%TARGET%\\data" /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >> "%LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 echo robocopy rc=%RC% >> "%LOG%"
-rem robocopy 的 0-7 都算成功（1=复制了文件，3=复制+多出），8 以上才是失败
-if %RC% GEQ 8 goto failed
+rem robocopy 的 0-7 都算成功（1=复制了文件，2=多出文件，3=复制+多出），8 以上才是失败
+if %RC% GEQ 8 goto restore
 start "" "%TARGET%\\%EXE%"
 echo started new version >> "%LOG%"
-rmdir /s /q "{workdir}" 2>nul
+rem 只清 payload（几百 MB）。rollback 留着：万一手抖更新到坏版本还能手动回滚。
+if exist "%WORKDIR%\\payload" rmdir /s /q "%WORKDIR%\\payload"
 (goto) 2>nul & del "%~f0"
 exit /b 0
-:failed
-rem 覆盖失败就把旧版本拉起来，别让用户面对一个打不开的软件
+:restore
+rem 覆盖失败：从备份镜像回去，再把旧版本拉起来，别让用户面对一个打不开的软件
+echo restore >> "%LOG%"
+if exist "%ROLLBACK%" robocopy "%ROLLBACK%" "%TARGET%" /MIR /XD "%TARGET%\\data" /R:10 /W:1 /NFL /NDL /NJH /NJS /NP >> "%LOG%" 2>&1
 start "" "%TARGET%\\%EXE%"
-echo copy failed, rolled back to old version >> "%LOG%"
+echo copy failed, restored from rollback >> "%LOG%"
 (goto) 2>nul & del "%~f0"
 exit /b 1
+:noenv
+rem 路径清单没拿到（被清理软件删了/没写成功）：什么都不动，只把旧版本拉起来
+echo missing VPNTRAY_TARGET / VPNTRAY_PAYLOAD >> "%LOG%"
+if not "%TARGET%"=="" start "" "%TARGET%\\%EXE%"
+(goto) 2>nul & del "%~f0"
+exit /b 2
 """
 
 
 def stage(payload_root: Path, workdir: Path, target_root: Path | None = None,
           exe_name: str = "VPNTray.exe") -> Path:
-    """写好 update.cmd 返回它。调用方随后应该让应用正常退出。"""
+    """写好 update.cmd（附一份路径清单）并返回它。调用方随后应让应用正常退出。
+
+    路径不写进 .cmd 源码，而是落在 update.json 里、由 launch() 当环境变量传进去：
+    cmd 对没转义的 & ^ % 没有容错，而安装目录是用户自己挑的。
+    """
     target = Path(target_root or paths.ROOT).resolve()
     payload = Path(payload_root).resolve()
     workdir = Path(workdir).resolve()
     if not (payload / exe_name).exists():
         raise UpdateError("待安装目录里没有 VPNTray.exe")
     workdir.mkdir(parents=True, exist_ok=True)   # 正常由 prepare 建好，这里兜底
+    plan = {
+        "target": str(target),
+        "payload": str(payload),
+        "exe": str(exe_name),
+        "workdir": str(workdir),
+        "rollback": str(workdir / "rollback"),
+    }
+    try:
+        (workdir / "update.json").write_text(
+            json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        raise UpdateError(f"更新脚本写不出来：{e}") from e
     bat = workdir / "update.cmd"
-    bat.write_bytes(
-        BAT.format(target=str(target), payload=str(payload),
-                   exe=str(exe_name), workdir=str(workdir))
-        .replace("\n", "\r\n").encode("utf-8")
-    )
+    # 源码里是 LF，cmd 只认 CRLF；两个方向先归一，免得写出 \r\r\n
+    bat.write_bytes(BAT.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8"))
     return bat
 
 
@@ -522,10 +735,27 @@ def launch(bat: Path) -> None:
     bat = Path(bat)
     if not bat.exists():
         raise UpdateError("更新脚本没写成功")
+    # 路径清单是 stage() 写好的，这里只塞进环境变量：.cmd 全程不解析路径内容
+    plan_path = bat.parent / "update.json"
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise UpdateError(f"更新脚本的路径清单读不到：{type(e).__name__}") from e
+    if not isinstance(plan, dict) or not plan.get("target") or not plan.get("payload"):
+        raise UpdateError("更新脚本的路径清单不完整")
+    env = dict(os.environ)
+    env.update({
+        "VPNTRAY_TARGET": str(plan.get("target") or ""),
+        "VPNTRAY_PAYLOAD": str(plan.get("payload") or ""),
+        "VPNTRAY_EXE": str(plan.get("exe") or "VPNTray.exe"),
+        "VPNTRAY_WORKDIR": str(plan.get("workdir") or plan_path.parent),
+        "VPNTRAY_ROLLBACK": str(plan.get("rollback") or (plan_path.parent / "rollback")),
+    })
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     subprocess.Popen(
         ["cmd.exe", "/c", str(bat)],
         cwd=str(bat.parent),
+        env=env,
         creationflags=flags,
         close_fds=True,
         stdin=subprocess.DEVNULL,
@@ -541,8 +771,14 @@ def update_workdir() -> Path:
 
 
 def prepare(info: dict[str, Any], local_port: int | None = None,
-            on_progress: Callable[[int, int], None] | None = None) -> Path:
-    """下载 → 校验 → 解压，返回 payload 根。不重启、不动当前文件。"""
+            on_progress: Callable[[int, int], None] | None = None,
+            confirm: bool = False) -> Path:
+    """下载 → 校验 → 解压，返回 payload 根。不重启、不动当前文件。
+
+    confirm 只影响「拿不到 SHA256」这一种情况：缺哈希等于没有完整性校验，中途被
+    换包完全看不出来，所以自动更新一律拒绝；用户在界面上明确点过「仍然安装」之后
+    传 confirm=True 才继续，并把这件事写进日志。
+    """
     url = str(info.get("zip_url") or "")
     latest = str(info.get("latest") or "")
     if not url:
@@ -555,16 +791,26 @@ def prepare(info: dict[str, Any], local_port: int | None = None,
     work = update_workdir()
     work.mkdir(parents=True, exist_ok=True)
     zip_path = work / f"VPNTray-{latest}.zip"
+    proxies = _proxies(local_port)
+
+    want = str(info.get("zip_sha256") or "").strip().lower()
+    if not want:
+        # check() 已经找过一轮；这里再补一次，防止调用方手工拼 info 时漏了哈希
+        want = _resolve_zip_sha(str(info.get("repo") or ""),
+                               str(info.get("tag") or latest), url, proxies, NET_TIMEOUT)
+    if not want and not confirm:
+        # 文案要和界面上的「已跳过自动更新」对上，用户得知道为什么没装
+        raise UpdateError("无法校验更新包（缺 SHA256），已跳过自动更新")
+
     download(url, zip_path, local_port=local_port, on_progress=on_progress)
 
-    want = str(info.get("zip_sha256") or "").lower()
     if want:
         got = sha256_of(zip_path)
         if got != want:
             zip_path.unlink(missing_ok=True)
             raise UpdateError("安装包校验和不匹配，已丢弃")
     else:
-        log.warning("Release 没提供 sha256，跳过完整性校验")
+        log.warning("用户已确认在没有 SHA256 的情况下安装 %s：完整性无法验证", latest)
 
     return extract(zip_path, work, latest)
 

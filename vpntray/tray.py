@@ -7,8 +7,17 @@ import time
 from collections import OrderedDict
 from functools import partial
 
-import pystray
-from pystray import Menu, MenuItem
+# 托盘是可选组件：pystray 在 Linux 上要 GTK/AppIndicator，缺库时导入就抛。
+# 这里只降级不中断，让 webui / 命令行入口在没托盘的环境里照样能起来。
+IMPORT_ERROR = ""
+try:
+    import pystray
+    from pystray import Menu, MenuItem
+except Exception as _e:  # noqa: BLE001
+    pystray = None                    # type: ignore[assignment]
+    Menu = None                       # type: ignore[assignment]
+    MenuItem = None                   # type: ignore[assignment]
+    IMPORT_ERROR = f"托盘不可用（pystray 导入失败）：{_e}"
 
 from . import icons
 from .app import App
@@ -61,8 +70,14 @@ def _fmt_age(ts: float) -> str:
 
 class Tray:
     def __init__(self, app: App) -> None:
+        if pystray is None:
+            raise RuntimeError(IMPORT_ERROR or "托盘不可用（pystray 不可用）")
         self.app = app
         self._last_state_key: tuple | None = None
+        # 同一个动作不许并发跑两遍：托盘菜单会被连点，两个线程同时 set_mode /
+        # 重启内核会互相打脸，也会把订阅接口打出两份并发请求
+        self._bg_lock = threading.Lock()
+        self._bg_busy: set[str] = set()
         self.icon = pystray.Icon(
             "vpntray",
             icons.make_icon("busy", 64),
@@ -92,14 +107,14 @@ class Tray:
 
         # —— 模式 ——
         yield MenuItem(
-            lambda i: f"模式：{self._mode_text(st['mode'])}",
+            lambda i: f"模式：{self._mode_text(st.get('mode') or 'rule')}",
             Menu(
                 MenuItem("规则分流（国内直连）", lambda i, it: self._bg(self.app.set_mode, "rule"),
-                         checked=lambda it: st["mode"] == "rule", radio=True),
+                         checked=lambda it: (st.get("mode") or "rule") == "rule", radio=True),
                 MenuItem("全局代理", lambda i, it: self._bg(self.app.set_mode, "global"),
-                         checked=lambda it: st["mode"] == "global", radio=True),
+                         checked=lambda it: (st.get("mode") or "rule") == "global", radio=True),
                 MenuItem("全部直连", lambda i, it: self._bg(self.app.set_mode, "direct"),
-                         checked=lambda it: st["mode"] == "direct", radio=True),
+                         checked=lambda it: (st.get("mode") or "rule") == "direct", radio=True),
             ),
         )
 
@@ -128,7 +143,7 @@ class Tray:
         yield MenuItem(lambda i: self._sub_text(st), lambda i, it: self._bg(self.app.update_subscription, True))
         yield MenuItem("打开控制面板", lambda i, it: self._bg(self.app.open_dashboard))
         yield MenuItem("断开全部连接", lambda i, it: self._bg(self.app.close_connections))
-        yield MenuItem("重启内核", lambda i, it: self._bg(self.app.restart_kernel))
+        yield MenuItem("重启内核", lambda i, it: self._bg(self._restart_kernel))
         yield MenuItem("打开日志目录", lambda i, it: self._bg(self.app.open_log))
         yield Menu.SEPARATOR
         yield MenuItem("退出", lambda i, it: self._quit())
@@ -212,7 +227,7 @@ class Tray:
             return "○ 未连接"
         now = st.get("group_now") or "?"
         proxy_on = "系统代理 开" if st.get("sysproxy") else "系统代理 关"
-        return f"● {now}  [{self._mode_text(st['mode'])} · {proxy_on}]"
+        return f"● {now}  [{self._mode_text(st.get('mode') or 'rule')} · {proxy_on}]"
 
     def _traffic_text(self, st: dict) -> str:
         t = st.get("traffic") or {}
@@ -243,7 +258,51 @@ class Tray:
         return None
 
     def _bg(self, fn, *args) -> None:
-        threading.Thread(target=fn, args=args, daemon=True).start()
+        """后台执行托盘动作，同一个动作在跑时忽略重复点击。
+
+        按函数身份（__name__）判重，不同动作之间不互相阻塞：更新订阅很慢，
+        但不能因此让「重启内核」也点不动。
+        """
+        key = getattr(fn, "__name__", repr(fn))
+        with self._bg_lock:
+            if key in self._bg_busy:
+                log.debug("动作 %s 仍在执行，忽略这次点击", key)
+                return
+            self._bg_busy.add(key)
+
+        def runner() -> None:
+            try:
+                fn(*args)
+            except Exception:  # noqa: BLE001
+                log.exception("托盘动作 %s 失败", key)
+            finally:
+                with self._bg_lock:
+                    self._bg_busy.discard(key)
+
+        threading.Thread(target=runner, daemon=True, name=f"tray-{key}").start()
+
+    def _restart_kernel(self) -> None:
+        """重启内核，并把「没成」的两种原因分别说出来。
+
+        为什么不能直接把 app.restart_kernel 挂到菜单上：它现在返回 bool，菜单回调的
+        返回值没人看，重建失败就成了「点了没反应」。另外它抢不到总锁时也返回 False，
+        语义是「跳过」而不是失败（此时 state['error'] 为空），所以两种提示必须分开，
+        否则用户会在正常并发时看到一条假的失败提示。
+        """
+        try:
+            ok = self.app.restart_kernel()
+        except Exception as e:  # noqa: BLE001
+            log.exception("重启内核调用失败")
+            self.app.notify(f"内核重启失败：{e}")
+            return
+        if ok:
+            return  # 成功提示由 App 自己发，这里不重复弹
+        err = str(self.app.state.get("error") or getattr(self.app.kernel, "last_error", "") or "")
+        if err:
+            self.app.notify(f"内核重启失败：{err[:120]}")
+        else:
+            self.app.notify("内核重启被跳过：有其它任务正在操作内核，请稍后重试")
+
 
     def _toggle_auto_best(self) -> None:
         cur = bool(self.app.settings.get("auto_best", False))
@@ -272,13 +331,17 @@ class Tray:
             self.icon.icon = icons.make_icon(icon_state, 64)
             self.icon.title = self._tooltip(st)
         except Exception:  # noqa: BLE001
-            pass
+            # 换图标失败（explorer 重启、会话切换时 pystray 会抛）就别推进 key：
+            # 推进了等于「这次算更新过」，下次状态相同就不会再试，托盘会一直
+            # 停在旧图标上
+            log.debug("更新托盘图标失败", exc_info=True)
+            return
         if key != self._last_state_key:
             self._last_state_key = key
             try:
                 self.icon.update_menu()
             except Exception:  # noqa: BLE001
-                pass
+                log.debug("刷新托盘菜单失败", exc_info=True)
 
     def _tooltip(self, st: dict) -> str:
         if st.get("error"):

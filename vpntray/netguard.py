@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import winreg
 from typing import Any
@@ -36,14 +37,29 @@ PROXY_APP_PATTERNS = (
     "cloudflare-warp", "outline", "psiphon", "lantern",
 )
 
-# TUN/TAP 网卡的驱动名片段
-TUN_PATTERNS = ("wintun", "tap-", "tapwindows", "tun", "wireguard", "sing-tun",
-                "clash", "mihomo", "vpn", "wintap")
+# TUN/TAP 网卡的驱动名片段。这里刻意不放 "tun" / "vpn" 这种泛词：
+# 它们会命中 wintun0（我们自己拉起来的内核网卡）和「VPN 连接」这类系统自带拨号网卡，
+# 于是「一键清理」把自家网卡列成冲突，用户一点就断网。
+TUN_PATTERNS = ("wintun", "tap-", "tapwindows", "wintap", "wireguard",
+                "sing-tun", "tun2socks", "clash", "mihomo")
+
+# 虚拟网卡不是代理，只是名字里常带 tun/vpn，或者本身就是 TUN 的宿主。
+# 单独列出来是为了「只报真实物理网卡」：禁掉 vEthernet 只会让用户的
+# WSL / 虚拟机 / 容器断网，跟代理冲突毫无关系。
+VIRTUAL_ADAPTER_PATTERNS = (
+    "vethernet", "hyper-v", "wsl", "vmware", "virtualbox", "vbox",
+    "tailscale", "zerotier", "docker", "npcap", "bluetooth", "蓝牙",
+    "teredo", "isatap", "pseudo", "loopback",
+)
+
+# 从 GUI（pythonw / PyInstaller onedir）拉子进程时没有这个标志会闪黑框，
+# 托盘程序闪框很容易被当成「中毒了」。0 在非 Windows 上对 subprocess 无害。
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 _PS = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
-$pat = 'clash|mihomo|verge|v2ray|xray|sing-box|singbox|neko|shadowsocks|ss-local|trojan|hiddify|flclash|qv2ray|wireguard|openvpn|warp|outline|psiphon|lantern'
+$pat = 'clash|mihomo|verge|v2ray|xray|sing-box|singbox|neko|shadowsocks|ss-local|trojan|hiddify|flclash|qv2ray|wireguard|openvpn|warp|outline|psiphon|lantern|clash-meta'
 $procs = Get-CimInstance Win32_Process |
     Where-Object { $_.Name -match $pat } |
     Select-Object @{n='pid';e={[int]$_.ProcessId}},
@@ -57,27 +73,66 @@ $adaps = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } |
 """
 
 
-def _run_ps(script: str, timeout: float = 20.0) -> dict[str, Any]:
+def _no_window() -> dict[str, Any]:
+    """子进程统一加「无窗口」标志；非 Windows 平台返回空字典走安全分支。"""
+    if os.name == "nt":
+        return {"creationflags": CREATE_NO_WINDOW}
+    return {}
+
+
+def _run_ps2(script: str, timeout: float = 20.0) -> tuple[dict[str, Any], str]:
+    """跑一段 PowerShell，返回 (解析后的 JSON, 失败原因)。
+
+    失败原因要单独交出去：调用方必须能区分「扫了，没冲突」和「根本没扫成」。
+    以前一失败就返回 {}，界面显示成「没有冲突」，等于骗用户说环境已经干净了。
+    """
     try:
         p = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, timeout=timeout,
+            capture_output=True, timeout=timeout, **_no_window(),
         )
     except (OSError, subprocess.SubprocessError) as e:
         log.warning("调用 PowerShell 失败: %s", e)
-        return {}
+        return {}, f"PowerShell 启动失败: {e}"
     out = (p.stdout or b"").decode("utf-8", "replace").strip()
+    err = (p.stderr or b"").decode("utf-8", "replace").strip()
     if not out:
         if p.returncode:
-            log.debug("PowerShell 退出码 %s: %s", p.returncode,
-                      (p.stderr or b"").decode("utf-8", "replace")[:300])
-        return {}
+            log.debug("PowerShell 退出码 %s: %s", p.returncode, err[:300])
+            return {}, f"PowerShell 退出码 {p.returncode}: {err[:300]}"
+        return {}, "PowerShell 没有输出"
     try:
         data = json.loads(out)
     except ValueError:
         log.debug("PowerShell 输出不是 JSON: %s", out[:200])
-        return {}
-    return data if isinstance(data, dict) else {}
+        return {}, f"PowerShell 输出不是 JSON: {out[:200]}"
+    if not isinstance(data, dict):
+        return {}, "PowerShell 输出结构不是对象"
+    return data, ""
+
+
+def _run_ps(script: str, timeout: float = 20.0) -> dict[str, Any]:
+    """旧调用方只要数据：保持签名不变，内部走 _run_ps2。"""
+    return _run_ps2(script, timeout)[0]
+
+
+def _is_proxy_app(name: str) -> bool:
+    """进程名算不算「别的」代理客户端。
+
+    mihomo 内核有好几个发行名字：Clash.Meta 的 clash-meta.exe、Verge 的
+    verge-mihomo.exe、还有些打包直接把内核改名成 meta.exe。只认 "mihomo"
+    会漏掉它们，用户的旧内核就一直在后台和我们的抢路由表。
+    """
+    low = (name or "").lower()
+    if any(pat in low for pat in PROXY_APP_PATTERNS):
+        return True
+    stem = low[:-4] if low.endswith(".exe") else low
+    return stem in ("meta", "mihomo", "clash", "clash-meta", "verge-mihomo")
+
+
+def _is_virtual_adapter(name: str, desc: str) -> bool:
+    hay = f"{name} {desc}".lower()
+    return any(pat in hay for pat in VIRTUAL_ADAPTER_PATTERNS)
 
 
 def system_proxy_state() -> dict[str, Any]:
@@ -97,7 +152,11 @@ def scan(exclude_pids: set[int] | None = None) -> dict[str, Any]:
     当成「别人的代理」列出来，用户一点清理就把自己杀了。
     """
     exclude = set(exclude_pids or ())
-    data = _run_ps(_PS)
+    data, why = _run_ps2(_PS)
+
+    # scan_ok=False 的意思是「没扫成」，不是「扫过、没冲突」。
+    # 这两种情况给用户的结论正好相反，混在一起会让人以为机器已经干净了。
+    scan_ok = not why
 
     procs: list[dict[str, Any]] = []
     for item in data.get("procs") or []:
@@ -110,7 +169,7 @@ def scan(exclude_pids: set[int] | None = None) -> dict[str, Any]:
         if pid <= 0 or pid in exclude:
             continue
         name = str(item.get("name") or "")
-        if not any(pat in name.lower() for pat in PROXY_APP_PATTERNS):
+        if not _is_proxy_app(name):
             continue
         procs.append({"pid": pid, "name": name,
                       "path": str(item.get("path") or "")})
@@ -124,6 +183,8 @@ def scan(exclude_pids: set[int] | None = None) -> dict[str, Any]:
         hay = f"{name} {desc}".lower()
         if not any(pat in hay for pat in TUN_PATTERNS):
             continue
+        if _is_virtual_adapter(name, desc):
+            continue
         try:
             idx = int(item.get("idx") or 0)
         except (TypeError, ValueError):
@@ -136,6 +197,8 @@ def scan(exclude_pids: set[int] | None = None) -> dict[str, Any]:
         "apps": procs,
         "adapters": adapters,
         "conflict": bool(st["enabled"] or st["pac"] or procs or adapters),
+        "scan_ok": scan_ok,
+        "scan_error": why,
     }
 
 
@@ -157,19 +220,27 @@ def wipe_system_proxy() -> dict[str, Any]:
             failed.append(f"{what}: {e}")
             log.warning("清理系统代理 %s 失败: %s", what, e)
 
+    # 先把「接管前的原始值」冻结下来。清理只改当前状态，绝不改写备份 ——
+    # 备份是退出时还原的唯一依据；以前这里往备份里写 {ProxyEnable:0, ...}，
+    # 用户原本的代理设置就被永久覆盖，再想恢复也无从恢复。
+    try:
+        sysproxy.freeze_backup()  # noqa: SLF001
+    except Exception as e:  # noqa: BLE001
+        failed.append(f"冻结原始代理设置: {e}")
+        log.warning("冻结系统代理备份失败: %s", e)
+
     step(lambda: sysproxy._write("ProxyEnable", 0, winreg.REG_DWORD),  # noqa: SLF001
          "关闭 ProxyEnable")
     for name in ("ProxyServer", "AutoConfigURL", "ProxyOverride"):
         step(lambda n=name: sysproxy._delete(n), f"删除 {name}")  # noqa: SLF001
-    sysproxy._internet_set_option()  # noqa: SLF001
+    step(sysproxy._internet_set_option, "刷新 WinINet 设置")  # noqa: SLF001
 
-    # 同时把备份标记成「直连」：否则退出时 disable() 会照着老备份
-    # 把用户的旧代理又装回去，白清理一场。
+    # 用户这次是主动要直连：单独记一个标记（不动备份），
+    # 退出时就不会照着老备份把那个已经死掉的旧代理又装回去。
     try:
-        sysproxy._save_backup({"ProxyEnable": 0, "ProxyServer": None,  # noqa: SLF001
-                               "ProxyOverride": None, "AutoConfigURL": None})
+        sysproxy.mark_direct(True)  # noqa: SLF001
     except Exception as e:  # noqa: BLE001
-        failed.append(f"重置备份: {e}")
+        failed.append(f"记录直连意图: {e}")
 
     after = system_proxy_state()
     log.info("系统代理已清理：%s -> %s", before.get("server") or "空", after)
@@ -189,7 +260,7 @@ def kill_apps(pids: list[int]) -> dict[str, Any]:
             continue
         try:
             p = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                               capture_output=True, timeout=15)
+                               capture_output=True, timeout=15, **_no_window())
             ok = p.returncode == 0
             done.append({"pid": pid, "ok": ok,
                          "msg": "" if ok else (p.stderr or b"").decode("utf-8", "replace")[:120]})
@@ -200,6 +271,11 @@ def kill_apps(pids: list[int]) -> dict[str, Any]:
 
 def disable_adapters(names: list[str]) -> dict[str, Any]:
     """禁用虚拟网卡（需要管理员，否则 PowerShell 会报 Access denied）。"""
+    # 非管理员时 PowerShell 只会抛 Access denied，白跑一圈还可能弹 UAC。
+    # 直接返回结构化 need_admin，界面才能提示「以管理员身份重开」而不是静默失败。
+    if not is_admin():
+        return {"ok": False, "need_admin": True, "results": [],
+                "msg": "需要管理员权限才能禁用网卡"}
     done: list[dict[str, Any]] = []
     for name in names[:16]:
         name = str(name or "").strip()
@@ -211,7 +287,7 @@ def disable_adapters(names: list[str]) -> dict[str, Any]:
         try:
             p = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                capture_output=True, timeout=25,
+                capture_output=True, timeout=25, **_no_window(),
             )
             ok = p.returncode == 0 and b"ok" in (p.stdout or b"")
             done.append({"name": name, "ok": ok,
@@ -305,4 +381,5 @@ def portal_hint(reason: str) -> str:
 
 __all__ = ["scan", "wipe_system_proxy", "kill_apps", "disable_adapters",
            "system_proxy_state", "is_admin", "PROXY_APP_PATTERNS",
+           "TUN_PATTERNS", "VIRTUAL_ADAPTER_PATTERNS",
            "portal_status", "portal_hint"]

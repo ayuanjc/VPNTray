@@ -380,6 +380,23 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
 .ndbadge { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: 0 0 8px; }
 .ndbadge.ok { background: #43a047; } .ndbadge.warn { background: #e0a800; }
 .ndbadge.bad { background: #d9534f; } .ndbadge.info { background: #8a8a8a; } .ndbadge.skip { background: #c0c0c0; }
+
+/* 深色下 .gp（浅灰字 + 半透明底）和 .ndbadge.info 的对比度只有 3:1 左右，
+   状态点几乎看不见，单独把字和点的亮度提一档；浅色沿用原值不动。 */
+html[data-theme="dark"] .gp{color:var(--ink2);border-color:var(--line2)}
+html[data-theme="dark"] .gp.ok{color:#a8d4ba}
+html[data-theme="dark"] .gp.bad{color:#f0b0a4}
+html[data-theme="dark"] .ndbadge.info{background:#b9b4aa}
+html[data-theme="dark"] .ndbadge.skip{background:#8a857c}
+html[data-theme="dark"] .empty{color:var(--ink2)}
+@media (prefers-color-scheme:dark){
+  html:not([data-theme="light"]) .gp{color:var(--ink2);border-color:var(--line2)}
+  html:not([data-theme="light"]) .gp.ok{color:#a8d4ba}
+  html:not([data-theme="light"]) .gp.bad{color:#f0b0a4}
+  html:not([data-theme="light"]) .ndbadge.info{background:#b9b4aa}
+  html:not([data-theme="light"]) .ndbadge.skip{background:#8a857c}
+  html:not([data-theme="light"]) .empty{color:var(--ink2)}
+}
 </style>
 </head>
 <body>
@@ -714,16 +731,27 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
 </div>
 
 <script>
-var UI_VER = '3.0.1';
+var UI_VER = '3.0.2';
 var $ = function (s, r) { return (r || document).querySelector(s); };
+/* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
+   （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
+var LS = {
+  get: function (k, d) { try { var v = localStorage.getItem(k); return v == null ? d : v; } catch (e) { return d; } },
+  set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  del: function (k) { try { localStorage.removeItem(k); } catch (e) {} }
+};
 var sig = {};
+var stale = {};          // patch() 因为焦点在输入框而推迟的重绘内容
 var S = null;
 var Q = '';
-var SORT = localStorage.getItem('vpn.sort') || 'delay';
-var REG = localStorage.getItem('vpn.reg') || '';
-var VIEW = localStorage.getItem('vpn.view') || 'home';
+var SORT = LS.get('vpn.sort', 'delay');
+var REG = LS.get('vpn.reg', '');
+var VIEW = LS.get('vpn.view', 'home');
 var polling = false;
-var THEME = localStorage.getItem('vpn.theme') || 'auto';
+var pollStarted = 0;     // 本轮 /api/state 的开始时间，用来兜底"旗标卡死"
+var pollFails = 0;       // 连续失败次数，决定退避间隔
+var pollTimer = null;
+var THEME = LS.get('vpn.theme', 'auto');
 var THEME_TEXT = { auto: '自动', light: '浅色', dark: '深色' };
 var THEME_ICON = {
   auto: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M12 3.6v16.8"/></svg>',
@@ -732,7 +760,7 @@ var THEME_ICON = {
 };
 function applyTheme(mode) {
   THEME = THEME_TEXT[mode] ? mode : 'auto';
-  try { localStorage.setItem('vpn.theme', THEME); } catch (e) {}
+  LS.set('vpn.theme', THEME);
   var rt = document.documentElement;
   if (THEME === 'auto') rt.removeAttribute('data-theme');
   else rt.setAttribute('data-theme', THEME);
@@ -752,6 +780,10 @@ function esc(v) {
   });
 }
 function n(v, d) { var x = Number(v); return isFinite(x) ? x : (d || 0); }
+/* 和 n() 的区别：格式化用。数值是真的就用它，不是就显示占位符，
+   别把 NaN / "NaN ms" 这种字样漏到界面上。 */
+function fixed(v, d) { var x = Number(v); return isFinite(x) ? x.toFixed(d) : '—'; }
+function rnd(v) { var x = Number(v); return isFinite(x) ? Math.round(x) : '—'; }
 function bytes(v) {
   var x = n(v), u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
   while (x >= 1024 && i < u.length - 1) { x /= 1024; i += 1; }
@@ -782,66 +814,169 @@ function dcls(ms) {
 }
 function dcell(ms) {
   if (ms == null || ms <= 0) return '<div class="dl"><i>—</i></div>';
-  return '<div class="dl ' + dcls(ms) + '"><b>' + Math.round(ms) + '</b><i>ms</i></div>';
+  return '<div class="dl ' + dcls(ms) + '"><b>' + rnd(ms) + '</b><i>ms</i></div>';
 }
 
-async function api(path, body) {
+var API_TIMEOUT = 12000;   // 状态、开关这类接口都该秒回
+var API_SLOW = 30000;      // 体检 / GitHub 自检 / 订阅拉取，调用点显式传
+/* 统一请求出口：
+   1) 一律带 AbortController。内核卡死时 await 不能永远挂着 —— 挂住意味着 finally 不执行，
+      轮询旗标就永久停在 true，面板从此不再刷新且没有任何提示；
+   2) 超时抛 code='E_TIMEOUT' 的错误，调用方可以区分"超时"和"业务失败"；
+   3) 只有 opts.strict 才向上抛，其余情况兜成 {ok:false, code:'E_TIMEOUT'}，
+      老的「if (!r || r.ok === false)」调用点不用改也能继续工作。 */
+async function api(path, body, opts) {
+  var o = opts || {};
+  var ms = n(o.timeout, 0) > 0 ? n(o.timeout) : API_TIMEOUT;
+  var ctl = null;
+  try { ctl = new AbortController(); } catch (e) { ctl = null; }
+  var timer = ctl ? setTimeout(function () { try { ctl.abort(); } catch (e) {} }, ms) : null;
   try {
     var opt = body === undefined
       ? { cache: 'no-store' }
       : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) };
+    if (ctl) opt.signal = ctl.signal;
     var r = await fetch(path, opt);
-    var j = await r.json();
-    return j || { ok: false };
+    var data = null;
+    try { data = await r.json(); } catch (e) { data = null; }
+    if (!r.ok) {
+      // 404 表示后端还没实现这个端点，要能让调用方分辨出来，不能冒充"连接断开"
+      if (data && typeof data === 'object') {
+        if (data.ok === undefined) data.ok = false;
+        data.status = r.status;
+        return data;
+      }
+      return { ok: false, status: r.status, error: '接口返回 HTTP ' + r.status };
+    }
+    if (!data || typeof data !== 'object') return { ok: false, error: '返回内容不是 JSON' };
+    data.status = r.status;
+    return data;
   } catch (e) {
+    var aborted = !!(ctl && ctl.signal && ctl.signal.aborted) || !!(e && (e.name === 'AbortError' || e.code === 'ABORT_ERR'));
+    if (aborted) {
+      var err = new Error('请求超时，内核可能没响应');
+      err.code = 'E_TIMEOUT';
+      err.timeout = true;
+      toast('请求超时，内核可能没响应', 'bad');
+      if (o.strict) throw err;
+      return { ok: false, code: 'E_TIMEOUT', timeout: true, error: err.message };
+    }
+    if (o.strict) throw e;
     return { ok: false, error: '面板与主程序断开：' + (e && e.message ? e.message : e) };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
+var TOAST_MAX = 3;                       // 同屏最多 3 条，连点操作时不会糊满半个屏幕
+var toastLast = { msg: '', at: 0 };
 function toast(msg, kind) {
   var box = $('#toasts');
   if (!box || !msg) return;
+  var now = Date.now();
+  // 同一句话 1.2 秒内重复（例如多个请求同时超时）只留一条，避免叠成一堵墙
+  if (msg === toastLast.msg && now - toastLast.at < 1200) return;
+  toastLast = { msg: msg, at: now };
   var el = document.createElement('div');
   el.className = 'toast' + (kind ? ' ' + kind : '');
   el.textContent = msg;
   box.appendChild(el);
+  while (box.children.length > TOAST_MAX) box.removeChild(box.firstChild);
   setTimeout(function () { el.classList.add('out'); }, 2400);
-  setTimeout(function () { el.remove(); }, 2680);
+  setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 2680);
 }
+var askChain = Promise.resolve();
+/* 确认框是单例 DOM：两次 ask 并发时，后一次会把前一次的按钮回调覆盖掉，
+   前一个 Promise 永远不 resolve，调用方（删除订阅、退出程序）就一直卡在 await。
+   这里改成串行队列，保证每次只有一个询问在屏幕上。 */
 function ask(title, text, okText) {
+  var p = askChain.then(function () { return askOnce(title, text, okText); },
+    function () { return askOnce(title, text, okText); });
+  askChain = p.then(function () {}, function () {});
+  return p;
+}
+function askOnce(title, text, okText) {
   return new Promise(function (resolve) {
     var box = $('#ask');
     $('#askTitle').textContent = title || '确认';
     $('#askText').textContent = text || '';
     var yes = $('#askYes'), no = $('#askNo');
     yes.textContent = okText || '确定';
+    var back = document.activeElement;
     function off() {
       box.hidden = true; yes.onclick = null; no.onclick = null; box.onclick = null;
       document.removeEventListener('keydown', onKey);
+      if (back && back.focus) { try { back.focus(); } catch (e) {} }
     }
     function done(v) { off(); resolve(v); }
-    function onKey(e) { if (e.key === 'Escape') done(false); else if (e.key === 'Enter') done(true); }
+    // Enter 交给浏览器按"当前聚焦的按钮"触发：以前无条件 done(true)，
+    // 焦点停在取消上按回车也会执行破坏性操作。Esc 仍然一律取消。
+    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); done(false); } }
     yes.onclick = function () { done(true); };
     no.onclick = function () { done(false); };
     box.onclick = function (e) { if (e.target === box) done(false); };
     document.addEventListener('keydown', onKey);
     box.hidden = false;
-    yes.focus();
+    no.focus();
   });
 }
-async function run(path, body, okMsg) {
-  var r = await api(path, body);
+async function run(path, body, okMsg, opts) {
+  var r = await api(path, body, opts);
   if (r && r.ok === false) toast(r.error || '操作失败', 'bad');
   else if (okMsg) toast(okMsg, 'good');
   return r;
 }
+/* 同类操作全局只跑一份：连点「测速」会把内核的探测队列打爆，
+   而且多个并发调用的 finally 会互相把按钮文案改错。
+   用"全局键"而不是"按按钮"：首页和节点页两个测速按钮共用 test 这个键。 */
+var BUSY = {};
+function busyStart(key, btn, label) {
+  if (BUSY[key]) return false;
+  BUSY[key] = true;
+  if (btn) {
+    // 记住原始文案，恢复时原样抄回去，别还原成写死的字符串
+    if (!btn.dataset.idleText) btn.dataset.idleText = btn.textContent;
+    btn.disabled = true;
+    btn.classList.add('busy');
+    if (label) btn.textContent = label;
+  }
+  return true;
+}
+function busyEnd(key, btn) {
+  BUSY[key] = false;
+  if (!btn || !document.body.contains(btn)) return;
+  btn.disabled = false;
+  btn.classList.remove('busy');
+  if (btn.dataset.idleText) { btn.textContent = btn.dataset.idleText; delete btn.dataset.idleText; }
+}
+async function guarded(key, btn, label, fn) {
+  if (!busyStart(key, btn, label)) return null;
+  try { return await fn(); } finally { busyEnd(key, btn); }
+}
 function patch(sel, html, keep) {
-  if (keep && document.activeElement && document.activeElement.closest && document.activeElement.closest(keep)) return;
-  if (sig[sel] === html) return;
   var el = $(sel);
   if (!el) return;
+  if (sig[sel] === html) { delete stale[sel]; return; }
+  if (keep && document.activeElement && document.activeElement.closest && document.activeElement.closest(keep)) {
+    // 焦点还在可编辑控件里：立刻重绘会冲掉用户正在输入的内容，先记下来等 focusout 补。
+    // 以前这里是直接 return，结果只要光标停在场景下拉框里，#scenes 就永久停在旧数据。
+    stale[sel] = html;
+    return;
+  }
   sig[sel] = html;
+  delete stale[sel];
   el.innerHTML = html;
 }
+function flushStale() {
+  Object.keys(stale).forEach(function (sel) {
+    var html = stale[sel];
+    delete stale[sel];
+    var el = $(sel);
+    if (!el || sig[sel] === html) return;
+    sig[sel] = html;
+    el.innerHTML = html;
+  });
+}
+document.addEventListener('focusout', function () { setTimeout(flushStale, 0); });
 
 var TITLES = {
   home: ['概览', '连接状态与实时流量'],
@@ -856,7 +991,7 @@ function setView(v) {
   if (!TITLES[v]) v = 'home';
   var prev = VIEW;
   VIEW = v;
-  localStorage.setItem('vpn.view', v);
+  LS.set('vpn.view', v);
   var i;
   var ORDER = ['home', 'nodes', 'scenes', 'tools', 'subs', 'settings'];
   var dir = '';
@@ -879,6 +1014,7 @@ function setView(v) {
 
 /* ───── 顶栏 / 侧栏状态 ───── */
 function renderTop() {
+  if (!S) return;   // 首次 /api/state 失败时 S 还是 null，别让整页渲染在这里抛错白屏
   $('#ver').textContent = 'v' + (S.ui || '');
   var pill = $('#stat'), txt = $('#statText');
   pill.className = 'pill';
@@ -922,7 +1058,7 @@ function renderTop() {
 
 /* ───── 概览 ───── */
 function renderHome() {
-  var nodes = S.nodes || [];
+  var nodes = (S && S.nodes) || [];
   var cur = S.current || '';
   var c = null, i;
   for (i = 0; i < nodes.length; i += 1) if (nodes[i].name === cur) { c = nodes[i]; break; }
@@ -936,7 +1072,7 @@ function renderHome() {
 
   var ms = c ? c.delay : null;
   var de = $('#curDelay');
-  de.textContent = (ms == null || ms <= 0) ? '—' : String(Math.round(ms));
+  de.textContent = (ms == null || ms <= 0) ? '—' : String(rnd(ms));
   de.className = 'tv num ' + (ms == null || ms <= 0 ? '' : (dcls(ms) === 'good' || dcls(ms) === 'ok' ? 'good' : dcls(ms) === 'warn' ? 'warnc' : 'badc'));
 
   var tested = nodes.filter(function (x) { return x.delay != null && x.delay > 0; }).length;
@@ -976,7 +1112,7 @@ function renderHome() {
 
 /* ───── 节点 ───── */
 function renderChips() {
-  var nodes = S.nodes || [];
+  var nodes = (S && S.nodes) || [];
   var h = '<button class="chip' + (REG ? '' : ' on') + '" data-reg="">全部 <i>' + nodes.length + '</i></button>';
   (S.regions || []).forEach(function (r) {
     if (!r.cc) return;
@@ -987,7 +1123,7 @@ function renderChips() {
 }
 function pickNodes() {
   var q = Q.trim().toLowerCase();
-  var list = (S.nodes || []).filter(function (x) {
+  var list = ((S && S.nodes) || []).filter(function (x) {
     if (REG && x.cc !== REG) return false;
     if (!q) return true;
     return String(x.name).toLowerCase().indexOf(q) >= 0
@@ -1006,7 +1142,7 @@ function renderNodes() {
   var list = pickNodes();
   var h = list.map(function (x, i) {
     var pu = x.purity == null ? '<div class="pu dim">—</div>'
-      : '<div class="pu" title="第三方纯净度评分">' + Math.round(x.purity) + '</div>';
+      : '<div class="pu" title="第三方纯净度评分">' + rnd(x.purity) + '</div>';
     var reg = x.region && x.region !== '其它' ? '<span class="rg">' + esc(x.region) + '</span>' : '';
     return '<div class="lrow' + (x.current ? ' cur' : '') + '" data-name="' + esc(x.name) + '" title="' + esc(x.name) + '">'
       + '<div class="ix">' + (i + 1) + '</div>'
@@ -1014,13 +1150,16 @@ function renderNodes() {
       + '<div class="nm">' + esc(x.name) + reg + '</div>'
       + pu + dcell(x.delay) + '</div>';
   }).join('');
-  patch('#nlist', h || '<div class="empty">没有匹配的节点</div>');
+  // 区分"一个节点都没有"和"筛掉了"：前者要指路去订阅页，否则用户会以为程序坏了
+  patch('#nlist', h || '<div class="empty">' + (((S && S.nodes) || []).length
+    ? '没有匹配的节点：清空搜索框，或点上面的「全部」'
+    : '还没有节点。到「订阅」页粘贴订阅链接，拉取成功后节点会自动出现在这里') + '</div>');
 
-  var nodes = S.nodes || [];
+  var nodes = (S && S.nodes) || [];
   var tested = nodes.filter(function (x) { return x.delay != null && x.delay > 0; });
   var best = tested.length ? Math.min.apply(null, tested.map(function (x) { return x.delay; })) : null;
   var foot = '<span>显示 ' + list.length + ' / ' + nodes.length + '</span><span>已测 ' + tested.length + '</span>';
-  if (best) foot += '<span class="num">最快 ' + Math.round(best) + ' ms</span>';
+  if (best) foot += '<span class="num">最快 ' + rnd(best) + ' ms</span>';
   foot += '<span class="grow"></span>';
   if (S.delay_error) foot += '<span class="hint err">测速失败：' + esc(S.delay_error) + (S.delay_ts ? ' · 数据 ' + ago(S.delay_ts) : '') + '</span>';
   patch('#nfoot', foot);
@@ -1036,13 +1175,14 @@ function renderNodes() {
     var pct = p.total ? Math.min(100, Math.round(100 * n(p.done) / n(p.total))) : 30;
     $('#progBar').style.width = pct + '%';
   }
-  $('#btnTest').disabled = on;
-  $('#btnTest2').disabled = on;
+  // 重绘时不能把正在进行中的测速按钮重新点亮，否则连点仍然能并发
+  $('#btnTest').disabled = on || !!BUSY.test;
+  $('#btnTest2').disabled = on || !!BUSY.test;
 }
 
 /* ───── 场景 / GitHub / AI ───── */
 function nodeOptions(cur) {
-  var list = (S.nodes || []).slice().sort(function (a, b) {
+  var list = ((S && S.nodes) || []).slice().sort(function (a, b) {
     return (a.delay == null || a.delay <= 0 ? 1e9 : a.delay) - (b.delay == null || b.delay <= 0 ? 1e9 : b.delay);
   });
   var names = list.map(function (x) { return x.name; });
@@ -1052,12 +1192,12 @@ function nodeOptions(cur) {
   }
   h += list.map(function (x) {
     return '<option value="' + esc(x.name) + '"' + (x.name === cur ? ' selected' : '') + '>'
-      + esc(x.flag || '') + ' ' + esc(x.name) + (x.delay ? ' · ' + Math.round(x.delay) + 'ms' : '') + '</option>';
+      + esc(x.flag || '') + ' ' + esc(x.name) + (x.delay ? ' · ' + rnd(x.delay) + 'ms' : '') + '</option>';
   }).join('');
   return h;
 }
 function renderScenes() {
-  var h = (S.scenes || []).map(function (sc) {
+  var h = ((S && S.scenes) || []).map(function (sc) {
     var off = !sc.enabled;
     var isRule = sc.kind === 'rule';
     var auto = !!(sc.auto && sc.auto_name && sc.node === sc.auto_name);
@@ -1066,7 +1206,7 @@ function renderScenes() {
     if (isRule) meta.push('规则 → ' + (sc.target || '主组'));
     if (auto) meta.push('自动 · ' + n(sc.auto_members || 0) + ' 个活节点里挑最快');
     if (exit) meta.push('出口 ' + exit);
-    if (sc.delay) meta.push(Math.round(sc.delay) + ' ms');
+    if (sc.delay) meta.push(rnd(sc.delay) + ' ms');
     meta.push(n(sc.domains) + ' 条匹配');
     if (!isRule) meta.push(sc.main && exit === sc.main ? '与主代理一致' : (sc.members ? n(sc.members) + ' 个候选' : '等待内核'));
     // 纯规则模块没有出口可钉，用一颗标签占住那一列，保证行对齐
@@ -1076,7 +1216,9 @@ function renderScenes() {
     return '<div class="row2' + (off ? ' off' : '') + '">'
       + '<div class="t">' + esc(sc.icon || '') + ' ' + esc(sc.title)
       + (sc.builtin ? '' : ' <span class="gp" title="用户自建模块">自建</span>')
-      + '<em>' + esc(sc.desc || '') + ' · ' + meta.join(' · ') + '</em></div>'
+      // meta 里有出口节点名、目标组名，全部来自订阅（外部可控）。
+      // 只转义 desc、把 join 后的整段原样塞进 innerHTML 就是存储型 XSS。
+      + '<em>' + esc(sc.desc || '') + ' · ' + esc(meta.join(' · ')) + '</em></div>'
       + mid
       + '<label class="sw"><input type="checkbox" data-scene-on="' + esc(sc.key) + '"' + (sc.enabled ? ' checked' : '') + '><i></i></label>'
       + '<button class="btn" data-act="mod-edit" data-key="' + esc(sc.key) + '" title="直接改 JSON">编辑</button>'
@@ -1114,12 +1256,32 @@ async function modSave() {
   var obj;
   try { obj = JSON.parse(txt); } catch (e) { toast('JSON 写错了：' + e.message, 'bad'); return; }
   var url = MOD_MODE === 'import' ? '/api/module/import' : '/api/module/save';
-  var body = MOD_MODE === 'import' ? { modules: Array.isArray(obj) ? obj : (obj.modules || [obj]) } : { module: obj };
-  var r = await api(url, body);
-  if (!r || r.ok === false) { toast((r && r.error) || '保存失败', 'bad'); return; }
-  $('#modEdit').hidden = true;
-  toast(r.note ? ('已保存：' + r.note) : '已保存并生效', 'good');
-  setTimeout(refresh, 700);
+  var body;
+  var btn = $('#modYes');
+  if (!busyStart('mod-save', btn, '保存中')) return;
+  try {
+    if (MOD_MODE === 'import') {
+      // 后端把「空列表 / 空对象」当成"用这份覆盖全部模块"，粘错一次就会清空所有自定义模块，
+      // 而且没有任何撤销。所以前端先自校验：必须能解出至少一个带 key 的对象。
+      var arr = Array.isArray(obj) ? obj : (obj && Array.isArray(obj.modules) ? obj.modules : (obj && obj.key ? [obj] : null));
+      if (!arr || !arr.length) { toast('导入内容里没有任何模块，已拒绝（这会把全部模块清空）', 'bad'); return; }
+      var badAt = -1;
+      arr.forEach(function (m, i) { if (badAt < 0 && (!m || typeof m !== 'object' || !m.key)) badAt = i; });
+      if (badAt >= 0) { toast('第 ' + (badAt + 1) + ' 个模块缺少 key，已拒绝导入', 'bad'); return; }
+      body = { modules: arr };
+    } else {
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) { toast('模块必须是一个 JSON 对象（要有 key / title）', 'bad'); return; }
+      if (!obj.key) { toast('模块缺少 key 字段', 'bad'); return; }
+      body = { module: obj };
+    }
+    var r = await api(url, body, { timeout: API_SLOW });
+    if (!r || r.ok === false) { toast((r && r.error) || '保存失败', 'bad'); return; }
+    $('#modEdit').hidden = true;
+    toast(r.note ? ('已保存：' + r.note) : '已保存并生效', 'good');
+    setTimeout(refresh, 700);
+  } finally {
+    busyEnd('mod-save', btn);
+  }
 }
 async function modExport() {
   var r = await api('/api/module/export', {});
@@ -1145,7 +1307,7 @@ var ND_ORDER = { bad: 0, warn: 1, info: 2, ok: 3, skip: 4 };
 var ND_TEXT = { bad: '故障', warn: '注意', info: '参考', ok: '正常', skip: '跳过' };
 
 function renderNetDoc() {
-  var d = S.netdoc || {};
+  var d = (S && S.netdoc) || {};
   var checks = (d.checks || []).slice();
   if (!checks.length) {
     patch('#ndPills', '<span class="gp">还没体检过</span>');
@@ -1167,7 +1329,7 @@ function renderNetDoc() {
     return x - y;
   });
   var html = checks.map(function (c) {
-    var lv = c.level || 'info';
+    var lv = ND_ORDER[c.level] != null ? c.level : 'info';   // 白名单：level 会进 class 属性
     var fixBtn = c.fix
       ? '<button class="btn" data-act="nd-fix" data-a="' + esc(c.fix) + '" data-cid="' + esc(c.id) + '"'
         + (c.need_admin ? ' title="需要管理员权限"' : '') + '>' + esc(c.fix_title || '修') + (c.need_admin ? ' · 需管理员' : '') + '</button>'
@@ -1193,7 +1355,7 @@ async function ndRun() {
   if (b) { b.disabled = true; b.classList.add('busy'); b.textContent = '体检中'; }
   patch('#ndNote', '正在跑：网关 / DNS / 系统代理 / 内核 / 直连 / MTU / hosts …');
   try {
-    var r = await api('/api/net/diagnose', { refresh: true });
+    var r = await api('/api/net/diagnose', { refresh: true }, { timeout: API_SLOW });
     if (r && r.checks) { S.netdoc = r; renderNetDoc(); }
     else if (r && r.error) toast(r.error, 'bad');
   } catch (e) {
@@ -1210,7 +1372,7 @@ async function ndRepair() {
   var b = document.querySelector('[data-act="nd-repair"]');
   if (b) { b.disabled = true; b.classList.add('busy'); b.textContent = '急救中'; }
   try {
-    var r = await api('/api/net/repair', {});
+    var r = await api('/api/net/repair', {}, { timeout: API_SLOW });
     if (r && r.report) { S.netdoc = r.report; renderNetDoc(); }
     var done = (r && r.steps) ? r.steps.filter(function (s) { return s.ok; }).length : 0;
     var total = (r && r.steps) ? r.steps.length : 0;
@@ -1228,7 +1390,7 @@ async function ndFix(action, cid, btn) {
   if (!action) return;
   if (btn) { btn.disabled = true; btn.classList.add('busy'); btn.textContent = '修'; }
   try {
-    var r = await api('/api/net/fix', { action: action });
+    var r = await api('/api/net/fix', { action: action }, { timeout: API_SLOW });
     if (r && r.report) { S.netdoc = r.report; renderNetDoc(); }
     if (r && r.ok) toast('已执行：' + (r.title || action), 'good');
     else if (r && r.need_admin) toast('这一步要管理员权限：退出后右键「以管理员身份运行」', 'bad');
@@ -1250,7 +1412,8 @@ async function ndCopy() {
 
 /* ───── AI 接口卡片 ───── */
 function renderModulesApi() {
-  var a = S.ai_api || {};
+  var a = (S && S.ai_api) || {};
+  // /api/state 里的 token 是掩码，只能拿来显示；明文只走 reveal 那一次请求，不进 S
   var tok = a.token || '';
   var pills = [];
   pills.push('<span class="gp ' + (a.enabled ? 'ok' : 'bad') + '">' + (a.enabled ? '接口已开' : '接口已关') + '</span>');
@@ -1267,7 +1430,8 @@ function renderModulesApi() {
     + esc('curl -s -H "X-AI-Token: ' + (tok || '<token>') + '" http://127.0.0.1:7892/ai/v1/manifest') + '</div>';
   patch('#apiBody', body);
   var on = $('#apiOn'), lv = $('#apiLevel');
-  if (on) on.checked = a.enabled !== false;
+  // 用户正在拨这个开关时不回填：轮询 1.8 秒一次，回填会把刚点下去的状态弹回去
+  if (on && document.activeElement !== on) on.checked = a.enabled !== false;
   if (lv && a.level) lv.value = a.level;
   patch('#apiNote', esc(a.hint || ''));
 }
@@ -1287,10 +1451,24 @@ async function copyText(text) {
   }
 }
 async function apiCopy() {
-  var tok = (S.ai_api || {}).token || '';
-  if (!tok) { toast('还没有 token', 'bad'); return; }
-  toast((await copyText(tok)) ? 'token 已复制' : '剪贴板不可用，token 是：' + tok,
-    'good');
+  var masked = (S && S.ai_api && S.ai_api.token) || '';
+  if (!masked) { toast('还没有 token', 'bad'); return; }
+  // /api/state 里的 token 是掩码，复制必须单独要一次明文；
+  // 明文只活在这个局部变量里，不进 S，避免每次 1.8 秒的状态刷新把整串 token 灌进 DOM。
+  var r = await api('/api/ai/api', { action: 'reveal' }, { timeout: API_SLOW });
+  if (!r || r.ok === false) {
+    if (r && (r.status === 404 || r.code === 'E_NOT_FOUND')) {
+      toast('这个版本还不支持在面板里复制明文，请打开 data/settings.json 看 ai_api_token', 'bad');
+      return;
+    }
+    toast((r && r.error) || '拿不到明文 token', 'bad');
+    return;
+  }
+  var tok = r.token || (r.ai_api && r.ai_api.token) || '';
+  if (!tok) { toast('没拿到明文 token，请打开 data/settings.json 看 ai_api_token', 'bad'); return; }
+  // 复制失败时不再把完整 token 打进 toast（截图/录屏就泄露了）
+  if (await copyText(tok)) toast('token 已复制', 'good');
+  else toast('剪贴板不可用，请打开 data/settings.json 看 ai_api_token', 'bad');
 }
 async function apiRegen() {
   if (!(await ask('重置 token', '所有已经用旧 token 配好的 AI 客户端都会失效，要重新填。继续？', '重置'))) return;
@@ -1302,7 +1480,7 @@ async function apiRegen() {
 }
 var dnsProbe = null;   // 探活结果单独存：S 每 1.8 秒被 /api/state 覆盖一次
 function renderDns() {
-  var d = S.dns || {};
+  var d = (S && S.dns) || {};
   var on = d.enabled !== false;
   var pills = [];
   // running 只说明端口在手里；真正"能不能解析"要看探活（S.dns_probe）。
@@ -1323,10 +1501,10 @@ function renderDns() {
   patch('#dnsNote', '<span class="dim">' + esc(note) + '</span>');
   $('#dnsHint').textContent = d.running ? '127.0.0.1:53' : '';
   var sw = $('#dnsOn');
-  if (sw) sw.checked = on;
+  if (sw && document.activeElement !== sw) sw.checked = on;
 }
 function renderGithub() {
-  var g = S.github || {};
+  var g = (S && S.github) || {};
   var pills = [];
   if (g.ts) {
     pills.push('<span class="gp ' + (g.ok ? 'ok' : 'bad') + '">' + (g.ok ? '五链全通' : '有链路不通') + ' · ' + clock(g.ts) + '</span>');
@@ -1336,7 +1514,7 @@ function renderGithub() {
     });
     if (g.git) {
       pills.push('<span class="gp ' + (g.git.ok ? 'ok' : 'bad') + '" title="' + esc(g.git.error || '') + '">git '
-        + (g.git.ok ? g.git.refs + ' refs · ' + n(g.git.ms) + 'ms' : '拉不动') + '</span>');
+        + (g.git.ok ? n(g.git.refs) + ' refs · ' + n(g.git.ms) + 'ms' : '拉不动') + '</span>');
     }
   } else {
     pills.push('<span class="gp">还没自检过</span>');
@@ -1351,7 +1529,7 @@ function renderGithub() {
   $('#ghHint').textContent = S.gh_busy ? '自检中' : (g.ok === false ? '上次有失败' : '');
 }
 function renderAI() {
-  var a = S.ai || {};
+  var a = (S && S.ai) || {};
   var on = !!a.enabled;
   var cb = $('#aiOn');
   if (document.activeElement !== cb) cb.checked = on;
@@ -1380,17 +1558,17 @@ function renderAI() {
 
 /* ───── 订阅 ───── */
 function renderSubs() {
-  var s = S.sub || {};
+  var s = (S && S.sub) || {};
   var list = s.list || [];
   var now = s.name || '';
   $('#sumName').textContent = now || '未选择';
-  $('#sumLeft').textContent = s.total_left_gb != null ? Number(s.total_left_gb).toFixed(1) + ' GB' : '—';
+  $('#sumLeft').textContent = s.total_left_gb != null ? fixed(s.total_left_gb, 1) + ' GB' : '—';
   $('#sumNodes').textContent = n(s.count) + ' 个';
   $('#subCount').textContent = list.length ? list.length + ' 条' : '';
 
   var h = list.map(function (it) {
     var meta = [];
-    if (it.traffic_left_gb != null) meta.push('剩余 ' + Number(it.traffic_left_gb).toFixed(1) + ' GB');
+    if (it.traffic_left_gb != null) meta.push('剩余 ' + fixed(it.traffic_left_gb, 1) + ' GB');
     else if (it.traffic_text) meta.push(it.traffic_text);
     if (it.expire_text) meta.push(it.expire_text);
     if (it.updated) meta.push(ago(it.updated) + '更新');
@@ -1418,6 +1596,7 @@ function renderSubs() {
 
 /* ───── 设置 ───── */
 function renderSettings() {
+  if (!S) return;
   function set(id, v) { var el = $(id); if (el && document.activeElement !== el) el.checked = !!v; }
   set('#autoStart', S.autostart); set('#tunOn', S.tun); set('#autoBest', S.auto_best); set('#healOn', S.heal);
   var m = $('#modeSel');
@@ -1431,6 +1610,12 @@ function renderSettings() {
       + '<div class="acts" style="margin-top:10px"><button class="btn primary" data-act="update-apply">下载并安装</button>'
       + '<button class="btn" data-act="update-page">查看说明</button></div>'
       + (u.notes ? '<div class="dim" style="margin-top:10px;max-height:110px;overflow:auto;white-space:pre-wrap">' + esc(String(u.notes).slice(0, 900)) + '</div>' : '');
+  } else if (u.need_confirm) {
+    // 官方 release 没带 SHA256 时不自动装：给人一次明确的选择，而不是静默跳过
+    h = '新版本 ' + esc(u.latest || '') + ' 没有校验和，无法确认安装包完整。'
+      + '<div class="dim" style="margin-top:8px">' + esc(String(u.error || '').slice(0, 200)) + '</div>'
+      + '<div class="acts" style="margin-top:10px"><button class="btn primary" data-act="update-force">仍然安装</button>'
+      + '<button class="btn" data-act="update-check">重新检查</button></div>';
   } else if (u.error) {
     h = '检查更新失败：' + esc(u.error);
     h += '<div class="dim" style="margin-top:8px">更新仓库写成 owner/name（例如 ' + esc(S.update_repo || 'ayuanjc/VPNTray') + '），留空就是关掉检查。</div>'
@@ -1440,7 +1625,10 @@ function renderSettings() {
   else if (u.ok) h = '已是最新版本 v' + esc(u.latest || S.ver) + (u.checked_at ? ' · ' + ago(u.checked_at) + '检查' : '');
   else h = '尚未检查更新';
   patch('#upd', h);
-  $('#updHint').textContent = '当前 v' + (S.ver || '');
+  // 装在 Program Files 这类不能写的地方时，data 目录会退到 %LOCALAPPDATA%：
+  // 不写出来，用户永远找不到自己的设置文件
+  $('#updHint').textContent = '当前 v' + (S.ver || '')
+    + (S.data_dir_fallback && S.data_dir ? ' · 设置存放在 ' + S.data_dir : '');
 }
 
 function renderView(v) {
@@ -1457,24 +1645,61 @@ function render() {
   renderView(VIEW);
 }
 
+var POLL_FAST = 1800;    // 正常节奏；慢一点省 CPU，快一点状态更跟手，1.8 秒是折中
+var POLL_MAX = 30000;    // 连续失败后最慢 30 秒一轮，别把已经卡死的内核继续按在地上摩擦
+var POLL_STUCK = 45000;  // 兜底阈值：fetch 万一没被 abort 掉，也不让旗标永久卡住
 async function refresh() {
-  if (polling) return;
+  // 旗标兜底：正常情况下 12 秒超时就会走 finally，这里的 45 秒只是防极端情况
+  if (polling && Date.now() - pollStarted < POLL_STUCK) return;
   polling = true;
+  pollStarted = Date.now();
   try {
-    var r = await api('/api/state');
+    // strict：超时向上抛，交给 catch 计失败次数；普通调用点才需要兜成对象
+    var r = await api('/api/state', undefined, { strict: true });
     if (!r || r.ok === false) {
+      pollFails += 1;
       var pill = $('#stat');
-      pill.className = 'pill bad';
-      $('#statText').textContent = (r && r.error) || '与主程序断开';
+      if (pill) pill.className = 'pill bad';
+      var stxt = $('#statText');
+      if (stxt) stxt.textContent = (r && r.error) || '与主程序断开';
       return;
     }
-    S = r.state;
+    S = r.state || null;
+    pollFails = 0;
     render();
+  } catch (e) {
+    pollFails += 1;
+    var p2 = $('#stat');
+    if (p2) p2.className = 'pill bad';
+    var t2 = $('#statText');
+    if (t2) t2.textContent = (e && e.message) || '与主程序断开';
   } finally {
+    // 成功、业务失败、抛错都要复位：以前超时后 await 永不返回，finally 不执行，
+    // 旗标永久为 true，面板从此静默停更（手动刷新也一样被这个 if 挡掉）。
     polling = false;
   }
 }
-function loop() { refresh().finally(function () { setTimeout(loop, document.hidden ? 6000 : 1800); }); }
+function pollWait() {
+  if (!pollFails) return POLL_FAST;
+  // 2s → 4s → 8s → 16s → 30s 封顶
+  return Math.min(POLL_MAX, 2000 * Math.pow(2, Math.min(4, pollFails - 1)));
+}
+function loop() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  if (document.hidden) return;   // 页面在后台就不轮询，回到前台由 visibilitychange 重新拉起
+  refresh().finally(function () {
+    if (document.hidden) return;
+    pollTimer = setTimeout(loop, pollWait());
+  });
+}
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) {
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    return;
+  }
+  pollFails = 0;   // 回到前台先按正常节奏探一次，别让用户盯着 30 秒的退避等着
+  loop();
+});
 
 /* ───── 交互 ───── */
 $('#nav').addEventListener('click', function (e) {
@@ -1505,7 +1730,7 @@ document.addEventListener('click', async function (e) {
   var chip = t.closest('.chip');
   if (chip) {
     REG = chip.dataset.reg || '';
-    localStorage.setItem('vpn.reg', REG);
+    LS.set('vpn.reg', REG);
     renderChips(); renderNodes();
     return;
   }
@@ -1535,39 +1760,47 @@ document.addEventListener('click', async function (e) {
   }
   if (t.closest('[data-dns-probe]')) {
     var bp = t.closest('[data-dns-probe]');
-    bp.disabled = true;
-    var rp = await api('/api/dns', { probe: true });
-    bp.disabled = false;
-    if (!rp || rp.ok === false) { toast((rp && rp.error) || '探测失败', 'bad'); return; }
-    S.dns = rp.dns || S.dns;
-    dnsProbe = (rp.dns || {}).probe || null;
-    var pr = dnsProbe;
-    renderDns();
-    toast(pr && pr.ok ? ('解析正常 · ' + n(pr.ms) + 'ms · ' + n(pr.answers) + ' 条记录')
-      : ('解析失败：' + ((pr && pr.error) || '未知')), pr && pr.ok ? 'good' : 'bad');
+    // 探活要发真实查询，可能好几秒；没有 finally 的话中途返回按钮就永久灰掉
+    if (!busyStart('dns-probe', bp, '探测中')) return;
+    try {
+      var rp = await api('/api/dns', { probe: true }, { timeout: API_SLOW });
+      if (!rp || rp.ok === false) { toast((rp && rp.error) || '探测失败', 'bad'); return; }
+      S.dns = rp.dns || S.dns;
+      dnsProbe = (rp.dns || {}).probe || null;
+      var pr = dnsProbe;
+      renderDns();
+      toast(pr && pr.ok ? ('解析正常 · ' + n(pr.ms) + 'ms · ' + n(pr.answers) + ' 条记录')
+        : ('解析失败：' + ((pr && pr.error) || '未知')), pr && pr.ok ? 'good' : 'bad');
+    } finally {
+      busyEnd('dns-probe', bp);
+    }
     return;
   }
   if (t.closest('[data-gh-check]')) {
     var b = t.closest('[data-gh-check]');
-    b.disabled = true;
-    toast('正在自检 GitHub，约 30 秒…');
-    var rc = await api('/api/github/check', {});
-    if (!rc || rc.ok === false) { b.disabled = false; toast((rc && rc.error) || '自检失败', 'bad'); return; }
-    var g = {}, t0 = Date.now();
-    while (Date.now() - t0 < 120000) {
-      await new Promise(function (done) { setTimeout(done, 1200); });
-      var st = await api('/api/state');
-      if (!st || st.ok === false) break;
-      if (!st.gh_busy) { g = st.github || {}; break; }
+    // 30 秒起步的长任务：按钮必须靠 finally 复原，否则中途任何 return 都让它永久变灰
+    if (!busyStart('gh-check', b, '自检中')) return;
+    try {
+      toast('正在自检 GitHub，约 30 秒…');
+      var rc = await api('/api/github/check', {}, { timeout: API_SLOW });
+      if (!rc || rc.ok === false) { toast((rc && rc.error) || '自检失败', 'bad'); return; }
+      var g = {}, t0 = Date.now();
+      while (Date.now() - t0 < 120000) {
+        await new Promise(function (done) { setTimeout(done, 1200); });
+        var st = await api('/api/state');
+        if (!st || st.ok === false) break;
+        if (!st.gh_busy) { g = st.github || {}; break; }
+      }
+      if (!g.ts) { toast('自检没有结果，看一下日志', 'bad'); setTimeout(refresh, 400); return; }
+      var bad = (g.items || []).filter(function (i) { return !i.ok; }).length;
+      var gitBad = g.git && !g.git.ok;
+      toast(bad ? ('GitHub 有 ' + bad + ' 项不通' + (g.note ? '：' + g.note : ''))
+        : (gitBad ? '网页全通，但 git 拉不动' : 'GitHub 全通，git 可用'),
+        (bad || gitBad) ? 'bad' : 'good');
+      setTimeout(refresh, 400);
+    } finally {
+      busyEnd('gh-check', b);
     }
-    b.disabled = false;
-    if (!g.ts) { toast('自检没有结果，看一下日志', 'bad'); setTimeout(refresh, 400); return; }
-    var bad = (g.items || []).filter(function (i) { return !i.ok; }).length;
-    var gitBad = g.git && !g.git.ok;
-    toast(bad ? ('GitHub 有 ' + bad + ' 项不通' + (g.note ? '：' + g.note : ''))
-      : (gitBad ? '网页全通，但 git 拉不动' : 'GitHub 全通，git 可用'),
-      (bad || gitBad) ? 'bad' : 'good');
-    setTimeout(refresh, 400);
     return;
   }
   if (t.closest('[data-git-proxy]')) {
@@ -1581,7 +1814,12 @@ document.addEventListener('click', async function (e) {
   var act = t.closest('[data-act]');
   if (!act) return;
   var a = act.dataset.act;
-  if (a === 'ai-probe') { toast('正在测 AI 出口…'); await run('/api/ai/probe'); }
+  if (a === 'ai-probe') {
+    // 探测要真的发请求出去，给 30 秒；顺便按按钮加互斥，连点会堆出一串探测
+    if (!busyStart('ai-probe', act, '探测中')) return;
+    try { toast('正在测 AI 出口…'); await run('/api/ai/probe', {}, '', { timeout: API_SLOW }); }
+    finally { busyEnd('ai-probe', act); }
+  }
   else if (a === 'ai-align') {
     var ra = await api('/api/ai/align', {});
     toast(ra.message || ra.error || (ra.ok ? '已对齐' : '失败'), ra.ok ? 'good' : 'bad');
@@ -1595,9 +1833,14 @@ document.addEventListener('click', async function (e) {
     if (!(await ask('安装新版本', '下载完成后程序会自动退出并重启，代理会短暂中断。现在安装？', '下载并安装'))) return;
     var rup = await run('/api/update/apply', {}, '开始下载');
     if (rup && rup.ok === false) toast(rup.error || '失败', 'bad');
+  } else if (a === 'update-force') {
+    if (!(await ask('仍然安装？', '这个安装包没有 SHA256 校验和，装之前请确认下载来源可信。', '仍然安装'))) return;
+    var rf = await run('/api/update/apply', { confirm: true }, '开始下载');
+    if (rf && rf.ok === false) toast(rf.error || '失败', 'bad');
   } else if (a === 'update-page') {
     var u = S.update || {};
-    if (u.page) window.open(u.page, '_blank');
+    // noopener：否则新窗口能通过 window.opener 反向操作这个面板
+    if (u.page) window.open(u.page, '_blank', 'noopener');
   } else if (a === 'update-fixrepo') {
     var inp = $('#updRepo');
     var repo = (inp && inp.value.trim()) || S.update_repo || 'ayuanjc/VPNTray';
@@ -1635,6 +1878,20 @@ document.addEventListener('keydown', function (e) {
   else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) modSave();
 });
 
+/* 弹层打开时把 Tab 圈在弹层里：否则焦点会跑到背后的页面上，
+   键盘用户按几下 Tab 就找不到自己在哪，屏幕阅读器也会念到被遮住的卡片。 */
+function trapFocus(box, e) {
+  if (!box || box.hidden || e.key !== 'Tab') return;
+  var f = box.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+  if (!f.length) return;
+  var first = f[0], last = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+document.addEventListener('keydown', function (e) {
+  trapFocus($('#ask'), e);
+  trapFocus($('#modEdit'), e);
+});
 document.addEventListener('change', async function (e) {
   var t = e.target;
   var sc = t.closest('[data-scene]');
@@ -1671,7 +1928,7 @@ document.addEventListener('change', async function (e) {
     setTimeout(refresh, 700);
     return;
   }
-  if (t.id === 'sortSel') { SORT = t.value; localStorage.setItem('vpn.sort', SORT); renderNodes(); return; }
+  if (t.id === 'sortSel') { SORT = t.value; LS.set('vpn.sort', SORT); renderNodes(); return; }
   if (t.id === 'subMode') {
     var r5 = await run('/api/sub_url', { action: 'mode', mode: t.value }, t.value === 'merge' ? '已改为合并所有订阅' : '已改为单条订阅生效');
     if (r5 && r5.ok === false) toast(r5.error || '失败', 'bad');
@@ -1707,66 +1964,118 @@ document.addEventListener('change', async function (e) {
 
 $('#q').addEventListener('input', function (e) {
   Q = e.target.value;
-  if (Q.trim() && REG) { REG = ''; try { localStorage.removeItem('vpn.reg'); } catch (x) {} renderChips(); }
+  if (Q.trim() && REG) { REG = ''; LS.del('vpn.reg'); renderChips(); }
   renderNodes();
 });
 $('#sortSel').value = SORT;
-$('#sortSel').addEventListener('change', function () {});
 
-function testDelays() {
-  run('/api/test', {}, '正在测速，稍等十几秒').then(function (r) {
-    if (r && r.ok === false) toast(r.error || '失败', 'bad');
-    setTimeout(refresh, 800);
-  });
+function testDelays(btn) {
+  // 两个测速按钮共用 test 这个 busy 键：一个在跑，另一个也点不动，
+  // 否则并发两次 /api/test 会把内核的探测队列排爆，面板也跟着卡
+  if (!busyStart('test', btn, '测速中')) return;
+  $('#btnTest').disabled = true;
+  $('#btnTest2').disabled = true;
+  run('/api/test', {}, '正在测速，稍等十几秒', { timeout: API_SLOW })
+    .catch(function (e) { toast('测速失败：' + ((e && e.message) || e), 'bad'); })
+    .then(function (r) {
+      if (r && r.ok === false) toast(r.error || '失败', 'bad');
+      setTimeout(refresh, 800);
+    })
+    .finally(function () {
+      busyEnd('test', btn);
+      // 另一个按钮不是本次被禁的那个，单独复原（renderNodes 之后也会按 BUSY 重算）
+      $('#btnTest').disabled = !!BUSY.test;
+      $('#btnTest2').disabled = !!BUSY.test;
+    });
 }
-$('#btnTest').addEventListener('click', testDelays);
-$('#btnTest2').addEventListener('click', testDelays);
-$('#btnBest').addEventListener('click', function () { run('/api/best', {}, '正在按延迟挑最优节点'); setTimeout(refresh, 900); });
-$('#btnPurity').addEventListener('click', function () { run('/api/purity', { scope: 'current' }, '正在检测当前节点纯净度'); });
-$('#btnSpeed').addEventListener('click', function () { run('/api/speed', { scope: 'top', limit: 10 }, '正在测延迟最好的 10 个节点带宽'); });
+$('#btnTest').addEventListener('click', function () { testDelays(this); });
+$('#btnTest2').addEventListener('click', function () { testDelays(this); });
+$('#btnBest').addEventListener('click', function () {
+  var b = this;
+  guarded('best', b, '挑选中', function () { return run('/api/best', {}, '正在按延迟挑最优节点'); })
+    .then(function () { setTimeout(refresh, 900); });
+});
+$('#btnPurity').addEventListener('click', function () {
+  var b = this;
+  guarded('purity', b, '检测中', function () { return run('/api/purity', { scope: 'current' }, '正在检测当前节点纯净度'); });
+});
+$('#btnSpeed').addEventListener('click', function () {
+  var b = this;
+  guarded('speed', b, '测速中', function () { return run('/api/speed', { scope: 'top', limit: 10 }, '正在测延迟最好的 10 个节点带宽'); });
+});
 $('#btnPurityAll').addEventListener('click', async function () {
+  var b = this;
+  if (BUSY.purity) { toast('纯净度检测正在进行中', 'bad'); return; }   // 全部检测期间不要和单点检测叠着跑
   var ok = await ask('全部纯净度检测', '会逐个切过去测所有节点的出口 IP，2–4 分钟，期间网络会短暂抖动，结束后自动回到原节点。现在开始？', '开始检测');
   if (!ok) return;
-  var r = await run('/api/purity', { scope: 'all' }, '已排队，逐个检测中');
-  if (r && r.ok === false) toast(r.error || '失败', 'bad');
+  if (!busyStart('purity-all', b, '检测中')) return;
+  try {
+    var r = await run('/api/purity', { scope: 'all' }, '已排队，逐个检测中');
+    if (r && r.ok === false) toast(r.error || '失败', 'bad');
+  } finally {
+    busyEnd('purity-all', b);
+  }
 });
-$('#btnRestart').addEventListener('click', function () { run('/api/kernel/restart', {}, '正在重启内核'); setTimeout(refresh, 1200); });
-$('#btnCloseAll').addEventListener('click', function () { run('/api/conn/clear', {}, '已断开全部连接'); });
+$('#btnRestart').addEventListener('click', function () {
+  var b = this;
+  guarded('restart', b, '重启中', function () { return run('/api/kernel/restart', {}, '正在重启内核', { timeout: API_SLOW }); })
+    .then(function () { setTimeout(refresh, 1200); });
+});
+$('#btnCloseAll').addEventListener('click', function () {
+  var b = this;
+  guarded('conn-clear', b, '清理中', function () { return run('/api/conn/clear', {}, '已断开全部连接'); });
+});
 $('#btnScan').addEventListener('click', async function () {
+  // 扫描要枚举进程和网卡，几百毫秒起步；连点会同时跑起多份枚举，结果互相覆盖
+  if (!busyStart('scan', this, '扫描中')) return;
   var note = $('#ngNote');
   note.hidden = false; note.className = 'note dim'; note.textContent = '正在扫描…';
-  var r = await api('/api/netguard', {});
-  if (!r || r.ok === false) { note.className = 'note err'; note.textContent = '扫描失败：' + ((r && r.error) || '未知错误'); return; }
-  var apps = r.apps || [], ads = r.adapters || [], sp = r.system_proxy || {};
-  var bits = [];
-  if (sp.enabled) bits.push('系统代理被占用：' + esc(sp.server || ''));
-  if (sp.pac) bits.push('PAC 被设置');
-  apps.forEach(function (x) { bits.push('代理进程：' + esc(x.name) + ' (#' + n(x.pid) + ')'); });
-  ads.forEach(function (x) { bits.push('TUN 网卡：' + esc(x.name)); });
-  if (!bits.length) { note.className = 'note dim'; note.textContent = '没有发现其他代理冲突。'; return; }
-  note.innerHTML = '发现 ' + bits.length + ' 项冲突：<br>' + bits.join('<br>')
-    + '<div class="acts" style="margin-top:10px"><button class="btn sm" data-ng="1">一键清理</button></div>';
-  var btn = note.querySelector('[data-ng]');
-  if (btn) btn.addEventListener('click', async function () {
-    var out = [];
-    if (sp.enabled || sp.pac) out.push(await api('/api/netguard/fix', { target: 'sys' }));
-    if (apps.length) out.push(await api('/api/netguard/fix', { target: 'apps', pids: apps.map(function (x) { return n(x.pid); }) }));
-    if (ads.length) out.push(await api('/api/netguard/fix', { target: 'adapters', names: ads.map(function (x) { return x.name; }) }));
-    var bad = out.filter(function (x) { return x && x.ok === false; });
-    toast(bad.length ? '部分项目清理失败' : '已清理冲突', bad.length ? 'bad' : 'good');
-    setTimeout(function () { $('#btnScan').click(); }, 900);
-  });
+  try {
+    var r = await api('/api/netguard', {}, { timeout: API_SLOW });
+    if (!r || r.ok === false) { note.className = 'note err'; note.textContent = '扫描失败：' + ((r && r.error) || '未知错误'); return; }
+    var apps = r.apps || [], ads = r.adapters || [], sp = r.system_proxy || {};
+    var bits = [];
+    if (sp.enabled) bits.push('系统代理被占用：' + esc(sp.server || ''));
+    if (sp.pac) bits.push('PAC 被设置');
+    apps.forEach(function (x) { bits.push('代理进程：' + esc(x.name) + ' (#' + n(x.pid) + ')'); });
+    ads.forEach(function (x) { bits.push('TUN 网卡：' + esc(x.name)); });
+    if (!bits.length) { note.className = 'note dim'; note.textContent = '没有发现其他代理冲突。'; return; }
+    // bits 里每一项都已经单独 esc 过，这里只拼固定文案和按钮
+    note.innerHTML = '发现 ' + n(bits.length) + ' 项冲突：<br>' + bits.join('<br>')
+      + '<div class="acts" style="margin-top:10px"><button class="btn sm" data-ng="1">一键清理</button></div>';
+    var btn = note.querySelector('[data-ng]');
+    if (btn) btn.addEventListener('click', async function () {
+      if (!busyStart('ng-fix', btn, '清理中')) return;
+      try {
+        var out = [];
+        if (sp.enabled || sp.pac) out.push(await api('/api/netguard/fix', { target: 'sys' }, { timeout: API_SLOW }));
+        if (apps.length) out.push(await api('/api/netguard/fix', { target: 'apps', pids: apps.map(function (x) { return n(x.pid); }) }, { timeout: API_SLOW }));
+        if (ads.length) out.push(await api('/api/netguard/fix', { target: 'adapters', names: ads.map(function (x) { return x.name; }) }, { timeout: API_SLOW }));
+        var bad = out.filter(function (x) { return x && x.ok === false; });
+        toast(bad.length ? '部分项目清理失败' : '已清理冲突', bad.length ? 'bad' : 'good');
+        setTimeout(function () { $('#btnScan').click(); }, 900);
+      } finally {
+        busyEnd('ng-fix', btn);
+      }
+    });
+  } finally {
+    busyEnd('scan', $('#btnScan'));
+  }
 });
 $('#btnUpdate').addEventListener('click', async function () {
-  var r = await run('/api/update/check', { force: true });
-  if (r && r.ok === false) toast('检查失败：' + (r.error || ''), 'bad');
-  else if (r && r.has_update) toast('发现新版本 ' + r.latest, 'good');
-  else toast('已是最新版本');
-  setTimeout(refresh, 600);
+  var b = this;
+  await guarded('update-check', b, '检查中', async function () {
+    var r = await run('/api/update/check', { force: true }, '', { timeout: API_SLOW });
+    if (r && r.ok === false) toast('检查失败：' + (r.error || ''), 'bad');
+    else if (r && r.has_update) toast('发现新版本 ' + r.latest, 'good');
+    else toast('已是最新版本');
+    setTimeout(refresh, 600);
+  });
 });
 $('#btnQuit').addEventListener('click', async function () {
+  var b = this;
   if (!(await ask('退出 VPNTray', '退出后系统代理会被还原，网络会走回本机直连。确定退出？', '退出'))) return;
-  await run('/api/quit', {}, '正在退出');
+  await guarded('quit', b, '退出中', function () { return run('/api/quit', {}, '正在退出'); });
 });
 $('#btnLog').addEventListener('click', loadLogs);
 
@@ -1774,20 +2083,31 @@ async function loadLogs() {
   var r = await api('/api/log', {});
   var box = $('#logs');
   if (!r || r.ok === false) { box.textContent = (r && (r.lines || []).join('\n')) || '读取失败'; return; }
-  box.textContent = (r.lines || []).join('\n') || '（空）';
+  box.textContent = (r.lines || []).join('\n') || '还没有日志。跑一次体检或连接一次节点后这里会有内容。';
   box.scrollTop = box.scrollHeight;
   $('#logHint').textContent = '最近 ' + (r.lines || []).length + ' 行';
 }
 
 $('#subAdd').addEventListener('click', async function () {
+  var b = this;
   var url = ($('#subUrl').value || '').trim();
   if (!url) { toast('先粘贴订阅链接', 'bad'); return; }
-  var r = await run('/api/sub_url', { action: 'add', url: url }, '已添加，正在拉取');
-  if (r && r.ok === false) { toast(r.error || '添加失败', 'bad'); return; }
+  // 只放行 http/https：javascript: / file: 这类 scheme 后端不该拿到，
+  // 提前拦掉能避免"点了添加才开始报奇怪的错"
+  if (!/^https?:\/\//i.test(url)) { toast('订阅链接要以 http:// 或 https:// 开头', 'bad'); return; }
+  var r = await guarded('sub-add', b, '添加中', function () {
+    // 添加会真的去拉一次订阅，慢的时候十几秒
+    return run('/api/sub_url', { action: 'add', url: url }, '已添加，正在拉取', { timeout: API_SLOW });
+  });
+  if (!r || r.ok === false) return;
   $('#subUrl').value = '';
   setTimeout(refresh, 1200);
 });
-$('#subRefresh').addEventListener('click', function () { run('/api/sub', {}, '正在更新订阅'); setTimeout(refresh, 1200); });
+$('#subRefresh').addEventListener('click', function () {
+  var b = this;
+  guarded('sub-refresh', b, '更新中', function () { return run('/api/sub', {}, '正在更新订阅', { timeout: API_SLOW }); })
+    .then(function () { setTimeout(refresh, 1200); });
+});
 $('#fbSend').addEventListener('click', async function () {
   var detail = ($('#fbDetail').value || '').trim();
   var title = ($('#fbTitle').value || '').trim();

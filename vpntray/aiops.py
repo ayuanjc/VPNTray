@@ -101,7 +101,9 @@ _HANDLERS: dict[str, Callable[[Any, dict], Any]] = {}
 # ── 只读 ──
 def _t_status(app, args):
     snap = app.snapshot()
-    st = app.state or {}
+    # 用 snapshot 里的浅拷贝，不直接读 app.state：后者是别的线程正在 _set() 的
+    # 同一个 dict，读的过程中可能看到写了一半的键（表现为「节点数 0」的假故障）。
+    st = snap
     groups = (st.get("proxies") or {})
     main = str(st.get("group_now") or "")
     return {
@@ -257,8 +259,15 @@ def _t_sub_update(app, args):
 
 # ── 完全控制 ──
 def _t_kernel_restart(app, args):
-    app.restart_kernel()
-    return {"ok": True, "queued": "restart"}
+    """重启内核，并如实回报结果。
+
+    以前固定回 ok=True、把失败藏进 queued，AI 拿到成功就继续下一步，实际内核
+    没起来（端口被占、配置错）时用户只看到「AI 说好了其实没好」。restart_kernel
+    现在返回 bool，这里必须把它当唯一真相。
+    """
+    ok = bool(app.restart_kernel())
+    return {"ok": ok, "queued": "restart",
+            "error": "" if ok else "内核没起来：看 /api/state 的 error 与 kernel 日志"}
 
 
 def _t_proxy(app, args):
@@ -299,7 +308,8 @@ def _t_update_check(app, args):
 
 
 def _t_update_apply(app, args):
-    return app.update_apply()
+    # confirm 只该由人给出：AI 走默认 False，遇到缺校验和会被拒，必须有人点一次
+    return app.update_apply(confirm=_b(args, "confirm", False))
 
 
 def _t_quit(app, args):
@@ -320,8 +330,10 @@ _reg("log.tail", "read", "最近日志", "app.log 末尾若干行",
 # ── 断网急救 ──
 def _t_net_diagnose(app, args):
     """跑一轮网络体检（网关 / DNS / 系统代理 / 内核 / 直连 / MTU / hosts）。"""
-    refresh = args.get("refresh", True)
-    return app.net_diagnose(bool(refresh))
+    # 默认吃缓存：这是 read 级工具，AI 常常连着问几轮「现在什么情况」，每轮都
+    # 真跑一遍同步体检会卡 6 秒以上，还可能和用户正在做的切换抢内核端口。
+    # 要新鲜结果（write/full 操作之后复检）就显式传 refresh=true。
+    return app.net_diagnose(_b(args, "refresh", False))
 
 
 def _t_net_report(app, args):
@@ -348,7 +360,7 @@ def _t_net_repair(app, args):
 # 断网急救：read 看结论，full 才允许动手（改系统代理 / 重启内核都算重手）
 _reg("net.diagnose", "read", "网络体检",
      "12 项检查：链路/网关/DNS 配置/本机解析/域名解析/系统代理/内核端口/直连/MTU/hosts/代理冲突/IPv6；每项带 fix 动作名",
-     {"refresh": "true 默认；false 吃缓存"}, _t_net_diagnose, {"refresh": True})
+     {"refresh": "false 默认吃缓存（快）；true 现场重跑（6s+）"}, _t_net_diagnose, {"refresh": False})
 _reg("net.report", "read", "体检报告文本", "把最近一次体检渲染成可复制的纯文本", {}, _t_net_report)
 _reg("net.fix", "full", "修单项网络问题",
      "动作名取自体检结果里的 checks[].fix：fix_proxy / fix_dns / flush_dns / start_dns / restart_kernel / renew_ip / restart_adapter / winsock_reset / clean_hosts / open_portal",
@@ -410,16 +422,39 @@ _reg("app.quit", "full", "退出程序", "关闭 VPNTray（系统代理会释放
 
 
 # ────────────────────────── 凭证 / 权限 ──────────────────────────
+_TOKEN_LOCK = threading.Lock()
+
+
 def ensure_token(settings) -> str:
-    tok = str(settings.get(TOKEN_KEY) or "")
-    if len(tok) < 16:
-        tok = secrets.token_urlsafe(24)
-        settings[TOKEN_KEY] = tok
-        try:
-            settings.save()
-        except Exception as e:  # noqa: BLE001
-            log.warning("保存 AI token 失败：%s", e)
-    return tok
+    """取（必要时生成）AI token。
+
+    加锁的原因：/api/state 每秒被前端轮询一次，Web 线程和托盘线程可能同时进来。
+    旧代码在 len(tok)<16 时各自生成一个再各自 save()，后写的覆盖先写的，于是
+    面板上复制的 token 和 AI 客户端手里的对不上（401 排查起来毫无线索）。
+    """
+    with _TOKEN_LOCK:
+        tok = str(settings.get(TOKEN_KEY) or "")
+        if len(tok) < 16:
+            tok = secrets.token_urlsafe(24)
+            settings[TOKEN_KEY] = tok
+            try:
+                settings.save()
+            except Exception as e:  # noqa: BLE001
+                log.warning("保存 AI token 失败：%s", e)
+        return tok
+
+
+def mask_token(tok: str) -> str:
+    """只露头尾各 4 位。
+
+    /api/state 会被前端、浏览器插件、屏幕录制、以及用户粘进聊天框的日志看到，
+    明文 token 等于把这些渠道全变成密钥泄漏面；而「复制」按钮又需要一个能确认
+    「这是哪个 token」的短标识，所以保留头尾。太短的值直接全遮，避免遮了等于没遮。
+    """
+    tok = str(tok or "")
+    if len(tok) < 12:
+        return "****" if tok else ""
+    return tok[:4] + "****" + tok[-4:]
 
 
 def level(settings) -> str:
@@ -431,14 +466,25 @@ def enabled(settings) -> bool:
     return bool(settings.get(ENABLED_KEY, True))
 
 
-def state(app) -> dict[str, Any]:
+def state(app, reveal: bool = False) -> dict[str, Any]:
+    """AI 接口面板状态。
+
+    reveal=False（默认）时 token 只回掩码；明文只在 POST /api/ai/api
+    {"action":"reveal"} 且 Origin 校验通过时返回（由 webui 决定），这样「复制」
+    依旧能拿到真 token，而截图/日志/插件看到的永远是掩码。
+    "token" 字段保留但改成掩码，是为了不打破旧前端和外部脚本对结构的假设。
+    """
     s = app.settings
     tok = ensure_token(s)
+    masked = mask_token(tok)
     return {
         "enabled": enabled(s),
         "level": level(s),
         "level_text": LEVEL_TEXT.get(level(s), ""),
-        "token": tok,
+        "token": tok if reveal else masked,
+        "token_masked": masked,
+        "token_available": bool(tok),
+        "token_revealed": bool(reveal),
         "path": "/ai/v1/call",
         "manifest": "/ai/v1/manifest",
         "tools": len(TOOLS),

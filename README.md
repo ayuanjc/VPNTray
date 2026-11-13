@@ -426,6 +426,26 @@ python -m pytest tests -q           # 单元测试
 
 ## 11. 更新日志
 
+### 3.0.2 — 全量审查后的加固版（无新功能，只修坑）
+
+对着 16k 行代码做了一遍逐文件审查 + 五个并行代理复核，修掉 7 条会导致功能不可用的缺陷和
+约 30 条隐患，全部有测试兜底（pytest 176 例）：
+
+- **TUN 一直开不起来**：restart_kernel() 以前返回 None，set_tun() 里 ok = restart_kernel() 恒假，每次都被判成失败并回滚。现在只有端口真的起来才返回 True，抢不到工作锁单独用 state["kernel_skip"] 标出（不再冒充失败）。
+- **非 select 模块规则全丢**：configgen 以前按 type=="select" 重算场景开关，url-test / fallback / load-balance 模块的域名规则一条都不插。现在用 _scene_groups() 的真实结果。
+- **断网急救的 DNS 修复 100% 失败**：解析 netsh interface show interface 的正则按「接口 + 网卡名」两列写，实际输出是四列（Enabled Connected Dedicated WLAN），永远匹配不到网卡名。改成按词解析，中英输出都认，Get-NetAdapter 优先、netsh 兜底。
+- **hosts 修复会污染文件**：以前 open(path, "w") 截断重写、一律按 UTF-8 读，GBK 的 hosts 会被写坏。现在先探测编码（utf-8-sig → utf-8 → gbk，全失败只报告不写回）、原子写（tmp + fsync + os.replace）、保留原权限位。
+- **系统代理备份被自己覆盖**：netguard.wipe_system_proxy() 以前拿一份空备份覆盖用户的原始代理设置，清一次就永久丢失。现在只走 sysproxy.freeze_backup()；sysproxy.enable() 备份写失败直接抛错、不接管。
+- **存储型 XSS**：节点名来自订阅（第三方可控），概览卡片拼接时没转义就进 innerHTML。现在全部走 esc()。
+- **更新包校验**：非 API 路径以前 zip_sha256 恒为空且「无哈希就跳过校验」。现在按 <zip>.sha256 → SHA256SUMS.txt → API digest 的顺序找哈希，拿不到就拒绝自动安装（人工确认后可用「仍然安装」放行），下载后再校验一次；版本比较逐段数字（3.0.10 > 3.0.9），解压前卡总字节与单文件大小。
+- **凭据加密**：settings.json 里的 controller secret 与 AI 接口 token 现在用 DPAPI 封装（前缀 dpapi:v1:，只有当前 Windows 账户解得开），文件权限收到仅当前用户（icacls）。
+- **配置坏了不再全丢**：settings.json 整体解析失败时逐键抢救，能救回的订阅地址/节点选择继续用；字段类型不对先备份 settings.json.bad-<时间戳> 再回落默认值；旧的 steam_*/github_* 在模块物化后按 schema_version 清理。
+- **并发与卡死**：AI 面板轮询失败会永久停更（旗标在 await 前就置位）已修，加了 12/30 秒超时、退避到 30 秒、切回标签页立刻刷新；托盘「重启内核」连点两次不再起两条线程；state["busy"] 不再当任务锁用（改用 _work_try / _work_done）。
+- **界面与接口**：响应头补 X-Frame-Options / nosniff / Referrer-Policy / CSP；AI token 在 /api/state 里默认掩码，点「显示」才回传；断网急救可以异步跑（POST /api/net/diagnose/start），不再让转圈卡 6 秒。
+- **数据目录不可写**：装到 Program Files 这类受保护目录时，data/ 自动退到 %LOCALAPPDATA%\\VPNTray\\data，状态里带 data_dir_fallback 供界面提示。
+- 订阅层：base64 / URL-safe / GBK / BOM 订阅都能解；YAML 别名炸弹有上限；空 proxies、悬空策略组自动修复；缓存写失败不再谎报成功。
+- 测速纯度：One-IP 探测走本地代理，不再有环境变量能把它指到别的站点。
+
 ### 3.0.1 — 检查更新说「未配置 update_repo」已修
 
 - 更新仓库填错/留空不再是一句干巴巴的报错：`updater.normalize_repo()` 会把 `https://github.com/owner/name`、`owner/name/`、`owner/name.git`、`owner/name/releases/...`、前后空格统一收敛成 `owner/name`，非法字符或只填一半才报错，并说清该写什么。

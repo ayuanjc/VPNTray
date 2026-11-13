@@ -150,13 +150,19 @@ def read_fingerprint() -> dict[str, Any]:
     font_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
     cn_fonts = [f for f in ("msyh.ttc", "msyhbd.ttc", "simsun.ttc", "simhei.ttf", "deng.ttf")
                 if (font_dir / f).exists()]
-    return {
+    fp = {
         "tz_id": tz_id,
         "locale": locale_name,
         "lang": locale_lang,
         "ui_culture": ui_lang,
         "cn_fonts": cn_fonts,
     }
+    # 读不到时区就明确标记出来：下游把空字符串当成「偏移 0」会算出 0 分，
+    # 显示成「低风险」——正好把最可疑的场景报成最安全。
+    fp["ok"] = bool(tz_id)
+    if not tz_id:
+        fp["error"] = "读不到系统时区（tzutil 不可用或缺少权限）"
+    return fp
 
 
 def _tz_offset_hours(tz_id: str) -> float | None:
@@ -185,12 +191,16 @@ def score(fp: dict[str, Any], exit_cc: str = "") -> dict[str, Any]:
     exit_cc = (exit_cc or "").strip().upper()
 
     off = _tz_offset_hours(fp.get("tz_id", ""))
-    if off is not None and abs(off - 8) < 0.01:
+    if off is None:
+        # 探测失败就是「不知道」，不给分也不给「低风险」结论
+        hits.append({"score": 0, "item": "读不到系统时区，这一项无法评估",
+                     "fix": "以管理员身份重跑，或检查 tzutil 是否可用"})
+    elif abs(off - 8) < 0.01:
+        # 「系统时区是 UTC+8」和「时区偏移 +480 分钟」是同一个事实的两种说法，
+        # 原来按两条信号各加 30、8 分，等于一次暴露按两遍扣分。合并成一条。
         total += 30
-        hits.append({"score": 30, "item": "系统时区为 UTC+8", "fix": "改成 US/JP/EU 时区，或只用启动脚本里的 TZ"})
-    if off is not None and abs(off - 8) < 0.01:
-        total += 8
-        hits.append({"score": 8, "item": "时区偏移 +480 分钟", "fix": "同上"})
+        hits.append({"score": 30, "item": "系统时区为 UTC+8（偏移 +480 分钟）",
+                     "fix": "改成 US/JP/EU 时区，或只用启动脚本里的 TZ"})
 
     lang = (fp.get("locale") or "").lower()
     ui = (fp.get("ui_culture") or "").lower()
@@ -214,8 +224,12 @@ def score(fp: dict[str, Any], exit_cc: str = "") -> dict[str, Any]:
                              "fix": "点「一键对齐」把时区切到出口国家"})
 
     total = min(100, total)
-    grade = "低" if total < 30 else ("中" if total < 60 else "高")
-    return {"score": total, "grade": grade, "hits": hits,
+    known = off is not None
+    if not known:
+        grade = "unknown"
+    else:
+        grade = "低" if total < 30 else ("中" if total < 60 else "高")
+    return {"score": total, "grade": grade, "known": known, "hits": hits,
             "tz_id": fp.get("tz_id"), "offset": off,
             "locale": fp.get("locale"), "cn_fonts": len(fp.get("cn_fonts") or [])}
 
@@ -249,6 +263,23 @@ def current_tz() -> str:
     return _run(["tzutil", "/g"])
 
 
+def set_timezone_for_ex(cc: str) -> tuple[bool, str, bool]:
+    """同 set_timezone_for，但额外返回 need_admin（界面据此显示「以管理员重试」）。"""
+    ok, msg = set_timezone_for(cc)
+    if ok:
+        return True, msg, False
+    # 失败原因只有两种：没有映射 / 权限不够。tzutil 在非提权下会静默失败，
+    # 所以「切换后读到的值没变」基本就是权限问题，除非本来就是映射缺失。
+    need = "没有" not in msg and "读不到当前时区" not in msg
+    if need:
+        try:
+            from .netguard import is_admin
+            need = not bool(is_admin())
+        except Exception:  # noqa: BLE001
+            need = True
+    return False, msg, need
+
+
 def set_timezone_for(cc: str) -> tuple[bool, str]:
     """把系统时区切到出口国家对应时区，原值记下来可还原。"""
     cc = (cc or "").upper()
@@ -270,13 +301,19 @@ def set_timezone_for(cc: str) -> tuple[bool, str]:
 
 
 def restore_timezone() -> tuple[bool, str]:
+    """还原到备份里的原时区。返回值必须如实反映结果。"""
     bak = _load_backup() or {}
     tz = bak.get("tz_id")
     if not tz:
-        return False, "没有可还原的时区备份"
+        # 「没检测到备份」不等于「已恢复」：以前这里回的是「已还原为 X」的看法
+        # 一旦备份丢失，用户会以为系统时区已经复原，其实什么都没改。
+        return False, "没有时区备份（未修改过，或备份文件已丢失），未做任何修改"
     _run(["tzutil", "/s", tz])
     now = current_tz()
-    ok = bool(now) and now.lower() == str(tz).lower()
+    if not now:
+        # 读不到结果就不能声称成功
+        return False, f"已尝试还原为 {tz}，但读不到当前时区，无法确认结果"
+    ok = now.lower() == str(tz).lower()
     if ok:
         # 还原成功就清掉备份，否则下次「设置时区」会把软件自己的时区当成原值备份进去
         for p in (BACKUP, _LEGACY_BACKUP):
@@ -284,7 +321,8 @@ def restore_timezone() -> tuple[bool, str]:
                 p.unlink(missing_ok=True)
             except OSError:
                 pass
-    return ok, f"已还原为 {now or tz}"
+        return True, f"已还原为 {now}"
+    return False, f"还原失败：目标 {tz}，当前仍是 {now}（可能需要管理员权限）"
 
 
 # ────────────────────────── 启动脚本（只影响 AI 进程） ──────────────────────────

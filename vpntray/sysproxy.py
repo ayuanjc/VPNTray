@@ -114,26 +114,77 @@ def _load_backup() -> dict | None:
     return None
 
 
-def _save_backup(d: dict) -> None:
-    """原子写 + 双份：备份是「退出时还原」的唯一依据，写坏了就是永久断网。"""
+# 用户主动要求「直连」的标记。和备份分开存：清理别家代理时既不能改写备份
+# （那是退出时还原的唯一依据），退出时也不能把用户那个已经死掉的旧代理装回去。
+DIRECT_MARK = BACKUP.with_name("sysproxy_direct.json")
+
+
+def _save_backup(d: dict) -> bool:
+    """原子写 + 双份：备份是「退出时还原」的唯一依据，写坏了就是永久断网。
+
+    返回 False 表示没落盘 —— 调用方必须因此放弃接管：接管了却没有原值，
+    退出时就再也还原不了，用户原有的代理设置等于被我们吃掉。
+    """
     ensure_dirs()
     body = json.dumps(d, ensure_ascii=False, indent=2)
-    BACKUP.parent.mkdir(parents=True, exist_ok=True)
-    tmp = BACKUP.with_name(BACKUP.name + ".tmp")
+    ok = True
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(body)
-            f.flush()
-            os.fsync(f.fileno())
+        BACKUP.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BACKUP.with_name(BACKUP.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, BACKUP)
     except OSError as e:
         log.warning("写入系统代理备份失败: %s", e)
+        ok = False
     # 旧位置也写一份，方便回退到旧版本时不丢
     try:
         LEGACY_BACKUP.parent.mkdir(parents=True, exist_ok=True)
         LEGACY_BACKUP.write_text(body, encoding="utf-8")
-    except Exception:  # noqa: BLE001
+    except OSError:
         pass
+    return ok
+
+
+def freeze_backup(force: bool = False) -> dict:
+    """把「此刻」的注册表值冻结成接管前原值；已有备份时默认不动。
+
+    force=False 才安全：清理别家代理（netguard.wipe_system_proxy）以前直接
+    用 {ProxyEnable:0, ProxyServer:None, ...} 覆盖这份备份，用户原设置从此丢失。
+    冻结只在「还没有备份」时发生，之后谁都不许改写。
+    """
+    with _lock:
+        old = None if force else _load_backup()
+        if old:
+            return old
+        fresh = snapshot()
+        if not _save_backup(fresh):
+            # 冻结失败不影响「现在要直连」这件事，但必须留痕：
+            # 没有备份意味着退出时还原不了用户原设置，排查问题时要能看到这条。
+            log.warning("冻结系统代理原值失败（退出时将无法还原）")
+        return fresh
+
+
+def mark_direct(on: bool = True) -> None:
+    """记「用户要直连」：退出还原时见它就保持直连，不装回旧代理。"""
+    try:
+        ensure_dirs()
+        if on:
+            DIRECT_MARK.parent.mkdir(parents=True, exist_ok=True)
+            DIRECT_MARK.write_text(json.dumps({"direct": True}), encoding="utf-8")
+        elif DIRECT_MARK.exists():
+            DIRECT_MARK.unlink()
+    except OSError as e:
+        log.warning("写直连标记失败: %s", e)
+
+
+def _direct_intent() -> bool:
+    try:
+        return DIRECT_MARK.exists()
+    except OSError:
+        return False
 
 
 def current() -> dict:
@@ -181,7 +232,10 @@ def enable(server: str = "127.0.0.1:7891") -> None:
                 log.info("检测到上次残留的代理设置，还原目标改为「关闭系统代理」")
                 fresh = {"ProxyEnable": 0, "ProxyServer": None,
                          "ProxyOverride": None, "AutoConfigURL": None}
-            _save_backup(fresh)
+            if not _save_backup(fresh):
+                # 备份没落盘就绝对不能接管：接管了却没有原值，退出时无法还原，
+                # 用户原来的代理设置等于被我们吃掉，而且他事后无从恢复 —— 那是永久断网。
+                raise RuntimeError("系统代理备份写入失败，为避免无法还原，本次不接管系统代理")
             log.info("已备份原系统代理设置: %s", fresh.get("ProxyServer"))
 
         if _read("AutoConfigURL"):
@@ -208,8 +262,17 @@ def disable() -> None:
 
     这里每一步都必须独立兜底：只要有一项抛异常就整体中断，
     可能停在「ProxyEnable=1 但 ProxyServer 已被删」的状态 —— 那就是全系统断网。
+    另外必须和 enable() 抢同一把 _lock：健康看护线程每 20 秒 enable 一次，
+    与用户关开关并发时，还原和接管会交错写注册表，写出「半套配置」。
     """
+    with _lock:
+        _disable_locked()
+
+
+def _disable_locked() -> None:
+    """disable() 的实际内容，调用方必须已经持有 _lock。"""
     bak = _load_backup() or {}
+    direct = _direct_intent()
     failed = 0
     if bak:
         if bak.get("ProxyEnable") is None:
@@ -227,6 +290,14 @@ def disable() -> None:
             log.warning("系统代理还原有 %d 项失败，强制关闭代理以免断网", failed)
             _safe(lambda: _write("ProxyEnable", 0, winreg.REG_DWORD), "强制关闭 ProxyEnable")
             _safe(lambda: _delete("ProxyServer"), "强制删除 ProxyServer")
+        elif direct:
+            # 用户此前点过「一键清理」，要的是直连。原值照原样写回（备份与还原
+            # 都必须保真，那是我们唯一能回滚的依据），最后再把开关压回关闭，
+            # 免得那个已经死掉的旧代理又被装回去。
+            _safe(lambda: _write("ProxyEnable", 0, winreg.REG_DWORD), "关闭 ProxyEnable")
+            _safe(lambda: _delete("ProxyServer"), "删除 ProxyServer")
+            _safe(lambda: _delete("AutoConfigURL"), "删除 AutoConfigURL")
+            log.info("系统代理已还原原值，但用户此前要求直连，保持关闭")
         else:
             log.info("系统代理已还原 -> %s", _read("ProxyServer") or "（直连）")
     else:
@@ -234,7 +305,11 @@ def disable() -> None:
         log.warning("未找到系统代理备份，已关闭系统代理（直连）")
         _safe(lambda: _write("ProxyEnable", 0, winreg.REG_DWORD), "关闭 ProxyEnable")
         _safe(lambda: _delete("ProxyServer"), "删除 ProxyServer")
+    if direct:
+        # 直连意图只用一次：还原完就清掉，免得下次真正的还原也被它拦掉。
+        mark_direct(False)
     _internet_set_option()
 
 
-__all__ = ["enable", "disable", "snapshot", "current", "is_enabled_to", "BYPASS"]
+__all__ = ["enable", "disable", "snapshot", "current", "is_enabled_to",
+           "freeze_backup", "mark_direct", "BYPASS"]

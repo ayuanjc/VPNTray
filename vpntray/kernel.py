@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import shutil
 import socket
@@ -31,7 +32,14 @@ def port_free(port: int, host: str = "127.0.0.1") -> bool:
         if probe.connect_ex((host, port)) == 0:
             return False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # 关键：Windows 上 SO_REUSEADDR 允许绑定到别人正在监听的端口，
+        # 绑上了就等于「空闲」，后面 Popen 出去的内核才报 address in use。
+        # 独占模式才是真正的「这个端口现在能不能给我」。
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
         try:
             s.bind((host, port))
             return True
@@ -93,6 +101,40 @@ def _kill_pid_from_hint(hint: str) -> None:
         pass
 
 
+def _digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_sidecar(dst: Path) -> None:
+    """把已复制文件的哈希写到 <名字>.sha256，下次启动只需比对一次哈希。"""
+    try:
+        (DATA / (dst.name + ".sha256")).write_text(_digest(dst), encoding="ascii")
+    except OSError as e:
+        log.warning("写地理数据哈希失败（下次会重新比对全文）: %s", e)
+
+
+def _same_content(src: Path, dst: Path) -> bool:
+    """只比文件大小是不够的：同样大小的新版 geosite.dat 会被当成「已就位」，
+    用户升级程序后规则悄悄停在半年前的版本上。这里比哈希，并留 sidecar 缓存。
+    """
+    try:
+        if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+            return False
+        side = DATA / (dst.name + ".sha256")
+        if side.exists():
+            try:
+                return side.read_text(encoding="ascii").strip() == _digest(src)
+            except OSError:
+                pass
+        return _digest(src) == _digest(dst)
+    except OSError:
+        return False
+
+
 def ensure_geo_assets() -> None:
     """mihomo 从 -d 目录读取地理数据，首次运行需要就位。"""
     ensure_dirs()
@@ -103,8 +145,9 @@ def ensure_geo_assets() -> None:
             log.warning("缺少地理数据文件: %s", src)
             continue
         dst = DATA / src.name
-        if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+        if not _same_content(src, dst):
             shutil.copyfile(src, dst)
+            _write_sidecar(dst)
             log.info("地理数据就位: %s", dst.name)
 
 
@@ -164,6 +207,9 @@ class Kernel:
         # 就绪等待最长 20s —— 这些都在锁里做的话，退出/重启会被硬拖住。
         with self._lock:
             if self.proc and self.proc.poll() is None:
+                # 看门狗可能因为「连续崩溃放弃」已经退出，这里补一次，
+                # 否则进程活着但没人看着，崩溃后再也不自愈。
+                self._ensure_watch()
                 return True
         if not MIHOMO.exists():
             self.last_error = f"内核不存在: {MIHOMO}"
@@ -244,6 +290,8 @@ class Kernel:
         """看门狗只能有一个：重启路径反复 start() 绝不能把线程越堆越多。"""
         if self._watch and self._watch.is_alive():
             return
+        if self._stop.is_set():     # 正在退出：别在关闭流程里再起一个循环
+            return
         self._watch = threading.Thread(target=self._watchdog, name="kernel-watch", daemon=True)
         self._watch.start()
 
@@ -264,20 +312,29 @@ class Kernel:
         log.info("内核已停止")
 
     def _terminate(self, wait: float = 6.0) -> None:
-        p = self.proc
-        self.proc = None
-        if not p:
-            return
-        try:
+        # 句柄必须先留着：以前这里一进来就把 self.proc 置 None，terminate 抛异常
+        # 或超时后 kill 也失败时，进程就彻底失联 —— 端口被占、系统代理指着它，
+        # 而程序已经不知道该 PID 是谁。现在只有确认「已经死了或杀不掉」才放手。
+        with self._lock:
+            p = self.proc
+            if not p:
+                return
+            try:
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=wait)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait(timeout=3)
+            except Exception as e:  # noqa: BLE001
+                log.warning("停止内核异常: %s", e)
+            finally:
+                if p.poll() is not None or self._stop.is_set():
+                    if self.proc is p:
+                        self.proc = None
             if p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=wait)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait(timeout=3)
-        except Exception as e:  # noqa: BLE001
-            log.warning("停止内核异常: %s", e)
+                log.error("内核进程仍在运行（pid=%s），保留句柄等待下次重试", p.pid)
 
     def _kill(self) -> None:
         self._terminate(wait=3.0)

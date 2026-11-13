@@ -12,6 +12,8 @@ import logging
 import os
 import re
 import socket
+import tempfile
+import threading
 import time
 from datetime import datetime
 from typing import Any
@@ -159,8 +161,10 @@ def fetch_userinfo(url: str, ua: str, local_port: int, timeout: int = 10) -> dic
         return {}
     for proxies in _proxies_candidates(local_port):
         try:
+            # 只读响应头，不需要给它长超时；候选逐个试，单个卡住会把 UI 线程拖死
             r = requests.get(url, headers={"User-Agent": ua, "Accept": "*/*"},
-                             proxies=proxies or None, timeout=timeout, stream=True)
+                             proxies=proxies or None,
+                             timeout=min(_MAX_NET_TIMEOUT, timeout), stream=True)
             try:
                 hdr = r.headers.get("subscription-userinfo") or r.headers.get("Subscription-Userinfo")
             finally:
@@ -220,7 +224,10 @@ def fetch(url: str, ua: str, local_port: int, timeout: int = 25) -> bytes:
             with requests.Session() as s:
                 s.trust_env = False  # 不读环境变量里的系统代理
                 s.proxies.update(prox)
-                with s.get(url, headers=headers, timeout=timeout, stream=True) as r:
+                # 单次读写上限 15 秒：total 传进来的 25 秒是「整包」预算，但 requests
+                # 的 timeout 是单次 socket 操作，放大到 25 秒在断流节点上等于白等。
+                with s.get(url, headers=headers,
+                           timeout=min(_MAX_NET_TIMEOUT, timeout), stream=True) as r:
                     if r.status_code != 200:
                         raise SubscriptionError(f"HTTP {r.status_code}")
                     # 以前只在 parse() 里检查上限，但那时整包已经读进内存了：
@@ -251,38 +258,76 @@ def fetch(url: str, ua: str, local_port: int, timeout: int = 25) -> bytes:
 
 
 def _maybe_base64(text: str) -> str:
-    """有些机场给的是 base64 编码的节点列表。"""
+    """有些机场给的是 base64 编码的节点列表。
+
+    base64 至少四种变体：标准/URL-safe、带/不带 = padding。以前只认「长度能被 4
+    整除」的标准串，URL-safe（- _ 代替 + /）和去掉 padding 的会被原样丢给 YAML，
+    于是用户只看到「订阅内容不是 YAML 字典」。这里先归一化再解。
+    """
     s = text.strip()
     if "proxies:" in s:
         return s
     compact = "".join(s.split())
-    if len(compact) < 32 or len(compact) % 4:
+    if len(compact) < 32:
         return s
+    compact = compact.replace("-", "+").replace("_", "/").rstrip("=")
     try:
         raw = base64.b64decode(compact + "=" * (-len(compact) % 4), validate=False)
-        dec = raw.decode("utf-8", "ignore")
     except Exception:  # noqa: BLE001
         return s
+    if not raw:
+        return s
+    # 解出来必须是文本；图片/加密串解出来是乱码，直接当「不是 base64」放回去
+    try:
+        dec = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        dec = raw.decode("gb18030", "ignore")
     return dec if ("proxies:" in dec or "://" in dec) else s
 
 
 MAX_SUB_BYTES = 8 * 1024 * 1024   # 订阅体量上限，防止恶意/异常订阅吃爆内存
+_MAX_NET_TIMEOUT = 15.0           # 单次网络操作的上限，断流节点不能把刷新挂住
 MAX_RULES = 20000
+
+
+def _decode_sub(content: bytes) -> str:
+    """按 BOM → utf-8 → gb18030 的顺序解码订阅正文。
+
+    以前一律 utf-8 errors="ignore"：GBK 订阅里每个中文字符都会变成 U+FFFD，
+    节点名被污染后去重、规则匹配全部错位，用户看到的是「配置全是问号」。
+    """
+    if content.startswith(b"\xef\xbb\xbf"):
+        return content[3:].decode("utf-8", "ignore")
+    for enc in ("utf-8", "gb18030"):
+        try:
+            return content.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", "ignore")
 
 
 def parse(content: bytes) -> dict[str, Any]:
     if len(content) > MAX_SUB_BYTES:
         raise SubscriptionError(f"订阅过大：{len(content) / 1024 / 1024:.1f} MB")
-    text = content.decode("utf-8", "ignore")
-    text = _maybe_base64(text)
+    text = _maybe_base64(_decode_sub(content))
+    if len(text) > MAX_SUB_BYTES:
+        # base64 解出来的可能比原始体还大，解码后再卡一次
+        raise SubscriptionError(f"订阅过大：解码后 {len(text) / 1024 / 1024:.1f} MB")
     try:
         cfg = yaml.safe_load(text)
     except (yaml.YAMLError, RecursionError) as e:
         raise SubscriptionError(f"YAML 解析失败: {e}") from e
+    except MemoryError as e:
+        # 别名炸弹（&a [*a,*a,...]）展开是纯内存爆炸，safe_load 挡不住，只能兜住异常
+        raise SubscriptionError("订阅内容疑似 YAML 别名炸弹，已拒绝解析") from e
     if not isinstance(cfg, dict):
         raise SubscriptionError("订阅内容不是 YAML 字典")
-    if not isinstance(cfg.get("proxies"), list) or not cfg["proxies"]:
-        raise SubscriptionError("订阅里没有 proxies（可能是不支持的明文节点列表格式）")
+    # proxies 允许为空：proxy-providers 形态的订阅本来就没有内联节点，
+    # 「有没有节点」交给 normalize 判断（那里能给出更准确的「没有可用节点」）。
+    if cfg.get("proxies") is None:
+        cfg["proxies"] = []
+    if not isinstance(cfg.get("proxies"), list):
+        raise SubscriptionError("订阅的 proxies 不是列表")
     if not isinstance(cfg.get("proxy-groups"), list) or not cfg["proxy-groups"]:
         raise SubscriptionError("订阅里没有 proxy-groups")
     return cfg
@@ -326,12 +371,10 @@ def normalize(cfg: dict[str, Any]) -> dict[str, Any]:
 
     names = seen_names
 
+    specials = {"DIRECT", "REJECT", "PASS", "GLOBAL"}
     groups: list[dict[str, Any]] = []
     seen_groups: set[str] = set()
-    declared_group_names = {
-        g["name"] for g in (cfg.get("proxy-groups") or [])
-        if isinstance(g, dict) and isinstance(g.get("name"), str) and g["name"].strip()
-    }
+    candidates: list[dict[str, Any]] = []
     for g in cfg.get("proxy-groups") or []:
         if not isinstance(g, dict):
             continue
@@ -339,32 +382,63 @@ def normalize(cfg: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(gname, str) or not gname.strip() or gname in seen_groups:
             continue
         seen_groups.add(gname)
-        g = dict(g)
-        members: list[str] = []
-        for n in g.get("proxies") or []:
-            if not isinstance(n, str):
-                continue
-            if n == gname or n in members:   # 组把自己列为成员 → mihomo 报 loop
-                continue
-            if n in names or n in declared_group_names or n in {"DIRECT", "REJECT", "PASS"}:
-                members.append(n)
-        g["proxies"] = members
-        groups.append(g)
+        candidates.append(dict(g))
+
+    # 反复剔除「成员全被过滤掉」的组：空 proxies 的组 mihomo 直接拒绝加载，
+    # 一个空组就能让整份配置起不来。多轮是因为剔除某个组之后，原本引用它的
+    # 兄弟组可能跟着变空（循环引用链），一轮清不干净。
+    while True:
+        alive = {g["name"] for g in candidates}
+        kept: list[dict[str, Any]] = []
+        for g in candidates:
+            gname = g["name"]
+            members: list[str] = []
+            for n in g.get("proxies") or []:
+                if not isinstance(n, str):
+                    continue
+                if n == gname or n in members:   # 组把自己列为成员 → mihomo 报 loop
+                    continue
+                if n in names or n in alive or n in specials:
+                    members.append(n)
+            g["proxies"] = members
+            if members:
+                kept.append(g)
+            else:
+                log.warning("丢弃没有可用成员的策略组：%s", gname)
+        if len(kept) == len(candidates):
+            break
+        candidates = kept
+    groups = candidates
     if not groups:
-        raise SubscriptionError("订阅里的策略组全部不可用")
+        raise SubscriptionError("订阅里的策略组全部不可用（成员都被过滤掉了）")
 
     # 规则：strip 后过滤，限长限量；MATCH 由我们自己拼，订阅里的一律丢掉
+    valid_policy = {g["name"] for g in groups} | names | specials
+    main_group = groups[0]["name"]
     rules: list[str] = []
+    fixed_policy = 0
     for r in cfg.get("rules") or []:
         if not isinstance(r, str):
             continue
         r = r.strip()
         if not r or r.upper().startswith("MATCH"):
             continue
+        parts = r.split(",")
+        if len(parts) >= 2:
+            policy = parts[-1].strip()
+            if policy and policy not in valid_policy:
+                # 悬空策略组名：规则指向一个不存在的组，mihomo 会整份拒绝加载；
+                # 丢规则又会让流量漏走，所以改指主组（用户仍可在界面上切换）。
+                parts[-1] = main_group
+                r = ",".join(parts)
+                fixed_policy += 1
         rules.append(r[:512])
         if len(rules) >= MAX_RULES:
             log.warning("订阅规则超过 %d 条，已截断", MAX_RULES)
             break
+    if fixed_policy:
+        log.warning("修正 %d 条指向不存在策略组的规则，已改指主组 %s",
+                    fixed_policy, main_group)
 
     dns = cfg.get("dns") if isinstance(cfg.get("dns"), dict) else {}
 
@@ -382,23 +456,46 @@ def normalize(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_cache_lock = threading.Lock()   # 进程内串行化：两个刷新线程同时写会踩同一个临时文件
+
+
 def save_cache(raw: bytes, content: dict[str, Any]) -> str:
-    """原子写订阅缓存：崩在中间也不会留下半截文件。"""
+    """原子写订阅缓存，返回原始内容的 sha256。
+
+    以前写失败只 log 一行就照样返回哈希，上层把哈希当成「缓存已更新」，
+    于是下次启动读到的是旧缓存、界面显示的却是新订阅 —— 静默不一致。
+    现在写失败直接抛，调用方必须知道缓存没写成。
+    """
     ensure_dirs()
-    tmp = SUB_CACHE.with_name(SUB_CACHE.name + ".tmp")
-    try:
-        with open(tmp, "wb") as f:
-            f.write(raw)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, SUB_CACHE)
-    except OSError as e:
-        log.warning("写入订阅缓存失败: %s", e)
+    digest = hashlib.sha256(raw).hexdigest()
+    with _cache_lock:
+        fd = -1
+        tmp = ""
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-    return hashlib.sha256(raw).hexdigest()
+            # mkstemp 拿唯一临时名 + 0600 权限；固定名 .tmp 在多实例下会互相覆盖
+            fd, tmp = tempfile.mkstemp(prefix=SUB_CACHE.name + ".", suffix=".tmp",
+                                       dir=str(SUB_CACHE.parent))
+            with os.fdopen(fd, "wb") as f:
+                fd = -1            # 已交给文件对象，别再手动 close
+                f.write(raw)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, SUB_CACHE)
+            tmp = ""
+        except OSError as e:
+            raise SubscriptionError(f"写入订阅缓存失败：{e}") from e
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    return digest
 
 
 def load_cache() -> dict[str, Any] | None:

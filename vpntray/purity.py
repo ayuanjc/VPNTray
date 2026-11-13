@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -59,30 +60,65 @@ def _session(port: int) -> requests.Session:
 #   2. 所以「拿出口 IP」和「查纯净度」是两条不同的路：IP 必须走代理问
 #      国外站（走代理问国内站会被规则判 DIRECT，拿到的是本机真实 IP），
 #      纯净度则拿这个 IP 直连 net.coffee 查。
-ONEIP_HOST = os.environ.get("VPNTRAY_ONEIP_HOST", "https://ip.net.coffee").rstrip("/")
+# 数据源写死成常量，不再读 VPNTRAY_ONEIP_HOST：那个环境变量任何能改环境的东西
+# 都能改（用户脚本、别的程序拉起的子进程），一旦被改，全机的纯净度检测请求
+# 都会发到第三方地址上去，而请求里带着节点出口 IP。
+ONEIP_HOST = "https://ip.net.coffee"
 ONEIP_MIN_SCORE = 45   # One-IP 官方分档：>=75 good / 45-74 moderate / <45 poor
 
 
-def _oneip(ip: str, timeout: float = 8.0) -> dict[str, Any] | None:
-    """直连 One-IP 数据源，查指定 IP 的画像。失败返回 None，交给上面的兜底。"""
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+
+
+def _oneip_get(url: str, proxies: dict[str, str] | None,
+               timeout: float) -> dict[str, Any] | None:
+    """单次请求 One-IP。失败重试 1 次（共 2 次），退避 0.6s→1.2s。"""
+    for attempt in range(2):
+        try:
+            # trust_env=False：系统代理/HKLM 里配的代理会把「走哪条路」这件事改掉
+            with requests.Session() as s:
+                s.trust_env = False
+                s.proxies = dict(proxies or {})
+                s.headers.update({"User-Agent": _UA})
+                with s.get(url, timeout=min(15.0, timeout)) as r:
+                    if r.status_code != 200:
+                        log.debug("one-ip HTTP %s", r.status_code)
+                        return None
+                    return r.json()
+        except Exception as e:  # noqa: BLE001
+            log.debug("one-ip 第 %d 次失败: %s", attempt + 1, e)
+            if attempt == 0:
+                time.sleep(0.6 * 2 ** attempt)
+    return None
+
+
+def _oneip(ip: str, timeout: float = 8.0,
+           port: int | None = None) -> dict[str, Any] | None:
+    """查指定 IP 的 One-IP 画像，失败返回 None，交给上面的兜底。
+
+    先借本地代理出口（和节点同一条路，运营商看不到这次查询）；代理这条路
+    对 net.coffee 有时握不上 TLS（历史上出现过 SSLEOFError），所以失败后
+    再直连，并在结果里用 _via 标明实际走的哪条路 —— 直连意味着本机 IP 暴露
+    给了数据源，界面/日志要能看出来。
+    """
     url = f"{ONEIP_HOST}/api/ip/lookup/{ip}"
+    routes: list[tuple[str, dict[str, str] | None]] = []
     try:
-        # 直连：trust_env=False 且不设 proxies，避免被系统代理/HKLM 带偏
-        with requests.Session() as s:
-            s.trust_env = False
-            s.proxies = {}
-            s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            with s.get(url, timeout=timeout) as r:
-                if r.status_code != 200:
-                    log.debug("one-ip HTTP %s", r.status_code)
-                    return None
-                d = r.json()
-    except Exception as e:  # noqa: BLE001
-        log.debug("one-ip 失败: %s", e)
-        return None
-    if not isinstance(d, dict) or str(d.get("ip") or "") != ip:
-        return None
-    return d
+        if port and 1024 <= int(port) <= 65535:
+            p = f"http://127.0.0.1:{int(port)}"
+            routes.append(("proxy", {"http": p, "https": p}))
+    except (TypeError, ValueError):
+        pass
+    routes.append(("direct", None))
+    for via, proxies in routes:
+        d = _oneip_get(url, proxies, timeout)
+        if not isinstance(d, dict):
+            continue
+        if str(d.get("ip") or "") != ip:
+            continue
+        d["_via"] = via
+        return d
+    return None
 
 
 def _from_oneip(ip: str, d: dict[str, Any]) -> dict[str, Any]:
@@ -155,10 +191,11 @@ def fetch_exit_info(port: int, timeout: float = 9.0) -> dict[str, Any] | None:
         except Exception as e:  # noqa: BLE001
             log.debug("ip-api 失败: %s", e)
 
-        # 第二步：拿这个出口 IP 直连 One-IP 查纯净度（trust_score + flags）
-        one = _oneip(ip, timeout=min(timeout, 8.0)) if ip else None
+        # 第二步：拿这个出口 IP 查 One-IP（trust_score + flags），优先仍走代理
+        one = _oneip(ip, timeout=min(timeout, 8.0), port=port) if ip else None
         if one:
             info = _from_oneip(ip, one)
+            info["via"] = one.get("_via") or "proxy"
             # 坐标只有 ip-api 有，补进去；其余字段一律以 One-IP 为准
             loc = info["location"]
             loc["latitude"] = base.get("lat")
@@ -176,6 +213,7 @@ def fetch_exit_info(port: int, timeout: float = 9.0) -> dict[str, Any] | None:
                 d = r.json()
                 if isinstance(d, dict) and d.get("ip"):
                     d["_src"] = "ipapi.is"
+                    d["via"] = "proxy"
                     return d
         except Exception as e:  # noqa: BLE001
             log.debug("ipapi.is 失败: %s", e)
@@ -200,6 +238,7 @@ def fetch_exit_info(port: int, timeout: float = 9.0) -> dict[str, Any] | None:
                 "asn": {"org": base.get("asname") or base.get("as"), "type": "hosting" if hosting else "isp"},
                 "company": {"name": base.get("org") or base.get("isp"), "type": "hosting" if hosting else "isp"},
                 "_src": "ip-api",
+                "via": "proxy",
             }
 
     return None
@@ -406,11 +445,60 @@ def _save(d: dict[str, Any]) -> None:
             pass
 
 
+# ── 内存缓冲 + 延迟落盘 ──
+# put() 以前每测完一个节点就把整份 JSON 读一遍、改一条、再全量写回去：测 100 个
+# 节点 = 100 次全量读写，文件长到几万条时每次都是几百 KB，而且 put 是在刷节点表
+# 的循环里被调用的，磁盘 I/O 直接把检测流程拖慢。现在全部改在内存里，攒一小段
+# 时间原子落盘一次，退出时 atexit 再兜一次。
+_mem: dict[str, Any] | None = None
+_flush_timer: threading.Timer | None = None
+_flush_lock = threading.Lock()   # 保护 _flush_timer，避免两个线程各起一个 Timer
+_FLUSH_DELAY = 2.0
+
+
+def _flush_now() -> None:
+    """把内存里的缓存原子落盘一次（没有待写内容就什么都不做）。"""
+    global _mem
+    with _lock:
+        d = _mem
+        _mem = None
+    with _flush_lock:
+        globals()["_flush_timer"] = None
+    if d is not None:
+        _save(d)
+
+
+def _schedule_flush() -> None:
+    global _flush_timer
+    with _flush_lock:
+        if _flush_timer is not None:
+            return
+        t = threading.Timer(_FLUSH_DELAY, _flush_now)
+        t.daemon = True         # 不能拦住进程退出
+        _flush_timer = t
+        t.start()
+
+
+def flush() -> None:
+    """立刻落盘，幂等。退出流程里调一次，别把刚测出来的结果丢了。"""
+    global _flush_timer
+    with _flush_lock:
+        t, _flush_timer = _flush_timer, None
+    if t is not None:
+        t.cancel()
+    _flush_now()
+
+
+atexit.register(flush)
+
+
 def load_all() -> dict[str, Any]:
     """返回未过期的缓存。单条脏数据只丢这一条，不能连坐整份缓存。"""
     now = time.time()
     out: dict[str, Any] = {}
-    for k, v in _load().items():
+    with _lock:
+        src = _mem if _mem is not None else _load()
+    for k, v in src.items():
         if not isinstance(v, dict):
             continue
         try:
@@ -423,8 +511,11 @@ def load_all() -> dict[str, Any]:
 
 
 def put(name: str, data: dict[str, Any]) -> None:
+    global _mem
     with _lock:
-        d = _load()
+        if _mem is None:
+            _mem = _load()
+        d = _mem
         now = time.time()
 
         def _stale(v: Any) -> bool:
@@ -439,10 +530,13 @@ def put(name: str, data: dict[str, Any]) -> None:
         for k in [k for k, v in d.items() if _stale(v)]:
             d.pop(k, None)
         d[str(name)] = data
-        _save(d)
+    _schedule_flush()
 
 
 def clear() -> None:
+    global _mem
+    with _lock:
+        _mem = None            # 有待写内容时，别让退出前的 flush 又把它写回去
     if CACHE.exists():
         try:
             CACHE.unlink()
@@ -464,7 +558,8 @@ def measure_speed(port: int, timeout: float = 25.0) -> dict[str, Any] | None:
     got = 0
     with _session(port) as s:
         try:
-            with s.get(SPEED_URL, stream=True, timeout=timeout) as r:
+            # 单次 socket 超时压到 15s，长测速靠上面的累计时间硬截
+            with s.get(SPEED_URL, stream=True, timeout=min(15.0, timeout)) as r:
                 if r.status_code != 200:
                     return None
                 for chunk in r.iter_content(65536):

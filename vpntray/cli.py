@@ -9,7 +9,7 @@
     python -m vpntray.cli mode <rule|global|direct>
     python -m vpntray.cli sub              强制更新订阅
     python -m vpntray.cli proxy <on|off>   系统代理开关
-    python -m vpntray.cli down             停止内核并还原系统代理
+    python -m vpntray.cli down [--yes]     停止内核并还原系统代理（不加 --yes 会先确认）
 """
 from __future__ import annotations
 
@@ -22,14 +22,41 @@ from .api import MihomoAPI
 from .app import App
 from .kernel import Kernel
 from .paths import CONFIG
-from .settings import Settings
+from .settings import Settings, port_setting
 
 
 def _out(*a) -> None:
     print(*a)
 
 
+def _safe_int(value, default: int) -> int:
+    """把设置里的数字安全转成 int（手改过的 settings.json 什么都写得出来）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def main(argv: list[str] | None = None) -> int:
+    """命令行总入口：任何异常都翻成一句中文提示 + 非零退出码。
+
+    命令行是最容易拿来「看一眼到底怎么了」的地方，甩一屏 traceback 对用户
+    没有信息量；完整堆栈照样进日志文件，需要排查时去看 app.log。
+    """
+    try:
+        return _main(argv)
+    except SystemExit:
+        raise                      # argparse 的 --help / 参数错误自带退出码
+    except KeyboardInterrupt:
+        _out("\n已取消")
+        return 130
+    except Exception as e:  # noqa: BLE001
+        _out(f"执行失败：{type(e).__name__}: {e}")
+        logger.get("cli").exception("命令行执行失败")
+        return 1
+
+
+def _main(argv: list[str] | None = None) -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -40,11 +67,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("cmd", nargs="?", default="status")
     p.add_argument("arg", nargs="?")
     p.add_argument("--no-proxy", action="store_true", help="不接管系统代理")
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="down 时不再询问，直接停内核并还原系统代理")
     args = p.parse_args(argv)
 
     logger.setup()
     s = Settings()
-    api = MihomoAPI(port=int(s["controller_port"]), secret=s["secret"])
+    # 手改坏的 controller_port 会让每个请求都连到不存在的端口，一律走安全取值
+    api = MihomoAPI(port=port_setting(s, "controller_port", 9091),
+                    secret=s.get("secret") or "")
 
     if args.cmd == "up":
         app = App()
@@ -63,8 +94,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "down":
+        # 还原系统代理 + 杀内核都是立刻能看见后果的动作：命令行里一个手滑的
+        # down 就会把用户正在用的代理断掉，所以缺省只打印计划并要求确认
+        mixed = port_setting(s, "mixed_port", 7891)
+        if not args.yes:
+            _out("将执行以下动作：")
+            _out(f"  1) 关闭 Windows 系统代理（当前指向 127.0.0.1:{mixed} 时会被还原）")
+            _out(f"  2) 结束监听端口 {mixed} 的 mihomo 内核进程")
+            stdin = sys.stdin
+            if stdin is None or not stdin.isatty():
+                # 脚本里误调 down 时绝不能替用户「猜」成同意
+                _out("非交互环境，已取消。确认执行请加 --yes："
+                     "python -m vpntray.cli down --yes")
+                return 2
+            try:
+                ans = input("确认执行？输入 yes 继续：").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                _out("\n已取消")
+                return 2
+            if ans not in ("yes", "y"):
+                _out("已取消")
+                return 2
         sysproxy.disable()
-        pid = _kill_by_port(int(s["mixed_port"]))
+        pid = _kill_by_port(mixed)
         _out(f"已停止（内核 pid={pid}）" if pid else "没有发现正在监听的内核")
         return 0
 
@@ -85,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         _out(f"主组: {group} -> {g.get('now')}")
         _out(f"节点数: {len(g.get('all') or [])}")
         _out(f"累计: ↑{c.get('uploadTotal', 0)} ↓{c.get('downloadTotal', 0)}  连接 {len(c.get('connections') or [])}")
-        server = f"127.0.0.1:{s['mixed_port']}"
+        server = f"127.0.0.1:{port_setting(s, 'mixed_port', 7891)}"
         _out(f"系统代理: {'开' if sysproxy.is_enabled_to(server) else '关'}  ({server})")
         return 0
 
@@ -93,7 +145,8 @@ def main(argv: list[str] | None = None) -> int:
         group = s.get("main_group", "节点选择")
         proxies = api.proxies()
         g = proxies.get(group, {})
-        delays = api.group_delay(group, s.get("delay_url"), int(s.get("delay_timeout_ms", 5000)))
+        delays = api.group_delay(group, s.get("delay_url"),
+                                _safe_int(s.get("delay_timeout_ms"), 5000))
         now = g.get("now")
         for n in g.get("all") or []:
             mark = "●" if n == now else " "
@@ -148,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "proxy":
         if (args.arg or "on") == "on":
-            sysproxy.enable(f"127.0.0.1:{s['mixed_port']}")
+            sysproxy.enable(f"127.0.0.1:{port_setting(s, 'mixed_port', 7891)}")
             _out("系统代理已开启")
         else:
             sysproxy.disable()
@@ -163,7 +216,8 @@ def _kill_by_port(port: int) -> int | None:
     """按端口找到监听进程并结束（用于停止没有托管的残留内核）。
 
     只杀 mihomo：端口有可能是用户自己的别的代理或开发服务，照着端口盲杀
-    会误伤。进程名查不出来时才按端口处理（那种情况只剩残留内核）。
+    会误伤。进程名查不出来（tasklist 被拦截、进程刚退出、系统繁忙）时也绝不
+    盲杀 —— 把 PID 和端口打出来，让用户自己确认。
     """
     import subprocess
 
@@ -185,7 +239,13 @@ def _kill_by_port(port: int) -> int | None:
                 name = raw2.decode("gbk", errors="replace").strip().split(",")[0].strip('"').lower()
             except Exception:  # noqa: BLE001
                 name = ""
-            if name and not name.startswith("mihomo"):
+            if not name:
+                # tasklist 失败时 name 是空串：以前会直接落到 taskkill，等于
+                # 「不知道是谁就杀」，端口上可能是用户自己的服务
+                _out(f"端口 {port} 的进程（PID {pid}）查不到名字，已跳过不杀。")
+                _out(f"  确认是本程序残留内核后手工执行：taskkill /F /PID {pid}")
+                return None
+            if not name.startswith("mihomo"):
                 _out(f"端口 {port} 被 {name}（PID {pid}）占用，不是本程序的内核，不处理")
                 return None
             try:

@@ -32,10 +32,22 @@ FEEDBACK_DIR = DATA / "feedback"
 # GitHub 的 issue 预填走 URL，太长会被浏览器/服务端截断。留一半余量。
 MAX_BODY_IN_URL = 5500
 MAX_LOG_LINES = 400
+_MAX_LOG_TAIL_BYTES = 200 * 1024   # 只读日志尾部这么多字节，别整份读
 
 # ── 脱敏 ────────────────────────────────────────────────────────────────
-_URL_RE = re.compile(r"""(https?://[^\s"'<>）)，。]+)""", re.I)
+# 代理链接本身就是凭证：ss:// 和 vmess:// 的正文就是 base64 里的密码/uuid，
+# 只挡 http(s) 等于把最敏感的那一类漏在日志里。
+_URL_RE = re.compile(
+    r"""((?:https?|ssr?|vmess|vless|trojan|hysteria2?|hy2|tuic|socks5)://[^\s"'<>）)，。]+)""",
+    re.I,
+)
 _IPV4_RE = re.compile(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b")
+# 内网/回环地址：日志里满屏 127.0.0.1，留着既没用又会让人以为泄露了本机地址
+_PRIVATE_RE = re.compile(
+    r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|127\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")
 _IPV6_RE = re.compile(r"\b([0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,7})\b", re.I)
 _SECRET_RE = re.compile(
     r"""((?:password|passwd|pwd|uuid|secret|token|auth|psk|key)\s*[:=]\s*)"""
@@ -45,10 +57,15 @@ _SECRET_RE = re.compile(
 
 
 def _mask_url(u: str) -> str:
-    """保留协议+域名，路径和 query 全打码 —— token 就在这两段里。"""
-    m = re.match(r"(https?)://([^/?#]+)(.*)$", u, re.I)
+    """保留协议+域名，路径和 query 全打码 —— token 就在这两段里。
+
+    ss/vmess 这类协议没有域名可言，正文整段就是凭证，一律只留协议名。
+    """
+    m = re.match(r"([a-z0-9]+)://([^/?#]+)(.*)$", u, re.I)
     if not m:
         return "***"
+    if m.group(1).lower() not in ("http", "https"):
+        return f"{m.group(1).lower()}://***"
     scheme, host, rest = m.group(1), m.group(2), m.group(3)
     if not rest or rest in ("/", ""):
         return f"{scheme}://{host}/"
@@ -71,6 +88,7 @@ def redact(text: str) -> str:
         return ""
     s = _URL_RE.sub(lambda m: _mask_url(m.group(1)), text)
     s = _SECRET_RE.sub(lambda m: m.group(1) + "***", s)
+    s = _PRIVATE_RE.sub("内网IP", s)   # 先摘内网段，再按公网规则打掉主机段
     s = _IPV4_RE.sub(_mask_ip, s)
     s = _IPV6_RE.sub(_mask_ipv6, s)
     # 本机用户名偶尔会出现在路径里
@@ -93,10 +111,22 @@ def _tail_log(lines: int = MAX_LOG_LINES) -> str:
     p = Path(path)
     if not p.exists():
         return f"（日志文件不存在：{p.name}）"
+    # 只读尾部 200KB：日志文件可以长到几百 MB，readlines() 会把整份读进内存，
+    # 在老机器上点一下「生成反馈」就是几秒卡顿甚至 MemoryError。
     try:
-        with open(p, "r", encoding="utf-8", errors="replace") as f:
-            buf = f.readlines()[-lines:]
-        return "".join(buf) or "（日志是空的）"
+        size = p.stat().st_size
+        with open(p, "rb") as f:
+            if size > _MAX_LOG_TAIL_BYTES:
+                f.seek(-_MAX_LOG_TAIL_BYTES, os.SEEK_END)
+                raw = f.read()
+                cut = raw.find(b"\n")
+                if cut >= 0:
+                    raw = raw[cut + 1:]      # 丢掉第一行残片（截断点可能落在行中间）
+            else:
+                raw = f.read()
+        text = raw.decode("utf-8", "replace")
+        buf = text.splitlines()[-lines:]
+        return ("\n".join(buf) + "\n") if buf else "（日志是空的）"
     except OSError as e:
         return f"（读日志失败：{e}）"
 
@@ -187,6 +217,16 @@ def collect(app) -> str:
     return body
 
 
+def _write_text(path: Path, text: str) -> bool:
+    """写文件并回读确认大小对得上。返回真才代表文件真的在磁盘上。"""
+    try:
+        path.write_text(text, encoding="utf-8")
+        return path.exists() and path.stat().st_size > 0
+    except OSError as e:
+        log.warning("写 %s 失败: %s", path.name, e)
+        return False
+
+
 def build(app, title: str, detail: str, email: str = "") -> dict[str, Any]:
     """写文件 + 拼 issue 链接。不联网，纯本地。"""
     ensure_dirs()
@@ -211,13 +251,16 @@ def build(app, title: str, detail: str, email: str = "") -> dict[str, Any]:
         f"```\n{redact(tail)}\n```\n"
     )
 
-    ok_file = True
-    try:
-        md_path.write_text(md, encoding="utf-8")
-        log_path.write_text(redact(tail), encoding="utf-8")
-    except OSError as e:
-        ok_file = False
-        log.warning("写反馈文件失败: %s", e)
+    # 「写成功」以文件真的落地为准：write_text 返回 None，之前 ok 只看异常，
+    # 磁盘满/被杀毒软件锁住时可能什么都没写出来却回 ok=True，用户贴到 issue 上
+    # 才发现没有附件。
+    err = ""
+    ok_md = _write_text(md_path, md)
+    ok_log = _write_text(log_path, redact(tail))
+    ok_file = ok_md and ok_log
+    if not ok_file:
+        err = "写入反馈文件失败"
+        log.warning("写反馈文件失败：md=%s logs=%s", ok_md, ok_log)
 
     repo = str(app.settings.get("update_repo") or "").strip()
     url = ""
@@ -231,12 +274,13 @@ def build(app, title: str, detail: str, email: str = "") -> dict[str, Any]:
         )
         if len(short) > MAX_BODY_IN_URL:
             short = short[:MAX_BODY_IN_URL] + "\n\n…（已截断，完整内容见本地反馈文件）"
-        q = urlencode({"title": f"[反馈] {title}", "body": short, "labels": "反馈"})
+        q = urlencode({"title": f"[反馈] {redact(title)}", "body": short, "labels": "反馈"})
         url = f"https://github.com/{repo}/issues/new?{q}"
 
     log.info("已生成反馈文件 %s", md_path.name if ok_file else "（写入失败）")
     return {
-        "ok": True,
+        "ok": ok_file,
+        "error": err,
         "file": str(md_path) if ok_file else "",
         "log_file": str(log_path) if ok_file else "",
         "dir": str(FEEDBACK_DIR),

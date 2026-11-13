@@ -15,9 +15,18 @@ import time
 import webbrowser
 from typing import Callable
 
-import win32api
-import win32con
-import win32gui
+# pywin32 只有 Windows 才有：webui / 命令行这些入口会间接 import 本模块，
+# 所以导入失败只降级（下面用 _WM_APP 兜住常量），不在 import 期抛异常。
+IMPORT_ERROR = ""
+try:
+    import win32api
+    import win32con
+    import win32gui
+except Exception as _e:  # noqa: BLE001
+    win32api = None                   # type: ignore[assignment]
+    win32con = None                   # type: ignore[assignment]
+    win32gui = None                   # type: ignore[assignment]
+    IMPORT_ERROR = f"原生托盘不可用（pywin32 导入失败）：{_e}"
 
 
 class _GUID(ctypes.Structure):
@@ -54,9 +63,11 @@ from .paths import asset
 
 log = logging.getLogger("tray")
 
-WM_TRAY = win32con.WM_APP + 1
-WM_REFRESH = win32con.WM_APP + 2
-WM_TASK = win32con.WM_APP + 3
+# 导入失败时 win32con 是 None，所以走 getattr 拿 WM_APP 的默认值
+_WM_APP = int(getattr(win32con, "WM_APP", 0x8000))
+WM_TRAY = _WM_APP + 1
+WM_REFRESH = _WM_APP + 2
+WM_TASK = _WM_APP + 3
 
 CLASS_NAME = "VPNTrayNativeWnd"
 TITLE = "VPN Tray"
@@ -95,6 +106,8 @@ FLAG_ORDER = ["🇭🇰", "🇸🇬", "🇯🇵", "🇹🇼", "🇺🇸", "🇰�
 
 class TrayWin:
     def __init__(self, app, webui, on_exit: Callable[[], None] | None = None) -> None:
+        if win32gui is None:
+            raise RuntimeError(IMPORT_ERROR or "原生托盘不可用（pywin32 不可用）")
         self.app = app
         self.webui = webui
         self.on_exit = on_exit
@@ -110,6 +123,8 @@ class TrayWin:
         self._menu_open = False
         self._taskqueue: list[Callable[[], None]] = []
         self._lock = threading.RLock()
+        # -1 是「还没注册」；run() 里在建窗口之前填上
+        self._msg_taskbar_created: int | None = None
 
         app.on_change = self.refresh
         app.on_notify = self.notify
@@ -277,6 +292,9 @@ class TrayWin:
 
         menu = win32gui.CreatePopupMenu()
         sub_menus: list[int] = []
+        # 先给定初值：TrackPopupMenu 抛异常时下面 `if cmd` 会因为未定义而再抛一次，
+        # 结果是右键菜单彻底没反应，日志里还只有一句 NameError
+        cmd = 0
         try:
             # 状态行
             win32gui.AppendMenu(menu, win32con.MF_STRING | win32con.MF_GRAYED, ID_STATUS,
@@ -496,13 +514,36 @@ class TrayWin:
             ID_AUTOBEST: self._toggle_auto_best,
             ID_HEAL: self._toggle_heal,
             ID_SUB: lambda: app.update_subscription(True),
-            ID_RESTART: app.restart_kernel,
+            ID_RESTART: self._restart_kernel,
             ID_CLOSE_CONNS: app.close_connections,
             ID_QUIT: self._quit,
         }
         fn = mapping.get(cmd)
         if fn:
             self._bg(fn)
+
+    def _restart_kernel(self) -> None:
+        """重启内核，并把「没成」的两种原因分别说出来。
+
+        为什么不能直接把 app.restart_kernel 挂到菜单映射上：它现在返回 bool，菜单回调
+        的返回值没人看，重建失败就成了「点了没反应」。它抢不到总锁时同样返回 False，
+        语义是「跳过」而不是失败（此时 state['error'] 为空），所以两种提示必须分开，
+        否则正常并发时用户会看到一条假的失败提示。
+        """
+        try:
+            ok = self.app.restart_kernel()
+        except Exception as e:  # noqa: BLE001
+            log.exception("重启内核调用失败")
+            self.notify(f"内核重启失败：{e}")
+            return
+        if ok:
+            return  # 成功提示由 App 自己发，这里不重复弹
+        err = str(self.app.state.get("error") or getattr(self.app.kernel, "last_error", "") or "")
+        if err:
+            self.notify(f"内核重启失败：{err[:120]}")
+        else:
+            self.notify("内核重启被跳过：有其它任务正在操作内核，请稍后重试")
+
 
     def _toggle_auto_best(self) -> None:
         cur = bool(self.app.settings.get("auto_best", False))
@@ -517,12 +558,28 @@ class TrayWin:
         self.app.notify("已开启节点自愈" if not cur else "已关闭节点自愈")
 
     def _bg(self, fn, *a) -> None:
+        # 同一个动作连点两次不该起两条线程：改内核/改系统代理都是独占操作，
+        # 第二条会撞上 app 的工作锁，用户看到的是「点了没反应」。
+        name = getattr(fn, "__name__", "action")
+        lock = getattr(self, "_bg_lock", None)
+        if lock is None:
+            lock = self._bg_lock = threading.Lock()
+            self._bg_busy = set()
+        with lock:
+            if name in self._bg_busy:
+                self.notify("上一步还在进行，稍等一下")
+                return
+            self._bg_busy.add(name)
+
         def run():
             try:
                 fn(*a)
             except Exception as e:  # noqa: BLE001
                 log.exception("菜单动作失败: %s", e)
                 self.notify(f"操作失败：{e}")
+            finally:
+                with lock:
+                    self._bg_busy.discard(name)
         threading.Thread(target=run, daemon=True).start()
 
     def open_console(self) -> None:
@@ -582,17 +639,38 @@ class TrayWin:
                 win32gui.PostMessage(self.hwnd, win32con.WM_DESTROY, 0, 0)
             except Exception:  # noqa: BLE001
                 pass
-            # 兜底：消息循环万一套不出来，也要保证进程真的结束
-            time.sleep(0.6)
-            log.info("进程强制结束")
+            finally:
+                done.set()
+
+        # 清理完成信号。以前这里是固定 sleep(0.6) 后 os._exit(0)，可
+        # app.shutdown() → kernel.stop() 最长要等 ~9 秒：mihomo 还没退就被掐死，
+        # 7891/9091 被残留进程占着，下次启动直接「端口被占用」。
+        done = threading.Event()
+        threading.Thread(target=cleanup, name="quit", daemon=True).start()
+
+        def finish() -> None:
+            """等清理真的结束再结束进程，最多 8 秒。
+
+            8 秒是折中：比 kernel.stop() 的最坏耗时短，用户点退出不能让窗口
+            一直挂着；超时也必须走，但会记一条 warning 说明内核可能残留。
+            """
+            if done.wait(8.0):
+                log.info("清理完成，结束进程")
+            else:
+                log.warning("退出清理超时（8s），强制结束；内核可能残留，"
+                            "下次启动会按端口清理")
             os._exit(0)
 
-        threading.Thread(target=cleanup, name="quit", daemon=True).start()
-        # 看门狗：清理线程卡在某个 join 上时也要让用户能退出
+        threading.Thread(target=finish, name="quit-finish", daemon=True).start()
+
+        # 看门狗：cleanup 卡在某个 join 上时也要让用户能退出。
+        # 和 finish 共用同一个 Event：清理已完成的正常路径不会再被它二次 _exit。
         def watchdog() -> None:
-            time.sleep(12.0)
-            log.warning("退出超时，强制结束进程")
+            if done.wait(12.0):
+                return
+            log.warning("退出超时（12s），强制结束进程；内核可能残留")
             os._exit(0)
+
         threading.Thread(target=watchdog, name="quit-watchdog", daemon=True).start()
 
     # ══════════ 消息循环 ══════════
@@ -649,11 +727,15 @@ class TrayWin:
             return True
 
     def run(self) -> None:
-        self.create()
+        # 必须在 create() 之前注册：create() 里就会 NIM_ADD 托盘图标，这中间
+        # 若 explorer 正好重启，我们就收不到「托盘区重建」，图标会永久消失
+        # （用户只能杀进程重开）。注册一个消息号不会失败到要命，失败只降级。
         try:
             self._msg_taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log.debug("注册 TaskbarCreated 失败: %s", e)
             self._msg_taskbar_created = None
+        self.create()
         log.info("原生托盘已创建，双击图标打开控制台")
         win32gui.PumpMessages()
 

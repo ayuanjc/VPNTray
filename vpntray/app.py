@@ -64,6 +64,22 @@ def _int(v: Any, default: int = 0, lo: int | None = None, hi: int | None = None)
     return n
 
 
+def _match_target(rules: Any) -> str:
+    """从配置的 rules 里按内容取 MATCH 的目标组名，取不到返回空串。
+
+    为什么不再写 rules[-1]：顺序不是这份代码能假定的，而越界会让 prepare_config
+    整个抛 IndexError，表现为「启动失败：配置失败」。按内容找，找不到由调用方兜底。
+    """
+    for line in reversed(list(rules or [])):
+        s = str(line).strip()
+        if not s.upper().startswith("MATCH"):
+            continue
+        _, _, tail = s.partition(",")
+        # MATCH,<组名>：组名后面即便带别的参数也只要第一段
+        return tail.split(",", 1)[0].strip()
+    return ""
+
+
 class App:
     def __init__(self) -> None:
         ensure_dirs()
@@ -71,6 +87,12 @@ class App:
         # 场景/规则模块是数据文件：首次运行把内置的 Steam / GitHub 物化到
         # data/modules/，之后用户删改都由文件说了算（不再写回）。
         modules_mod.ensure_builtins(self.settings)
+        # 旧版的 steam_* / github_* 只是模块首次物化时的取值来源：模块文件已经在
+        # 磁盘上了，这些键再留着会让「我改了设置怎么不生效」变成常驻疑问。
+        try:
+            self.settings.migrate()
+        except Exception:  # noqa: BLE001
+            log.warning("设置迁移失败（不影响启动）", exc_info=True)
         self.api = MihomoAPI(
             port=_int(self.settings.get("controller_port"), 9091, 1024, 65535),
             secret=self.settings.get("secret", ""),
@@ -119,6 +141,11 @@ class App:
             "gh_busy": False,               # GitHub 自检在后台跑（前端据此转圈）
             "conflict": {},                 # 最近一次代理冲突扫描结果（net_scan 写入）
             "sysproxy_hold": False,         # 用户手动关过系统代理：别再自动打开
+            # 装到 Program Files 后 data 目录可能不可写，paths 会在 import 期退到
+            # %LOCALAPPDATA%。界面必须能看见这件事，否则「设置存不上」永远查不出来。
+            "data_dir": str(self.settings.get("data_dir") or ""),
+            "data_dir_fallback": bool(self.settings.get("data_dir_fallback")),
+            "kernel_skip": False,           # 上次重启内核是「抢不到锁跳过」而不是失败
         }
         self.gh = github_ops.GithubOps(self)   # GitHub 自检/git 代理（实现见 github_ops.py）
         self._last_conn = (0, 0, 0.0)  # up, down, ts
@@ -130,6 +157,10 @@ class App:
         self._probe_busy = False
         self._update_busy = False
         self._task_lock = threading.Lock()   # 检测类长任务的互斥
+        # 「会动内核」的活儿（重启内核 / 切 TUN / 体检 / 健康探测）共用的总锁。
+        # 用 RLock：set_tun() 持锁后还要调 restart_kernel()，同一线程必须能重入；
+        # 跨线程一律非阻塞抢，抢不到就跳过本轮，绝不排队。
+        self._work_lock = threading.RLock()
         self._power_busy = False             # 总开关防连点
         self._github_busy = False
         self._gh_lock = threading.Lock()    # 自检本身要几十秒，check-then-set 必须原子
@@ -145,6 +176,23 @@ class App:
                 return False
             setattr(self, flag, True)
             return True
+
+    def _work_try(self) -> bool:
+        """非阻塞抢「动内核」总锁；抢不到说明别人正在改内核，本轮跳过。
+
+        为什么不用 state["busy"] 当锁：busy 是给面板看的文案，任何任务收尾都会
+        把它清空，于是测速进行中另一个线程读到空串就以为没人在跑，两边一起切节点。
+        """
+        return self._work_lock.acquire(blocking=False)
+
+    def _work_done(self) -> None:
+        """释放总锁。已经被外层（同一线程的重入）持有时只减计数，不会真放掉。"""
+        try:
+            self._work_lock.release()
+        except RuntimeError:
+            # 未持有时 release 会抛 RuntimeError：说明调用方路径出错，别让它盖住
+            # 真正的错误，只记一条。
+            log.debug("_work_done 在没有持锁的情况下被调用")
 
     # ══════════ 对外只读快照 ══════════
     def snapshot(self) -> dict[str, Any]:
@@ -622,6 +670,28 @@ class App:
     def module_get(self, key: str) -> dict[str, Any] | None:
         return modules_mod.load(key)
 
+    def _sub_group_names(self) -> set[str]:
+        """订阅里已有的策略组名 + 节点名，给模块组名查重。
+
+        为什么连节点名一起查：mihomo 里组名和节点名共用同一个命名空间，模块建一个
+        和节点同名的组，整份配置会被内核拒（duplicate name），表现是内核起不来。
+        只查 proxy-groups 会漏掉这一类。缓存读不到就返回空集合，绝不因此拦住保存。
+        """
+        try:
+            cached = subscription.load_cache() or {}
+        except Exception as e:  # noqa: BLE001
+            log.debug("读取订阅缓存失败（组名查重跳过）: %s", e)
+            return set()
+        names: set[str] = set()
+        for key in ("proxy-groups", "proxies"):
+            for it in cached.get(key) or []:
+                if not isinstance(it, dict):
+                    continue
+                n = str(it.get("name") or "").strip()
+                if n:
+                    names.add(n)
+        return names
+
     def module_save(self, payload: Any) -> tuple[bool, str]:
         """新建 / 覆盖一个模块。
 
@@ -631,7 +701,8 @@ class App:
         mod = payload.get("module") if isinstance(payload, dict) and isinstance(payload.get("module"), dict) else payload
         if not isinstance(mod, dict):
             return False, "需要模块对象"
-        ok, err = modules_mod.save(mod)
+        # 带上订阅里的组名/节点名：重名会让内核整份配置起不来，必须在此之前拦住
+        ok, err = modules_mod.save(mod, self._sub_group_names())
         if not ok:
             return False, err
         title = str((modules_mod.load(str(mod.get("key") or "")) or {}).get("title") or mod.get("title") or "")
@@ -999,8 +1070,18 @@ class App:
         sub = subscription.normalize(cached)
         cfg = configgen.build(sub, self.settings, self._delay_map())
         configgen.write(cfg)
+        rules = list(cfg.get("rules") or [])
+        main_group = _match_target(rules)
+        if not main_group:
+            # 兜底：build 意外没给 MATCH 时补一条，否则内核起来后没兜底规则，
+            # 而面板也拿不到 main_group。写回磁盘再 _set，保证文件和内存一致。
+            main_group = str(self.settings.get("main_group") or "节点选择")
+            log.warning("生成的配置里没有 MATCH 规则，已补一条 MATCH,%s", main_group)
+            rules.append(f"MATCH,{main_group}")
+            cfg["rules"] = rules
+            configgen.write(cfg)
         self._set(
-            main_group=cfg["rules"][-1].split(",", 1)[1],
+            main_group=main_group,
             sub_nodes=len(sub["proxies"]),
             info_nodes=list(sub.get("info") or []),
         )
@@ -1855,27 +1936,55 @@ class App:
         except ApiError as e:
             self.notify(f"操作失败：{e}")
 
-    def restart_kernel(self) -> None:
+    def restart_kernel(self) -> bool:
+        """重启内核；返回「端口真的起来了」才为 True。
+
+        为什么必须返回 bool：set_tun() 里写的是 ok = restart_kernel()，旧实现返回
+        None，恒为假，于是每次切 TUN 都被判成失败并回滚，TUN 永远开不起来。AI 接口
+        和 netdoctor 也按布尔读这个结果。
+        并发：抢不到总锁说明别的任务正在改内核，直接返回 False（≠ 失败，调用方按
+        「跳过」处理即可），绝不排队等着互相踩。
+        """
+        if not self._work_try():
+            # 「跳过」和「失败」都返回 False（set_tun 需要布尔），但调用方要能区分：
+            # 托盘据此提示「有其它任务在操作内核」而不是误报「重启失败」。
+            log.info("内核正被其它任务操作（重启/体检/测速），本次重建跳过")
+            self._set(kernel_skip=True)
+            return False
+        self._set(kernel_skip=False)
+        with self._lock:
+            prev_busy = self.state.get("busy") or ""
         self._set(busy="重启内核")
         ok = False
         err = ""
         try:
             self.kernel.stop()
-            ok = self.kernel.start()
+            ok = bool(self.kernel.start())
             if not ok:
                 err = self.kernel.last_error or ""
         except Exception as e:  # noqa: BLE001
             log.exception("重启内核异常")
             err = f"重启内核失败：{e}"
         finally:
-            # busy 漏清会让所有后续任务被 _wait_idle 永久挡住
-            self._set(busy="", kernel_ok=ok, error=err)
+            # busy 漏清会让所有后续任务被 _wait_idle 永久挡住；恢复成进来时的文案，
+            # 免得把外层任务（比如「切换 TUN」）的标题抹掉
+            self._set(busy=prev_busy, kernel_ok=ok, error=err)
+            self._work_done()
         if ok:
             try:
                 self._apply_saved_selection()
             except Exception as e:  # noqa: BLE001
                 log.warning("恢复节点选择失败: %s", e)
+            # 新内核里没有任何 select 的钉选状态：场景组/AI 组会退回组内第一个成员。
+            # start() 里走的是同样两步，重启后必须补一遍，否则用户钉住的节点在内核
+            # 一重启就「自己跑了」。
+            for fn, what in ((self._sync_ai_node, "AI 节点"), (self._sync_scene_nodes, "场景节点")):
+                try:
+                    fn()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("重启后同步%s失败: %s", what, e)
         self.refresh_now()
+        return ok
 
     # ══════════ 后台线程 ══════════
     def _start_loops(self) -> None:
@@ -1917,7 +2026,7 @@ class App:
         上一个地址上，表现就是「看着连着但什么都没速度」。
         """
         if not (tick % 3 == 0 and self.settings.get("net_change_restart", True)
-                and self.kernel.running() and not self.state.get("busy")):
+                and self.kernel.running()):
             return
         try:
             nid = tuple(hotspot.net_id())
@@ -1936,16 +2045,25 @@ class App:
                 log.info("网络地址 %s → %s，先等下一轮确认", prev, nid)
             elif since < 120:
                 log.info("网络地址仍在变（%s），距上次重建仅 %.0fs，暂不重建", nid, since)
+            elif not self._work_try():
+                # 非阻塞：内核正被体检/测速/切 TUN 占着就等下一轮，
+                # 也不能先把 _net_restart_at 更新掉，否则要白等 2 分钟
+                log.info("内核正忙，网络变化后的重建推迟到下一轮")
             else:
                 log.warning("网络变化 %s → %s（连续两轮稳定），重建内核", prev, nid)
-                self._net_id = nid
-                self._net_restart_at = time.time()
-                self._ai_fail = 0
                 try:
-                    self.restart_kernel()
-                    self.notify("网络已切换，内核已重建")
+                    self._net_id = nid
+                    self._net_restart_at = time.time()
+                    self._ai_fail = 0
+                    if self.restart_kernel():
+                        self.notify("网络已切换，内核已重建")
+                    else:
+                        log.warning("网络切换后重建内核失败：%s",
+                                    self.state.get("error") or "未知原因")
                 except Exception as e:  # noqa: BLE001
                     log.warning("网络切换后重建内核失败: %s", e)
+                finally:
+                    self._work_done()
         elif nid:
             self._net_id = nid
             self._net_pending = nid
@@ -1989,23 +2107,31 @@ class App:
         分支永远不会进。连续 2 次失败才自愈，避免一次抖动就换节点。
         """
         if not (tick % 3 == 0 and self.settings.get("ai_enabled", True)
-                and self.kernel.running() and not self.state.get("busy")):
+                and self.kernel.running()):
             return
-        ok_ai, why_ai = self._probe_ai(8.0)
-        if ok_ai:
-            if getattr(self, "_ai_fail", 0):
-                log.info("AI 通道恢复正常")
-            self._ai_fail = 0
+        # 用总锁而不是 state["busy"]：busy 只是个文案串，任何任务收尾都会清空它，
+        # 于是「测速进行中」这里照样会往下跑，和测速抢同一个出口。
+        if not self._work_try():
             return
-        self._ai_fail = getattr(self, "_ai_fail", 0) + 1
-        log.warning("AI 通道探测失败（连续 %d 次）：%s", self._ai_fail, why_ai)
-        if self._ai_fail < 2:
-            return
-        self._ai_fail = 0
         try:
-            self._heal_ai()
-        except Exception as e:  # noqa: BLE001
-            log.warning("AI 通道自愈失败: %s", e)
+            ok_ai, why_ai = self._probe_ai(8.0)
+            if ok_ai:
+                if getattr(self, "_ai_fail", 0):
+                    log.info("AI 通道恢复正常")
+                self._ai_fail = 0
+                return
+            self._ai_fail = getattr(self, "_ai_fail", 0) + 1
+            log.warning("AI 通道探测失败（连续 %d 次）：%s", self._ai_fail, why_ai)
+            if self._ai_fail < 2:
+                return
+            self._ai_fail = 0
+            try:
+                self._heal_ai()
+            except Exception as e:  # noqa: BLE001
+                log.warning("AI 通道自愈失败: %s", e)
+        finally:
+            # finally 保证探测抛异常也会放开锁，否则后面所有任务永久跳过
+            self._work_done()
 
     def _tick_probe(self, tick: int) -> None:
         """② 节点健康探测（每 2 轮 = 40 秒）。
@@ -2016,25 +2142,32 @@ class App:
         """
         if tick % 2 or not self.settings.get("heal", True) or not self.kernel.running():
             return
-        if self.state.get("busy") or self._stop.is_set():
-            return  # 正在测速/切换，或正在退出，别干扰
-        ok, why = self._probe_detail(4.0)
-        if ok:
-            if self._health_fail:
-                log.info("节点恢复正常（之前连续失败 %d 次）", self._health_fail)
-            self._health_fail = 0
+        if self._stop.is_set():
+            return  # 正在退出，别干扰
+        # 正在测速/切换/体检（持有总锁）时不要探测：这时候的失败是别人的操作造成的，
+        # 连续 3 次就会误触发「自动换节点」。
+        if not self._work_try():
             return
-        self._health_fail = getattr(self, "_health_fail", 0) + 1
-        log.warning("健康探测失败（连续 %d 次）：%s", self._health_fail, why)
-        if self._health_fail < 3:
-            return
-        self._health_fail = 0
         try:
-            picked = self.ensure_usable()
-            if picked:
-                self.notify(f"节点已自动切换：{picked}")
-        except Exception as e:  # noqa: BLE001
-            log.warning("自动切换失败: %s", e)
+            ok, why = self._probe_detail(4.0)
+            if ok:
+                if self._health_fail:
+                    log.info("节点恢复正常（之前连续失败 %d 次）", self._health_fail)
+                self._health_fail = 0
+                return
+            self._health_fail = getattr(self, "_health_fail", 0) + 1
+            log.warning("健康探测失败（连续 %d 次）：%s", self._health_fail, why)
+            if self._health_fail < 3:
+                return
+            self._health_fail = 0
+            try:
+                picked = self.ensure_usable()
+                if picked:
+                    self.notify(f"节点已自动切换：{picked}")
+            except Exception as e:  # noqa: BLE001
+                log.warning("自动切换失败: %s", e)
+        finally:
+            self._work_done()
 
 
     def _boot_verify(self) -> None:
@@ -2114,16 +2247,131 @@ class App:
     # ══════════ 自动更新 ══════════
     # ── 代理冲突清理 ───────────────────────────────────────────────────
     def _self_pids(self) -> set[int]:
-        """自己的进程集合（含内核），扫描时排除 —— 否则一键清理会把自己杀掉。"""
+        """自己的进程集合（含内核及其子进程），扫描时排除 —— 否则一键清理会把自己杀掉。
+
+        为什么要连子孙一起算：内核是独立的子进程，被杀软/代理链再拉起的孙进程
+        （比如它的 DNS 辅助进程）同样属于「自己」，只记内核那一个 pid 会把这些
+        当成「别的代理客户端」，一键清理就打到自己的腿上。
+        为什么不再无条件加 os.getppid()：从资源管理器/终端启动时父进程是
+        explorer.exe 或 cmd.exe，把父进程排除掉，正好漏掉「父进程真是那个冲突
+        代理」的情况；只有父进程确实是同一个可执行文件（PyInstaller 的 bootloader
+        以同名父进程方式存在）时才算自己，判据由 _same_exe_ancestors 给出。
+        """
         pids = {os.getpid()}
         pid = getattr(getattr(self.kernel, "proc", None), "pid", None)
         if pid:
-            pids.add(int(pid))
-        try:
-            pids.add(int(os.getppid()))
-        except Exception:  # noqa: BLE001
-            pass
+            try:
+                pids.add(int(pid))
+            except (TypeError, ValueError):
+                pass
+        pids |= self._descendants(pids)
+        # 同名父进程（打包器的 bootloader）也算自己：漏掉它，白名单/防火墙规则
+        # 只覆盖子进程，等于给自己留了个「绕过自己规则」的口子
+        pids |= self._same_exe_ancestors({os.getpid()})
         return pids
+
+    @staticmethod
+    def _proc_pairs() -> list[tuple[int, int, str]]:
+        """进程快照：(pid, 父 pid, exe 名)。非 Windows 或失败一律空列表。
+
+        纯 ctypes + 只读快照，不引入第三方依赖；失败也不能影响代理冲突扫描（那
+        只是辅助功能），所以整段 try/except 兜住。exe 名用来判断「这个祖先是不是
+        同一个可执行文件」—— PyInstaller 的 bootloader 就是同名父进程。
+        """
+        if os.name != "nt":
+            return []
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            k32.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32)]
+            k32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32)]
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+            # TH32CS_SNAPPROCESS = 0x2
+            snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
+            if not snap or snap == wintypes.HANDLE(-1).value:
+                return []
+            pairs: list[tuple[int, int, str]] = []
+            try:
+                ent = _PROCESSENTRY32()
+                ent.dwSize = ctypes.sizeof(_PROCESSENTRY32)
+                ok = k32.Process32First(snap, ctypes.byref(ent))
+                guard = 0
+                # guard 防异常驱动下死循环：Windows 进程数不会到 2 万
+                while ok and guard < 20000:
+                    guard += 1
+                    exe = bytes(ent.szExeFile).split(b"\x00", 1)[0].decode("mbcs", "replace")
+                    pairs.append((int(ent.th32ProcessID), int(ent.th32ParentProcessID), exe))
+                    ok = k32.Process32Next(snap, ctypes.byref(ent))
+            finally:
+                k32.CloseHandle(snap)
+            return pairs
+        except Exception as e:  # noqa: BLE001
+            log.debug("枚举进程树失败（冲突扫描按空集处理）: %s", e)
+            return []
+
+    @staticmethod
+    def _descendants(roots: set[int]) -> set[int]:
+        """按 parent-pid 关系展开子孙进程：内核的 DNS 辅助进程也属于「自己」。"""
+        kids: dict[int, list[int]] = {}
+        for pid, ppid, _exe in App._proc_pairs():
+            kids.setdefault(ppid, []).append(pid)
+        out: set[int] = set()
+        stack = list(roots)
+        while stack:
+            for child in kids.get(stack.pop(), ()):
+                if child not in out and child not in roots:
+                    out.add(child)
+                    stack.append(child)
+        return out
+
+    @staticmethod
+    def _same_exe_ancestors(roots: set[int]) -> set[int]:
+        """同名可执行文件的祖先链（PyInstaller 的 bootloader 就是同名父进程）。
+
+        只往上走到「可执行文件名变了」为止：从 explorer.exe / cmd.exe 启动时第一跳
+        就不同名，所以不会把 shell 或资源管理器误判成自己；而 onedir 打包出来的
+        bootloader 与 python 子进程同名，正好收进来 —— 写防火墙/白名单规则时漏掉
+        它等于漏掉自己的一半。
+        """
+        pairs = App._proc_pairs()
+        if not pairs:
+            return set()
+        parent: dict[int, int] = {}
+        exe: dict[int, str] = {}
+        for pid, ppid, name in pairs:
+            parent[pid] = ppid
+            exe[pid] = name.lower()
+        own = {exe[p] for p in roots if exe.get(p)}
+        out: set[int] = set()
+        for root in roots:
+            cur = parent.get(root, 0)
+            for _ in range(4):        # 打包器最多两层，4 层足够且防链式误伤
+                if not cur or cur in out or cur in roots:
+                    break
+                if own and exe.get(cur, "") not in own:
+                    break
+                out.add(cur)
+                cur = parent.get(cur, 0)
+        return out
 
     # ────────────────────── 断网急救 ──────────────────────
     # 体检结果缓存在 state["netdoc"]：页面来回切不该重跑一遍（一轮 ~6 秒）。
@@ -2136,11 +2384,21 @@ class App:
                 cached = self.state.get("netdoc")
             if isinstance(cached, dict) and cached.get("checks"):
                 return dict(cached, cached=True)
+        # 体检要跑 10 来个系统调用，期间后台的健康探测必须让路（否则探测到的
+        # 是「体检自己改出来的中间状态」，连续 3 次就误换节点）。
+        # 这是用户点出来的同步请求，可以等一会儿；等不到也照跑，只是记一条。
+        got = self._work_lock.acquire(timeout=15)
+        if not got:
+            log.warning("网络体检等待内核空闲超时，继续执行（结果可能受并发操作影响）")
+        with self._lock:
+            prev_busy = self.state.get("busy") or ""
         self._set(busy="网络体检")
         try:
             res = netdoctor.probe(self)
         finally:
-            self._set(busy="")
+            self._set(busy=prev_busy)
+            if got:
+                self._work_done()
         with self._lock:
             self.state["netdoc"] = res
         try:
@@ -2151,7 +2409,41 @@ class App:
         self._changed()
         return res
 
+    def net_diagnose_async(self, refresh: bool = True) -> dict[str, Any]:
+        """异步版体检：立刻返回，结果写进 state["netdoc"]，前端轮询 /api/state。
+
+        同步接口一轮 6 秒起，浏览器点按钮时标签页会僵住，用户连点两下就叠成两轮
+        并发（两轮互相把对方的中间状态当成网络故障，报出假的「DNS 不通」）。
+        这里只做三件事：抢运行标志、起后台线程、回报 running；重复请求幂等。
+        """
+        if not refresh:
+            # 吃缓存时不必起线程：和同步版保持同一份语义
+            with self._lock:
+                cached = self.state.get("netdoc")
+            if isinstance(cached, dict) and cached.get("checks"):
+                return dict(cached, cached=True)
+        if getattr(self, "_netdoc_running", False):
+            return {"ok": True, "running": True, "reused": True}
+        self._netdoc_running = True
+        self._set(netdoc_running=True, netdoc_error="")
+
+        def _job() -> None:
+            try:
+                self.net_diagnose(True)
+            except Exception as e:  # noqa: BLE001
+                # 后台线程没人接异常：失败必须落进 state，否则前端永远看到
+                # 「正在体检」，用户以为程序卡死
+                log.warning("后台网络体检失败: %s", e)
+                self._set(netdoc_error=f"体检失败：{e}")
+            finally:
+                self._netdoc_running = False
+                self._set(netdoc_running=False)
+
+        self._spawn("netdoc", _job)
+        return {"ok": True, "running": True}
+
     def net_fix_one(self, action: str) -> dict[str, Any]:
+
         from . import netdoctor
 
         res = netdoctor.fix(self, action)
@@ -2356,6 +2648,10 @@ class App:
         if old == want:
             return {"ok": True, "unchanged": True, "tun": want}
 
+        # 整个切换过程（改配置 + 重启内核 + 失败回滚）都要独占内核，
+        # 否则并发的体检/测速会在中间把内核又拉起来一次，回滚就成了空操作
+        if not self._work_try():
+            return {"ok": False, "error": "另一个任务正在进行，请稍后再切换", "tun": old}
         self._set(busy="切换 TUN")
         try:
             self.settings["tun"] = want
@@ -2385,6 +2681,7 @@ class App:
             return {"ok": False, "error": f"{type(e).__name__}: {e}", "tun": old}
         finally:
             self._set(busy="")
+            self._work_done()
 
     def feedback_send(self, title: str, detail: str, email: str = "") -> dict[str, Any]:
         from . import feedback
@@ -2462,10 +2759,12 @@ class App:
         info = self.update_check(force=True)
         return {"ok": True, "repo": cleaned, "check": info}
 
-    def update_apply(self) -> dict[str, Any]:
+    def update_apply(self, confirm: bool = False) -> dict[str, Any]:
         """下载 → 校验 → 解压 → 交给外部脚本替换，然后自己退出。
 
         整段在后台跑：安装包 70MB 起步，不能堵住 HTTP 线程。
+        confirm=True 表示用户已看过「这个更新包没有 SHA256 校验和」并坚持安装：
+        自动更新路径绝不越过校验，只有人手点一次才放行。
         """
         with self._lock:
             if self._update_busy:
@@ -2474,10 +2773,10 @@ class App:
             if not info.get("has_update") or not info.get("zip_url"):
                 return {"ok": False, "error": "当前没有可安装的新版本"}
             self._update_busy = True      # 与判断同一把锁，防双击下两份包
-        self._spawn("update-apply", lambda: self._do_update(info))
+        self._spawn("update-apply", lambda: self._do_update(info, bool(confirm)))
         return {"ok": True, "queued": info.get("latest")}
 
-    def _do_update(self, info: dict[str, Any]) -> None:
+    def _do_update(self, info: dict[str, Any], confirm: bool = False) -> None:
         from . import updater
 
         def prog(done: int, total: int) -> None:
@@ -2486,7 +2785,8 @@ class App:
         try:
             self._set(busy="更新中")
             port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
-            payload = updater.prepare(info, local_port=port, on_progress=prog)
+            payload = updater.prepare(info, local_port=port, on_progress=prog,
+                                     confirm=confirm)
             self._set_progress("update", 1, 1, "覆盖文件")
             bat = updater.stage(payload, updater.update_workdir())
             updater.launch(bat)
@@ -2508,13 +2808,19 @@ class App:
             log.info("更新：强制退出进程，等待 update.cmd 覆盖文件")
             os._exit(0)
         except updater.UpdateError as e:
-            log.warning("更新失败：%s", e)
+            msg = str(e)
+            # 缺校验和不是「更新坏了」，是「需要人点头」：单独标出来，界面给一个
+            # 「仍然安装」按钮，自动更新流程永远走不到这里（confirm=False 时抛错）
+            need = "SHA256" in msg and not confirm
+            log.warning("更新%s：%s", "等待用户确认" if need else "失败", msg)
             self._set(busy="")
             with self._lock:
-                self.state["update"] = {**info, "ok": False, "error": str(e),
+                self.state["update"] = {**info, "ok": False, "error": msg,
+                                        "need_confirm": need,
                                         "checked_at": time.time(), "installing": False}
             self._changed()
-            self.notify(f"更新失败：{e}")
+            if not need:
+                self.notify(f"更新失败：{msg}")
         except Exception as e:  # noqa: BLE001
             log.exception("更新异常")
             self._set(busy="")

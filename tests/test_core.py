@@ -222,6 +222,159 @@ def test_update_apply_single_flight():
     assert "已经在更新中" in app.update_apply()["error"]
 
 
+
+
+# ───────── 路径：数据目录可写性 / 回退 ─────────
+def test_probe_writable_true_and_creates_dir():
+    import tempfile
+    from vpntray import paths
+    d = pathlib.Path(tempfile.mkdtemp()) / "a" / "b"
+    ok, why = paths._probe_writable(d)
+    assert ok is True and why == "" and d.is_dir()
+
+
+def test_probe_writable_false_when_parent_is_file():
+    import tempfile
+    from vpntray import paths
+    f = pathlib.Path(tempfile.mkdtemp()) / "blocker"
+    f.write_text("x", encoding="utf-8")
+    ok, why = paths._probe_writable(f / "sub")
+    assert ok is False and why            # 建不出目录时必须带回原因，不能静默
+
+
+def test_ensure_dirs_returns_failure_list():
+    from vpntray import paths
+    fails = paths.ensure_dirs()
+    assert isinstance(fails, list)         # 空列表 = 全部就绪；以前返回 None
+
+
+def test_fallback_state_shape():
+    from vpntray import paths
+    st_ = paths.fallback_state()
+    assert set(st_) == {"data_dir", "data_dir_fallback", "data_dir_reason"}
+    assert isinstance(st_["data_dir_fallback"], bool) and st_["data_dir"]
+
+
+# ───────── settings：类型校验 / ACL ─────────
+def test_coerce_rejects_bad_types():
+    from vpntray import settings as S
+    assert S._coerce(7891, "7891") == (7891, True)     # 数字串可以救回来
+    assert S._coerce(7891, None) == (7891, False)      # null 回落默认
+    assert S._coerce(False, 0) == (False, True)        # 0/1 视为 bool
+    assert S._coerce(False, "maybe") == (False, False)
+
+
+def test_deep_merge_falls_back_on_type_mismatch():
+    from vpntray import settings as S
+    fixed: list = []
+    base = {"mixed_port": 7891, "subs": "url", "tun": False, "selected": {}}
+    merged = S._deep_merge(base, {"mixed_port": None, "subs": 123, "tun": "yes"}, fixed)
+    assert merged["mixed_port"] == 7891 and "mixed_port" in fixed
+    assert merged["subs"] == "url" and "subs" in fixed      # 整数覆盖不掉字符串
+    assert merged["tun"] is False and "tun" in fixed
+
+
+def test_harden_acl_never_raises():
+    from vpntray import settings as S
+    S._harden_acl(pathlib.Path("不存在的文件.json"))   # 失败只能 warning，不能抛
+    assert isinstance(S._current_user(), str)
+
+
+# ───────── logger：handler 识别 / 轮转自愈 ─────────
+def test_logger_setup_keeps_single_own_handler():
+    from vpntray import logger
+    r1 = logger.setup()
+    r2 = logger.setup()
+    ours = [h for h in r2.handlers if getattr(h, "_vpntray_handler", False)]
+    assert r1 is r2 and len(ours) == 1    # 不再「root 有 handler 就早退」
+
+
+def test_logger_emit_reopens_closed_stream():
+    import logging
+    import tempfile
+    from vpntray import logger
+    h = logger._SafeRotating(pathlib.Path(tempfile.mkdtemp()) / "x.log",
+                            maxBytes=1, backupCount=1, encoding="utf-8")
+    try:
+        h.stream = None                   # 模拟 doRollover 失败后流被置空
+        h.emit(logging.LogRecord("t", logging.INFO, __file__, 1, "hi", None, None))
+        assert h.stream is not None       # emit 必须自己把流重开
+    finally:
+        h.close()
+
+
+# ───────── cli：安全取值 / down 确认 ─────────
+def test_cli_safe_int():
+    from vpntray import cli
+    assert cli._safe_int("7891", 1) == 7891
+    assert cli._safe_int(None, 7) == 7
+    assert cli._safe_int("abc", 7) == 7
+
+
+def test_cli_down_refuses_without_yes():
+    from vpntray import cli
+    # 非交互 stdin 下必须拒绝：以前会直接还原系统代理并把内核杀掉
+    assert cli.main(["down"]) == 2
+
+
+# ───────── 托盘 / 原生窗口：导入兜底 ─────────
+def test_tray_raises_without_pystray():
+    from vpntray import tray
+    assert hasattr(tray, "IMPORT_ERROR")
+    old = tray.pystray
+    if old is None:
+        return
+    tray.pystray = None
+    try:
+        try:
+            tray.Tray(types.SimpleNamespace())
+        except RuntimeError as e:
+            assert "pystray" in str(e)
+        else:
+            raise AssertionError("没有 pystray 时应该抛 RuntimeError")
+    finally:
+        tray.pystray = old
+
+
+def test_tray_win_guard_matches_platform():
+    from vpntray import tray_win
+    assert hasattr(tray_win, "IMPORT_ERROR")
+    if tray_win.win32gui is not None:
+        return
+    try:
+        tray_win.TrayWin(None, None)
+    except RuntimeError as e:
+        assert "pywin32" in str(e)
+    else:
+        raise AssertionError("缺 pywin32 时应该抛 RuntimeError")
+
+
+def test_ui_native_spawn_result_is_two_tuple():
+    from vpntray import ui_native
+    r = ui_native.SpawnResult(True, "x", pending=True, proc=None)
+    ok, msg = r                            # 调用方按二元组解包必须继续可用
+    assert ok is True and msg == "x"
+    assert r.pending is True and r.proc is None
+    assert ui_native.pending_processes() == []
+    assert isinstance(ui_native.webview2_version(), str)
+
+
+def test_backup_bad_keeps_original_file():
+    import tempfile
+    from vpntray import settings as S
+    old = S.SETTINGS
+    d = pathlib.Path(tempfile.mkdtemp())
+    S.SETTINGS = d / "settings.json"
+    try:
+        inst = S.Settings.__new__(S.Settings)   # 不跑 __init__，免得碰真实数据目录
+        inst._backup_bad(b'{"subs": 123}', "类型不对")
+        got = list(d.glob("settings.json.bad-*"))
+        assert len(got) == 1
+        assert got[0].read_bytes() == b'{"subs": 123}'   # 原值必须可回查
+    finally:
+        S.SETTINGS = old
+
+
 if __name__ == "__main__":
     fails = []
     for name, fn in sorted(globals().items()):

@@ -113,6 +113,21 @@ def _domain(v: Any) -> str | None:
     return d.strip(". ") or None
 
 
+def _reserved_set(reserved: Iterable[str] | None) -> set[str]:
+    """订阅里的组名集合归一成小写，供组名查重使用。
+
+    为什么在做校验这一层：mihomo 的 proxy-groups 一旦出现同名组会直接起不
+    来（整份配置被拒），而用户只是想给新场景起个「香港」这样的名字。把这个
+    判断放到 save/validate 里，面板、AI 接口、手改文件走的是同一条路。
+    """
+    out: set[str] = set()
+    for n in reserved or ():
+        s = _s(n, 64)
+        if s:
+            out.add(s.lower())
+    return out
+
+
 def dir_path() -> Path:
     return paths.MODULES
 
@@ -169,8 +184,11 @@ def normalize(raw: Any) -> dict[str, Any]:
     }
 
 
-def validate(mod: dict[str, Any]) -> list[str]:
-    """返回全部问题（不是第一个）：一次改好几处时用户不用来回试。"""
+def validate(mod: dict[str, Any], reserved: Iterable[str] | None = None) -> list[str]:
+    """返回全部问题（不是第一个）：一次改好几处时用户不用来回试。
+
+    reserved 是当前订阅里的组名/节点名集合（可选，旧调用方不传也能用）。
+    """
     errs: list[str] = []
     key = mod.get("key") or ""
     title = mod.get("title") or ""
@@ -186,6 +204,10 @@ def validate(mod: dict[str, Any]) -> list[str]:
         errs.append("组名里不能有逗号或换行")
     elif title.upper() in RESERVED_TITLES:
         errs.append(f"组名「{title}」是保留名，换一个")
+    elif title.lower() in _reserved_set(reserved):
+        # 和订阅里的策略组同名 → mihomo 报 duplicate group，整个配置都起不来。
+        # 在这里挡住，比等内核 restart 失败再回滚好排查。
+        errs.append(f"组名与订阅里的组重名：{title}")
     if mod.get("kind") not in ("scene", "rule"):
         errs.append("kind 只能是 scene 或 rule")
 
@@ -212,12 +234,28 @@ def validate(mod: dict[str, Any]) -> list[str]:
     for r in m.get("rules") or []:
         head, sep, tail = str(r).partition(",")
         if not sep:
-            errs.append(f"规则「{r}」缺少值，格式是 类型,值")
+            if head.strip().upper() == "DOMAIN-REGEX":
+                # 只有类型没有正则时要说清缺的是什么：否则「格式是 类型,值」会
+                # 让人以为正则后面还得补个目标组（那正好会把规则写错）
+                errs.append(f"规则「{r}」缺正则表达式")
+            else:
+                errs.append(f"规则「{r}」缺少值，格式是 类型,值")
             break
-        if head.strip().upper() not in RULE_TYPES:
+        rtype = head.strip().upper()
+        if rtype not in RULE_TYPES:
             errs.append(f"规则类型 {head.strip()} 不支持")
             break
-        if "," in tail and head.strip().upper() != "DOMAIN-REGEX":
+        if rtype == "DOMAIN-REGEX":
+            # 正则的正文本体不允许逗号和空白：configgen 用 f"{规则},{组名}" 拼装，
+            # mihomo 又按逗号切参数，正则里一个 {1,3} 就能把这行规则切错位。
+            if not tail.strip():
+                errs.append(f"规则「{r}」缺正则表达式")
+                break
+            if "," in tail or any(ch.isspace() for ch in tail):
+                errs.append(f"正则里不能有逗号或空白：{r}")
+                break
+            continue
+        if "," in tail:
             errs.append(f"规则「{r}」不要写目标组，目标由程序按模块自动拼")
             break
     if not (m.get("domains") or m.get("rules") or m.get("cidrs")):
@@ -277,10 +315,13 @@ def load(key: str) -> dict[str, Any] | None:
     return None
 
 
-def save(raw: Any) -> tuple[bool, str]:
-    """新建或覆盖一个模块。key 不可变（要改名就删了重建）。"""
+def save(raw: Any, reserved: Iterable[str] | None = None) -> tuple[bool, str]:
+    """新建或覆盖一个模块。key 不可变（要改名就删了重建）。
+
+    reserved: 订阅里已有的组名集合，用于组名查重（可选，向后兼容）。
+    """
     mod = normalize(raw)
-    errs = validate(mod)
+    errs = validate(mod, reserved)
     if errs:
         return False, "；".join(errs[:4])
     with _lock:

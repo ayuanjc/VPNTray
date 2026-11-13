@@ -23,7 +23,14 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "3.0.1"
+UI_VER = "3.0.2"
+
+# 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
+# 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
+# 所以即使有人往页面里塞了外链脚本/图片/XHR，浏览器也会直接拦掉。
+_CSP = ("default-src 'self'; img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'")
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -55,6 +62,34 @@ def _int(v: Any, default: int = 0, lo: int | None = None, hi: int | None = None)
     if hi is not None:
         i = min(hi, i)
     return i
+
+
+class BadArg(ValueError):
+    """入参类型不合法。HTTP 层把它翻成 400，而不是当成内部错误 500。"""
+
+
+_TRUE_WORDS = {"true", "1", "on", "yes"}
+_FALSE_WORDS = {"false", "0", "off", "no"}
+
+
+def _flag(v: Any, key: str = "参数") -> bool:
+    """严格布尔收敛：只认 true/false/1/0/"1"/"0"/on/off。
+
+    为什么不用 bool(v)：bool("false") 是 True、bool("0") 也是 True，前端一个
+    字符串手误就能把开关反向 —— 「关掉 AI 接口」实际变成打开，而且没人看得出来。
+    收敛不了就报错（400），让调用方自己修，绝不做「差不多算真」的猜测。
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in _TRUE_WORDS:
+            return True
+        if s in _FALSE_WORDS:
+            return False
+    raise BadArg(f"{key} 只能是 true/false/1/0/on/off，收到 {v!r}")
 
 
 # ────────────────────────── 状态整形 ──────────────────────────
@@ -216,7 +251,8 @@ def build_state(app) -> dict[str, Any]:
         "scenes": app.scenes_status(),
         # 模块清单（轻量版，给「模块」卡片和编辑入口用）
         "modules": app.modules_status(),
-        # AI 接口：开关 / 权限级别 / token（本机回环，token 给用户复制用）
+        # AI 接口：开关 / 权限级别 / token 掩码（明文只走 POST /api/ai/api
+        # {"action":"reveal"}，见 ai_api 处理函数的注释）
         "ai_api": aiops.state(app),
         # GitHub 特化：最近一次自检结果 + git 全局代理当前指向
         "github": st.get("github") or {},
@@ -233,6 +269,9 @@ def build_state(app) -> dict[str, Any]:
         "git_proxy_note": str(st.get("git_proxy_note") or ""),
         # 断网急救：只带缓存的体检结果，真跑要走 /api/net/diagnose
         "netdoc": st.get("netdoc") or {},
+        # 异步体检的运行态：前端据此决定显示「体检中…」还是错误提示
+        "netdoc_running": bool(st.get("netdoc_running")),
+        "netdoc_error": str(st.get("netdoc_error") or ""),
         "update": st.get("update") or {},
         "update_repo": s.get("update_repo", ""),
         "purity_count": sum(1 for n in nodes if n.get("purity") is not None),
@@ -361,17 +400,17 @@ class WebUI:
             return {"ok": True}
 
         def sysproxy(body):
-            on = bool((body or {}).get("on", True))
+            on = _flag((body or {}).get("on", True), "on")
             self._bg(app.toggle_system_proxy, on)
             return {"ok": True}
 
         def autostart(body):
-            on = bool((body or {}).get("on", True))
+            on = _flag((body or {}).get("on", True), "on")
             self._bg(app.set_autostart, on)
             return {"ok": True}
 
         def power(body):
-            on = bool((body or {}).get("on", True))
+            on = _flag((body or {}).get("on", True), "on")
             return app.power(on)
 
         def best(_):
@@ -498,7 +537,7 @@ class WebUI:
             return {"ok": ok, "error": err}
 
         def ai_toggle(body):
-            on = bool((body or {}).get("on", True))
+            on = _flag((body or {}).get("on", True), "on")
             ok, err = app.set_ai_enabled(on)
             return {"ok": ok, "error": err}
 
@@ -536,8 +575,8 @@ class WebUI:
             cc = (app.ai_status() or {}).get("exit_cc") or ""
             if not cc:
                 return {"ok": False, "error": "还不知道出口国家，先点一次「测出口 IP」"}
-            ok, msg = disguise.set_timezone_for(cc)
-            return {"ok": ok, "message": msg, "cc": cc}
+            ok, msg, need_admin = disguise.set_timezone_for_ex(cc)
+            return {"ok": ok, "message": msg, "cc": cc, "need_admin": need_admin}
 
         def ai_restore_tz(_):
             ok, msg = disguise.restore_timezone()
@@ -585,17 +624,28 @@ class WebUI:
             return {"ok": True, "export": app.module_export()}
 
         def ai_api(body):
-            """AI 接口本身的管理：开关 / 权限上限 / 重置 token。"""
+            """AI 接口本身的管理：开关 / 权限上限 / 重置 token / 显式取明文。
+
+            默认只回掩码：/api/state 每秒被轮询一次，还会被插件、录屏、贴日志的
+            用户看到，明文 token 等于把这些渠道都变成密钥泄漏面。
+            "复制"按钮走 {"action":"reveal"}：这条请求必须是同源页面发的
+            application/json（do_POST 已经校验 Host、Origin、Content-Type），
+            所以只有用户自己点得到，别的网站拿不到明文。
+            """
             b = body or {}
             s = app.settings
+            if str(b.get("action") or "").strip().lower() == "reveal":
+                return {"ok": True, "ai_api": aiops.state(app, reveal=True)}
             if "enabled" in b:
-                s[aiops.ENABLED_KEY] = bool(b.get("enabled"))
+                s[aiops.ENABLED_KEY] = _flag(b.get("enabled"), "enabled")
             if "level" in b:
                 lv = str(b.get("level") or "").strip().lower()
                 if lv in aiops.LEVELS:
                     s[aiops.LEVEL_KEY] = lv
-            if b.get("regen"):
-                s[aiops.TOKEN_KEY] = ""
+            if "regen" in b:
+                # 以前是 if b.get("regen")：传 "false" 也会清 token（字符串真值陷阱）
+                if _flag(b.get("regen"), "regen"):
+                    s[aiops.TOKEN_KEY] = ""
             s.save()
             return {"ok": True, "ai_api": aiops.state(app)}
 
@@ -635,7 +685,15 @@ class WebUI:
         def topo(_):
             return {"ok": True, "topo": app.topo()}
 
-        def restart(_):
+        def restart(body):
+            b = body or {}
+            # 默认排队（前端点一下就回，别让按钮等 3 秒）；需要知道「内核到底起来
+            # 没有」的调用方（脚本 / AI / 诊断）传 sync=true 拿真布尔。
+            # restart_kernel 现在返回 bool，异步路径不能再把结果丢掉。
+            if "sync" in b and _flag(b.get("sync"), "sync"):
+                ok = bool(app.restart_kernel())
+                return {"ok": ok, "restarted": ok,
+                        "error": "" if ok else "内核没起来：看 /api/state 的 error 与 kernel 日志"}
             self._bg(app.restart_kernel)
             return {"ok": True, "queued": "restart"}
 
@@ -644,13 +702,13 @@ class WebUI:
             return {"ok": True}
 
         def auto_best_toggle(body):
-            on = bool((body or {}).get("on", False))
+            on = _flag((body or {}).get("on", False), "on")
             app.settings["auto_best"] = on
             app.settings.save()
             return {"ok": True, "auto_best": on}
 
         def heal_toggle(body):
-            on = bool((body or {}).get("on", True))
+            on = _flag((body or {}).get("on", True), "on")
             app.settings["heal"] = on
             app.settings.save()
             return {"ok": True, "heal": on}
@@ -666,7 +724,7 @@ class WebUI:
             b = body or {}
             guard = dnsguard.ensure(enabled=bool(app.settings.get("dns_guard", True)))
             if "on" in b:
-                on = bool(b.get("on"))
+                on = _flag(b.get("on"), "on")
                 app.settings["dns_guard"] = on
                 app.settings.save()
                 if on:
@@ -694,18 +752,32 @@ class WebUI:
                 return {"ok": False, "lines": [f"读取日志失败: {e}"]}
 
         def update_check(body):
-            force = bool((body or {}).get("force"))
+            force = _flag((body or {}).get("force", False), "force")
             return app.update_check(force=force)
 
         def update_repo(body):
             return app.update_set_repo(str((body or {}).get("repo") or ""))
 
-        def update_apply(_):
-            return app.update_apply()
+        def update_apply(body):
+            return app.update_apply(confirm=bool((body or {}).get("confirm")))
 
         def net_diagnose(body):
             # refresh=false 直接吃缓存：页面切回来不该重跑（一轮 ~6 秒）
-            return app.net_diagnose(bool((body or {}).get("refresh", True)))
+            b = body or {}
+            refresh = _flag(b.get("refresh", True), "refresh")
+            # 同步老行为保留（curl 和 AI 直接要结果），新前端传 async=true 走后台
+            if "async" in b and _flag(b.get("async"), "async"):
+                return app.net_diagnose_async(refresh=refresh)
+            return app.net_diagnose(refresh)
+
+        def net_diagnose_start(body):
+            """只起后台体检、立刻返回 running：6 秒级系统调用不该堵住 HTTP。
+
+            结果照旧写 state["netdoc"]，前端轮询 /api/state 的 netdoc /
+            netdoc_running / netdoc_error 三个字段即可。
+            """
+            b = body or {}
+            return app.net_diagnose_async(refresh=_flag(b.get("refresh", True), "refresh"))
 
         def net_repair(body):
             acts = (body or {}).get("actions")
@@ -784,6 +856,7 @@ class WebUI:
             "/api/update/repo": update_repo,
             "/api/update/apply": update_apply,
             "/api/net/diagnose": net_diagnose,
+            "/api/net/diagnose/start": net_diagnose_start,
             "/api/net/repair": net_repair,
             "/api/net/fix": net_fix_one,
             "/api/net/report": net_report,
@@ -811,6 +884,9 @@ class WebUI:
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "VPNTrayUI/1.0"
+            # 单连接 30 秒上限：不设 timeout 时，一条半开连接（浏览器预连接、
+            # 断网没发 FIN）会把工作线程和句柄一直钉住，面板开久了就没人接了。
+            timeout = 30
 
             def log_message(self, fmt, *args):  # 静音
                 log.debug("web %s - %s", self.address_string(), fmt % args)
@@ -845,6 +921,12 @@ class WebUI:
                     self.send_header("Content-Type", ctype)
                     self.send_header("Content-Length", str(len(body)))
                     self.send_header("Cache-Control", "no-store")
+                    # 安全头：面板虽然只绑回环，但同源页面 / 本地其它程序都能
+                    # 嵌它，禁嵌 + 禁嗅探 + 不外带 Referer 是零成本边界。
+                    self.send_header("X-Frame-Options", "DENY")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Referrer-Policy", "no-referrer")
+                    self.send_header("Content-Security-Policy", _CSP)
                     self.end_headers()
                     self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError, OSError):
@@ -935,6 +1017,9 @@ class WebUI:
                     return self._json({"ok": False, "error": "unknown endpoint"}, 404)
                 try:
                     return self._json(fn(body))
+                except BadArg as e:
+                    # 入参收敛失败属于调用方问题，不是内部故障：400 + 说清哪个字段
+                    return self._json({"ok": False, "error": str(e), "kind": "bad_arg"}, 400)
                 except Exception as e:  # noqa: BLE001
                     log.exception("API %s 失败", path)
                     return self._json({"ok": False,

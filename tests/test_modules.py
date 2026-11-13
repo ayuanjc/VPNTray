@@ -366,6 +366,144 @@ def test_tool_table_consistency():
         assert isinstance(t["params"], dict)
 
 
+# ───────── 审查修复回归（P1-d / 掩码 / 严格布尔 / 组名查重 / DOMAIN-REGEX / 异步体检）─────────
+def test_validate_domain_regex_shape():
+    """DOMAIN-REGEX 的尾巴是正则：逗号和空白都不该出现（会被 mihomo 当分隔符切开）。"""
+    bad = _mod(match={"rules": ["DOMAIN-REGEX,^a\\.b$,x"]})
+    errs = modules.validate(bad)
+    assert any("逗号或空白" in e for e in errs), errs
+    bad2 = _mod(match={"rules": ["DOMAIN-REGEX,^a b$"]})
+    assert any("逗号或空白" in e for e in modules.validate(bad2))
+    empty = _mod(match={"rules": ["DOMAIN-REGEX"]})
+    assert any("缺正则" in e for e in modules.validate(empty))
+    ok = _mod(match={"rules": ["DOMAIN-REGEX,^a\\.b$"]})
+    assert not [e for e in modules.validate(ok) if "正则" in e]
+
+
+def test_validate_rejects_subscription_group_name():
+    """模块组名与订阅里的组重名时提前报错，而不是等 mihomo 起不来。"""
+    errs = modules.validate(_mod(), reserved={"Epic 加速"})
+    assert any("组名与订阅里的组重名" in e for e in errs), errs
+    # 不传 reserved（老调用方）时行为不变：照旧只看模块之间是否重名
+    assert not [e for e in modules.validate(_mod()) if "重名" in e]
+
+
+def test_state_masks_token_by_default():
+    """api/state 只给掩码，明文要显式 reveal —— 否则日志/截图/插件全是密钥。"""
+    app = _App()
+    tok = aiops.ensure_token(app.settings)
+    st = aiops.state(app)
+    assert st["token"] != tok and "****" in st["token"]
+    assert st["token_available"] is True and st["token_revealed"] is False
+    raw = aiops.state(app, reveal=True)
+    assert raw["token"] == tok and raw["token_revealed"] is True
+
+
+def test_mask_token_edges():
+    assert aiops.mask_token("") == ""
+    assert aiops.mask_token("short") == "****"   # 太短就全遮，露一半等于没遮
+    assert aiops.mask_token("0123456789abcdef") == "0123****cdef"
+
+
+def test_kernel_restart_reports_bool():
+    """kernel.restart 以前固定回 ok=True，把失败藏进 queued。"""
+    class _A(_App):
+        def __init__(self, ok):
+            super().__init__()
+            self._ok = ok
+
+        def restart_kernel(self):
+            return self._ok
+
+    assert aiops.call(_A(True), "kernel.restart", {})["ok"] is True
+    bad = aiops.call(_A(False), "kernel.restart", {})
+    assert bad["ok"] is False and bad["error"]
+
+
+def test_net_diagnose_tool_prefers_cache():
+    """read 级 net.diagnose 默认吃缓存（一轮 6 秒，AI 会连问好几轮）。"""
+    app = _App()
+    app.calls = []
+
+    def _diag(refresh=True):
+        app.calls.append(refresh)
+        return {"ok": True}
+
+    app.net_diagnose = _diag
+    aiops.call(app, "net.diagnose", {})
+    assert app.calls == [False]
+    aiops.call(app, "net.diagnose", {"refresh": "true"})
+    assert app.calls == [False, True]
+
+
+def test_webui_flag_is_strict():
+    """bool("false") 是 True：布尔入参必须严格收敛，收敛不了就报错。"""
+    from vpntray import webui
+
+    assert webui._flag(True) is True and webui._flag("0") is False
+    assert webui._flag("off") is False and webui._flag(1) is True
+    assert webui._flag(" ON ") is True
+    for bad in (None, "nah", 2, [], {}, "yes please"):
+        try:
+            webui._flag(bad)
+        except webui.BadArg:
+            continue
+        raise AssertionError(f"应当拒绝 {bad!r}")
+
+
+def test_match_target_finds_and_falls_back():
+    """prepare_config 不再假设最后一条是 MATCH。"""
+    from vpntray import app as app_mod
+
+    assert app_mod._match_target(["DOMAIN,a.com,直连", "MATCH,主体"]) == "主体"
+    assert app_mod._match_target(["MATCH,主体", "MATCH,备用"]) == "备用"
+    assert app_mod._match_target(["DOMAIN,a.com,直连"]) == ""
+
+
+def test_net_diagnose_async_single_flight():
+    """异步体检：吃缓存不起线程、在跑时幂等、任务异常也必须把 running 降回去。"""
+    import threading
+
+    from vpntray import app as app_mod
+
+    class _A:
+        def __init__(self, **st):
+            self.state = dict(st)
+            self._lock = threading.RLock()
+            self._netdoc_running = False
+            self.spawned = []
+
+        def _set(self, **kw):
+            self.state.update(kw)
+
+        def _spawn(self, name, fn):
+            self.spawned.append((name, fn))
+
+    a = _A(netdoc={"checks": [{"name": "网关"}], "ok": True})
+    assert app_mod.App.net_diagnose_async(a, refresh=False).get("cached") is True
+    assert not a.spawned
+
+    b = _A(netdoc={})
+    b._netdoc_running = True
+    res = app_mod.App.net_diagnose_async(b, refresh=True)
+    assert res["running"] is True and res.get("reused") is True and not b.spawned
+
+    c = _A(netdoc={})
+    assert app_mod.App.net_diagnose_async(c, refresh=True) == {"ok": True, "running": True}
+    assert c.spawned and c.state["netdoc_running"] is True
+    c.spawned[0][1]()          # 任务体里 net_diagnose 不存在 → 走失败分支
+    assert c.state["netdoc_running"] is False
+    assert "体检失败" in c.state["netdoc_error"]
+
+def test_process_tree_helpers_are_safe():
+    """进程树枚举只读、失败退空集：冲突扫描不能因为拿不到进程列表就崩。"""
+    from vpntray import app as app_mod
+
+    pairs = app_mod.App._proc_pairs()
+    assert isinstance(pairs, list) and all(len(p) == 3 for p in pairs)
+    assert isinstance(app_mod.App._descendants({0}), set)
+    assert app_mod.App._same_exe_ancestors(set()) == set()
+
 if __name__ == "__main__":
     bad = 0
     for k, fn in list(globals().items()):

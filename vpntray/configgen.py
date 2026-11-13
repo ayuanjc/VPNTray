@@ -264,6 +264,10 @@ def _main_group(sub: dict[str, Any], settings) -> str:
     selects = [g["name"] for g in sub["proxy-groups"] if g.get("type") == "select"]
     main_group = selects[0] if selects else sub["proxy-groups"][0]["name"]
     settings["main_group"] = main_group
+    try:                      # 回退结果要落盘，否则每次启动都会重新 warning 一次
+        settings.save()
+    except Exception:         # noqa: BLE001    测试桩/只读环境放过
+        pass
     log.warning("主策略组回退为 %s", main_group)
     return main_group
 
@@ -284,10 +288,15 @@ def _subscription_groups(sub: dict[str, Any], probe_url: str) -> list[dict[str, 
     for g in sub["proxy-groups"]:
         g = dict(g)
         if g.get("type") in {"url-test", "fallback", "load-balance"}:
+            # 探测地址仍然覆盖（机场默认的 cp.cloudflare.com 常被 HEAD 打回 403，
+            # 会把好节点误判成死的），但 interval / tolerance / lazy 尊重订阅自己的
+            # 配置：以前一律改成 300s / 50ms / lazy=false，等于让所有组常驻健康检查，
+            # 移动网络下是持续流量和耗电。
             g["url"] = probe_url
-            g["interval"] = 300
-            g["tolerance"] = 50
-            g["lazy"] = False
+            g.setdefault("interval", 300)
+            if g["type"] == "url-test":
+                g.setdefault("tolerance", 50)
+            g.setdefault("lazy", False)
         groups.append(g)
     return groups
 
@@ -596,7 +605,10 @@ def build(sub: dict[str, Any], settings,
     # AI 组占了第 0 位，场景组从 1 开始插，顺序即面板顺序。
     # 模块的组名是用户自己起的，可能和订阅里的组重名 —— mihomo 遇到同名组
     # 直接拒绝启动，所以这里必须去重（重名的模块本轮跳过并记日志）。
-    scene_groups, _ = _scene_groups(node_names, settings, delays)
+    scene_groups, scene_on = _scene_groups(node_names, settings, delays)
+    # scene_on 由 _scene_groups 按「真的为这个模块建了组」给出，包含所有组类型。
+    # 以前这里按 type == "select" 重算一遍，等于把 url-test / fallback /
+    # load-balance 类型的模块规则全丢了（组建了、规则不插，流量落 MATCH）。
     taken = {g["name"] for g in groups}
     kept: list[dict[str, Any]] = []
     for g in scene_groups:
@@ -608,7 +620,8 @@ def build(sub: dict[str, Any], settings,
     base = 1 if ai else 0
     for i, g in enumerate(kept):
         groups.insert(base + i, g)
-    scene_on = {g["name"] for g in kept if g.get("type") == "select"}
+    # 重名被跳过的组要从 scene_on 里剔除，否则规则会指向一个不存在的组
+    scene_on = {n for n in scene_on if n in {g["name"] for g in kept}}
     if kept:
         log.info("模块组：%s", "、".join(g["name"] for g in kept))
 

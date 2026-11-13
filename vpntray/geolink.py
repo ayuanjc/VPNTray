@@ -22,62 +22,109 @@ from . import subscription
 log = logging.getLogger("geolink")
 
 TTL = 900
-# 失败也进缓存，但只放 60 秒：ip-api 免费额度是 45 次/分钟，
-# 连点几次拓扑、或者在没网的时候反复打开，会被自己打满
+# 保留常量供外部引用；失败结果不再进缓存，原因见 locate()
 FAIL_TTL = 60
 _CACHE: dict[str, tuple[float, dict[str, Any] | None, float]] = {}
 _LOCK = threading.Lock()
 
+_UA = "VPNTray/1.0"
+_TIME_OUT = 8.0
 _FIELDS = "status,country,countryCode,city,lat,lon,query,isp"
 
 
-def _http_json(url: str, timeout: float = 6.0) -> dict[str, Any] | None:
+def _http_json(url: str, timeout: float = _TIME_OUT,
+               retries: int = 2) -> dict[str, Any] | None:
+    """取一个 JSON 对象；网络错误重试（≤2 次）并指数退避。"""
+    delay = 0.6
+    for attempt in range(retries + 1):
+        try:
+            # 用 with 关掉连接：拓扑是 40 秒一轮的轮询，Session 不关会一直涨句柄
+            with requests.Session() as s:
+                s.trust_env = False    # 关键：不读系统代理，否则查到的「本机 IP」就是出口 IP
+                s.headers["User-Agent"] = _UA
+                with s.get(url, timeout=min(15.0, timeout)) as r:
+                    if r.status_code == 429:
+                        # 限流：再重试只会把额度烧得更久
+                        log.debug("geo http %s -> 429", url)
+                        return None
+                    if r.status_code != 200:
+                        log.debug("geo http %s -> %s", url, r.status_code)
+                        return None
+                    try:
+                        data = r.json()
+                    except ValueError:
+                        log.debug("geo http %s -> 非 JSON 响应", url)
+                        return None
+                    return data if isinstance(data, dict) else None
+        except Exception as e:  # noqa: BLE001
+            log.debug("geo http fail %s (%d): %s", url, attempt, e)
+            if attempt >= retries:
+                break
+            time.sleep(delay)
+            delay *= 2
+    return None
+
+
+def _cand(ip, city, country, cc, lat, lon, isp) -> dict[str, Any] | None:
+    """把各家的字段裁成同一形状；缺经纬度就当没查到。"""
+    if lat is None or lon is None:
+        return None
     try:
-        # 用 with 关掉连接：拓扑是 40 秒一轮的轮询，Session 不关会一直涨句柄
-        with requests.Session() as s:
-            s.trust_env = False    # 关键：不读系统代理，否则查到的「本机 IP」就是出口 IP
-            s.headers["User-Agent"] = "VPNTray/1.0"
-            with s.get(url, timeout=timeout) as r:
-                if r.status_code != 200:
-                    log.debug("geo http %s -> %s", url, r.status_code)
-                    return None
-                try:
-                    data = r.json()
-                except ValueError:
-                    log.debug("geo http %s -> 非 JSON 响应", url)
-                    return None
-                return data if isinstance(data, dict) else None
-    except Exception as e:  # noqa: BLE001
-        log.debug("geo http fail %s: %s", url, e)
+        flat, flon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None
+    return {"ip": ip or "", "city": city or "", "country": country or "",
+            "cc": str(cc or "").upper(), "lat": flat, "lon": flon,
+            "isp": isp or ""}
+
+
+def _geo(query: str) -> dict[str, Any] | None:
+    """按「https 优先」的顺序问多家，任一家给出完整坐标就用它。"""
+    q = quote(str(query or ""), safe="")
+    # ip-api 免费版只走 http，明文响应在运营商侧可以被改写成任意假坐标，
+    # 拓扑图上就会显示一个错误的国家而用户毫无察觉 —— 所以 https 服务排前面。
+    d = _http_json(f"https://ipapi.co/{q}/json/")
+    if isinstance(d, dict) and not d.get("error"):
+        c = _cand(d.get("ip") or query, d.get("city"), d.get("country_name"),
+                 d.get("country_code"), d.get("latitude"), d.get("longitude"),
+                 d.get("org"))
+        if c:
+            return c
+    d = _http_json(f"https://api.ip.sb/geoip/{q}")
+    if isinstance(d, dict):
+        c = _cand(d.get("ip") or query, d.get("city"), d.get("country"),
+                 d.get("country_code"), d.get("latitude"), d.get("longitude"),
+                 d.get("isp") or d.get("organization"))
+        if c:
+            return c
+    for scheme in ("https", "http"):
+        d = _http_json(f"{scheme}://ip-api.com/json/{q}?fields={_FIELDS}")
+        if d and d.get("status") == "success":
+            c = _cand(d.get("query") or query, d.get("city"), d.get("country"),
+                     d.get("countryCode"), d.get("lat"), d.get("lon"),
+                     d.get("isp"))
+            if c:
+                return c
     return None
 
 
 def locate(query: str = "") -> dict[str, Any] | None:
-    """query 为空 = 查本机公网 IP；也可以是 IP 或域名（ip-api 自己会解析域名）。"""
+    """query 为空 = 查本机公网 IP；也可以是 IP 或域名（服务商自己会解析域名）。"""
     key = (query or "self").lower()
     now = time.time()
     with _LOCK:
         hit = _CACHE.get(key)
-    if hit and now - hit[0] < hit[2]:
+    if hit and hit[1] is not None and now - hit[0] < hit[2]:
         return hit[1]
 
-    url = f"http://ip-api.com/json/{quote(str(query or ''), safe='')}?fields={_FIELDS}"
-    d = _http_json(url)
-    info = None
-    if d and d.get("status") == "success":
-        cand = {
-            "ip": d.get("query") or query,
-            "city": d.get("city") or "",
-            "country": d.get("country") or "",
-            "cc": str(d.get("countryCode") or "").upper(),
-            "lat": d.get("lat"),
-            "lon": d.get("lon"),
-            "isp": d.get("isp") or "",
-        }
-        if cand["lat"] is not None and cand["lon"] is not None:
-            info = cand
+    info = _geo(query)
     with _LOCK:
-        _CACHE[key] = (now, info, TTL if info else FAIL_TTL)
+        # 失败不进缓存：缓存空结果会让「刚连上网就点拓扑」在 60 秒里一直显示空，
+        # 下一次真的查到结果也要等过期才见效。
+        if info:
+            _CACHE[key] = (now, info, TTL)
+        else:
+            _CACHE.pop(key, None)
     return info
 
 
