@@ -1021,10 +1021,31 @@ pnputil /remove-device "SWD\WINTUN\{03A3AABE-C890-F9C7-7DA2-DA7B6FF35C15}"
 # 顺带清掉对应接口下的 NameServer 值
 ```
 
-**3. 校园网可能根本不广播 5GHz。** 这次扫出来同一 SSID 的 4 个 AP 全在 2.4G（三个 ch6、一个 ch1），
-此时网卡里设「首选 5GHz 频带」等于让驱动白发扫描时间；真正能改善的是
-`吞吐量助推器 = 已启用`、`MIMO 节能模式 = 无 SMPS`（这两项实测把网关抖动从 max 355ms 压到 209ms，
-223.5.5.5 的 12% 丢包降到 0%）。
+**3. 2.4G 挤爆时，先确认网卡是不是「住在 2.4G 不肯走」。** 这次一开始 `netsh wlan show interfaces` 显示
+连在 2.4G ch6、接收速率 34 Mbps，而 `netsh wlan show networks mode=bssid` 头两遍扫出来同 SSID 的 4 个 AP
+全在 2.4G（三个 ch6、一个 ch1）—— 看上去像是「这个网没有 5G」。**这是扫描不全造成的误判**：
+把网卡高级属性里的 `首选频带` 设成 `3. 首选 5GHz 频带`、并重启网卡之后，它自己漫游到了
+`84:32:ea:43:b4:56`（5G ch149，信号 91%）。差别是断崖式的：
+
+| 指标 | 2.4G ch6 | 5G ch149 |
+|---|---|---|
+| 接收 / 发送速率 | 34 / 138 Mbps | **413 / 542 Mbps** |
+| 网关 172.34.16.1 | avg 38–59ms，max 355ms | **avg 4ms（4–5ms）** |
+| `223.5.5.5` | 12% 丢包，avg 214ms | **0% 丢包，avg 17ms（17–19ms）** |
+
+管理员 PowerShell：
+
+```powershell
+Get-NetAdapterAdvancedProperty -Name 'WLAN' | Where-Object DisplayName -in '首选频带','吞吐量助推器','MIMO 节能模式'
+Set-NetAdapterAdvancedProperty -Name 'WLAN' -DisplayName '首选频带'      -DisplayValue '3. 首选 5GHz 频带'
+Set-NetAdapterAdvancedProperty -Name 'WLAN' -DisplayName '吞吐量助推器'  -DisplayValue '已启用'
+Set-NetAdapterAdvancedProperty -Name 'WLAN' -DisplayName 'MIMO 节能模式' -DisplayValue '无 SMPS'
+Restart-NetAdapter -Name 'WLAN'
+```
+
+注意：`-DisplayName` 必须用**中文显示名**（`首选频带`），写 `RoamingPreferredBandType` 会报
+"未找到匹配的 MSFT_NetAdapterAdvancedPropertySettingData 对象"；值也必须用显示值（`3. 首选 5GHz 频带`），
+不能传 `3`。
 
 ### 升级方式
 
