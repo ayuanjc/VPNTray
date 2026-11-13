@@ -174,10 +174,37 @@ DEFAULT_DNS: dict[str, Any] = {
         "https://doh.pub/dns-query",
     ],
     "proxy-server-nameserver": ["223.5.5.5", "119.29.29.29"],
-    # 注意：fake-ip 模式下不要用境外 DoH 做 nameserver/policy，
-    # 那些 DoH 查询本身要经过代理，会在国内网络里卡 5 秒超时。
-    # 一律用国内 DNS，真实解析交给代理节点去做。
+    # 注意：fake-ip 模式下不要用「不经代理」的境外 DoH 做 nameserver，
+    # 那些查询在国内网络里会卡 5 秒超时。真实解析本来交给代理节点去做。
+    # 但**交易域名是例外**，见下面 TRADE_DNS_DOMAINS：国内 DNS 会返回投毒结果，
+    # 必须用「带 #策略组 的 DoH」，让查询本身走代理出去。
 }
+
+# ── 交易域名的 DNS 投毒护栏 ───────────────────────────────────────────
+# 2026-11-13 的实况：国内 DNS 对 www.okx.com / app.okx.com 返回
+#   awscn.okpool.top → 169.254.0.2（APIPA 链路本地地址，永远没有服务器）
+# 而 sniffer.force-dns-mapping=true 要求 mihomo 先解析再连，于是客户端连到
+# 黑洞地址、TLS 拿不到 ServerHello，五路全部报
+#   Cannot connect to host www.okx.com:443 ssl:default [None]
+# 同时节点延迟测试依然 120ms 全绿 —— 因为测速是节点侧解析，走的是另一条路径。
+# 结论：交易域名不能相信任何国内 DNS（运营商 / 阿里 / 腾讯 / 114 一样会投毒）。
+TRADE_DNS_DOMAINS: tuple[str, ...] = ("+.okx.com", "+.binance.com")
+TRADE_DNS_SERVERS: tuple[str, ...] = ("https://1.1.1.1/dns-query",
+                                      "https://8.8.8.8/dns-query")
+
+
+def trade_dns_policy(main_group: str) -> dict[str, list[str]]:
+    """交易域名 → 经代理的 DoH 列表。main_group 为空时返回 {}（不写策略）。
+
+    "#节点选择" 是 mihomo 的「这条 DNS 查询走哪个出口」语法，加上它以后
+    境外 DoH 不再从国内直连，实测 0.33~0.60s，不会卡 5 秒。反过来，少了
+    这一层，「一律用国内 DNS」的护栏本身就会把交易流量送进投毒结果里。
+    """
+    grp = str(main_group or "").strip()
+    if not grp:
+        return {}
+    return {dom: [f"{srv}#{grp}" for srv in TRADE_DNS_SERVERS]
+            for dom in TRADE_DNS_DOMAINS}
 
 SNIFFER: dict[str, Any] = {
     "enable": True,
@@ -500,8 +527,8 @@ def _ipv6_available() -> bool:
     return _ipv6_ok
 
 
-def _dns(sub: dict[str, Any]) -> dict[str, Any]:
-    """本地 DNS 基线 + 订阅覆盖。"""
+def _dns(sub: dict[str, Any], main_group: str = "") -> dict[str, Any]:
+    """本地 DNS 基线 + 订阅覆盖 + 交易域名的反投毒策略。"""
     dns = dict(DEFAULT_DNS)
     sub_dns = sub.get("dns") or {}
     for k in _DNS_KEYS:
@@ -521,9 +548,15 @@ def _dns(sub: dict[str, Any]) -> dict[str, Any]:
         dns["ipv6"] = False
     if not dns.get("fake-ip-filter"):
         dns["fake-ip-filter"] = FAKE_IP_FILTER
-    # 境外 DoH 在国内网络上会先卡超时，统一交给国内 DNS + fake-ip
+    # 订阅下发的 policy 一律丢弃：里面常是「境外 DoH 直连」，在国内网络上
+    # 先卡 5 秒超时，等于把整机 DNS 拖死。policy 只由本程序按白名单重建。
     if dns.pop("nameserver-policy", None):
-        log.info("已移除订阅中的 nameserver-policy（避免境外 DoH 卡顿）")
+        log.info("已移除订阅中的 nameserver-policy（避免境外 DoH 直连卡顿）")
+    trade = trade_dns_policy(main_group)
+    if trade:
+        # 只加交易域名，其余域名继续走国内 DNS + fake-ip（快且不会卡）
+        dns["nameserver-policy"] = trade
+        log.info("交易域名走代理 DoH：%s", "、".join(trade))
     return dns
 
 
@@ -626,7 +659,8 @@ def build(sub: dict[str, Any], settings,
         log.info("模块组：%s", "、".join(g["name"] for g in kept))
 
     rules = _rules(sub, main_group, ai is not None, scene_on, groups)
-    return _assemble({**sub, "proxy-groups": groups}, settings, _dns(sub), groups, rules)
+    return _assemble({**sub, "proxy-groups": groups}, settings,
+                     _dns(sub, main_group), groups, rules)
 
 
 

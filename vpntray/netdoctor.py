@@ -603,6 +603,259 @@ def _chk_dns_public(_app: Any) -> dict[str, Any]:
                fix="flush_dns", fix_title="清空 DNS 缓存")
 
 
+# ── 交易域名投毒探测 ───────────────────────────────────────────────
+# 2026-11-13 实况：国内 DNS 把 www.okx.com 解析成假 CNAME awscn.okpool.top →
+# 169.254.0.2（APIPA，永远没有服务器）。客户端连上去立刻被 RST，TLS 拿不到
+# ServerHello，五路交易进程全报 Cannot connect to host www.okx.com:443；
+# 而同一时刻节点延迟测试 120ms 全绿 —— 因为测速是节点侧解析，走的是另一条路。
+# 所以「只有某个境外域名不通、别的都正常」时，必须单独查这条。
+POISON_NAMES = ("www.okx.com", "www.binance.com")
+BAD_IP_NETS = (
+    ipaddress.ip_network("169.254.0.0/16"),      # APIPA 链路本地：只可能是假地址
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("255.255.255.255/32"),
+)
+# 已知的投毒指纹（只当补充证据用，黑名单永远不全，主判据还是上面的黑洞网段）
+KNOWN_POISON = {
+    "www.okx.com": {"cnames": ("okpool.top",), "nets": ()},
+    # binance 被投毒成 Meta 的段（157.240.0.0/16），这是典型的大陆 DNS 注入
+    "www.binance.com": {"cnames": (), "nets": ("157.240.0.0/16",)},
+}
+
+
+def _poison_ip(ip: str, name: str = "") -> bool:
+    """外网域名的 A 记录落在黑洞段（或已知投毒段）里 = 投毒，没有例外。"""
+    try:
+        addr = ipaddress.ip_address(str(ip))
+    except ValueError:
+        return False
+    if any(addr in net for net in BAD_IP_NETS):
+        return True
+    hint = KNOWN_POISON.get(name) or {}
+    return any(addr in ipaddress.ip_network(net) for net in (hint.get("nets") or ()))
+
+
+def _poison_cname(name: str, cnames: list[str]) -> str:
+    """CNAME 落到已知的假域名（okpool.top）时返回那个 CNAME。"""
+    hint = KNOWN_POISON.get(name) or {}
+    for suffix in (hint.get("cnames") or ()):
+        for cn in cnames:
+            if cn == suffix or cn.endswith("." + suffix):
+                return cn
+    return ""
+
+
+def _skip_name(data: bytes, off: int) -> int:
+    """跳过报文里的域名（0xC0 压缩指针占 2 字节）。"""
+    n = len(data)
+    while off < n:
+        ln = data[off]
+        if ln == 0:
+            return off + 1
+        if ln & 0xC0 == 0xC0:
+            return off + 2
+        off += 1 + ln
+    return n
+
+
+def _read_name(data: bytes, off: int) -> tuple[str, int]:
+    """读一个域名，返回 (名字, 下一个字段的偏移)。指针可能往前跳。"""
+    parts: list[str] = []
+    n, end, jumped = len(data), off, False
+    while off < n:
+        ln = data[off]
+        if ln == 0:
+            off += 1
+            if not jumped:
+                end = off
+            break
+        if ln & 0xC0 == 0xC0:
+            if off + 1 >= n:
+                break
+            if not jumped:
+                end = off + 2
+            jumped = True
+            off = ((ln & 0x3F) << 8) | data[off + 1]
+            continue
+        parts.append(data[off + 1:off + 1 + ln].decode("ascii", "replace"))
+        off += 1 + ln
+        if not jumped:
+            end = off
+    return ".".join(parts), (end or n)
+
+
+def _ask_full(server: str, name: str, timeout: float = 2.0) -> dict[str, Any]:
+    """问一次 A 记录并把 A / CNAME 解出来（_ask 只回条数，看不到投毒目标）。"""
+    t0 = time.time()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(_build_query(name), (server, 53))
+        data, _ = s.recvfrom(4096)
+    except OSError as e:
+        return {"ok": False, "ms": int((time.time() - t0) * 1000), "ips": [],
+                "cnames": [], "error": type(e).__name__}
+    finally:
+        s.close()
+    ms = int((time.time() - t0) * 1000)
+    if len(data) < 12:
+        return {"ok": False, "ms": ms, "ips": [], "cnames": [], "error": "short reply"}
+    rcode = data[3] & 0x0F
+    qd = struct.unpack("!H", data[4:6])[0]
+    an = struct.unpack("!H", data[6:8])[0]
+    off = 12
+    try:
+        for _ in range(qd):
+            off = _skip_name(data, off) + 4
+        ips: list[str] = []
+        cnames: list[str] = []
+        for _ in range(an):
+            _rr, off = _read_name(data, off)
+            if off + 10 > len(data):
+                break
+            rtype, _cls, _ttl, rdlen = struct.unpack("!HHIH", data[off:off + 10])
+            off += 10
+            if rtype == 1 and rdlen == 4:
+                ips.append(socket.inet_ntoa(data[off:off + 4]))
+            elif rtype == 5:
+                cn, _n = _read_name(data, off)
+                if cn:
+                    cnames.append(cn.rstrip(".").lower())
+            off += rdlen
+    except (struct.error, IndexError, ValueError) as e:
+        return {"ok": False, "ms": ms, "ips": [], "cnames": [],
+                "error": type(e).__name__}
+    return {"ok": rcode == 0, "ms": ms, "ips": ips, "cnames": cnames,
+            "rcode": rcode, "error": "" if rcode == 0 else "rcode=" + str(rcode)}
+
+
+def _trade_policy_on() -> tuple[bool, str]:
+    """生成出来的 config.yaml 里有没有交易域名的 nameserver-policy。
+
+    系统 DNS 被投毒但内核侧 policy 生效时，走代理的程序拿不到假地址，
+    这时候该报 warn（有风险）而不是 bad（不能上网）—— 判据要跟事实一致。
+    """
+    try:
+        from . import paths
+        p = str(getattr(paths, "CONFIG", "") or "")
+        if not p or not os.path.exists(p):
+            return False, "找不到 config.yaml"
+        with open(p, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        return False, "读配置失败 %s" % type(e).__name__
+    return (("+.okx.com" in text) and ("nameserver-policy" in text)), ""
+
+
+def _chk_dns_poison(_app: Any) -> dict[str, Any]:
+    """交易域名有没有被投毒。
+
+    判据分两路，这一点很关键：
+      · 有效路径（系统 DNS；指向 127.0.0.1 时就是本机解析/mihomo）——决定结论，
+        因为它就是客户端真正拿到的东西；
+      · 上游公共 DNS——只作证据列出。3.0.3 起 policy 让交易域名经代理走 DoH，
+        上游照样被投毒，但本机不再返回假地址，这时必须报 ok 而不是红色。
+    """
+    d = _dns_servers()
+    servers = [s for s in d["servers"]]
+    effective = servers[0] if servers else DNS_FALLBACK[0]
+    probes: list[tuple[str, bool]] = [(effective, True)]
+    for s in DNS_FALLBACK[:1]:
+        if s != effective:
+            probes.append((s, False))
+    rows: list[str] = []
+    bad: list[tuple[str, str, list[str], str]] = []
+    empty: list[tuple[str, str]] = []
+    upstream_bad: list[tuple[str, str, list[str], str]] = []
+    ok_rows = 0
+    for server, decisive in probes:
+        for name in POISON_NAMES:
+            r = _ask_full(server, name)
+            tag = "" if decisive else "（上游，仅作证据）"
+            if not r["ok"]:
+                rows.append("{} → {}: 查询失败 {}{}".format(
+                    server, name, r.get("error") or "无应答", tag))
+                continue
+            ok_rows += 1
+            fake_cn = _poison_cname(name, r["cnames"])
+            marks = [ip for ip in r["ips"] if _poison_ip(ip, name)]
+            cn = "  CNAME " + ",".join(r["cnames"]) if r["cnames"] else ""
+            rows.append("{} → {}: {}{}{}".format(
+                server, name, ", ".join(r["ips"]) or "（无 A 记录）", cn, tag))
+            hit = (server, name, marks or (["CNAME " + fake_cn] if fake_cn else []),
+                   fake_cn or (r["cnames"][0] if r["cnames"] else ""))
+            if marks or fake_cn:
+                (bad if decisive else upstream_bad).append(hit)
+            elif not r["ips"] and decisive:
+                empty.append((server, name))
+    detail = "\n".join([
+        "交易域名解析：",
+        "  " + ("\n  ".join(rows) or "（没有可用的 DNS 服务器）"),
+        "",
+        "有效路径: " + effective,
+        "要查的域名: " + ", ".join(POISON_NAMES),
+    ])
+    if bad:
+        server, name, hits, cname = bad[0]
+        first = hits[0]
+        brief = ("{} → {}（{}）".format(name, first, cname) if cname and not first[0].isdigit()
+                 else "{} → {}".format(name, first))
+        covered, why = _trade_policy_on()
+        if covered:
+            # 系统 DNS 脏，但内核侧 policy 已经把这两个域名的查询改走代理 DoH。
+            # 走代理的程序没事，不走代理的（部分库、系统组件）仍会拿到假地址 —— 报 warn。
+            return _ck("dns_poison", "交易域名解析（反投毒）", "warn",
+                       brief + "，系统 DNS 仍投毒（内核侧已走代理 DoH）",
+                       detail + "\n\n" + "\n".join([
+                           "系统 DNS（{}）返回的是黑洞地址，说明本地解析这条路被投毒。".format(server),
+                           "但 data/config.yaml 里有 +.okx.com / +.binance.com 的 nameserver-policy，"
+                           "内核在处理这两个域名时会改用代理侧的 DoH（1.1.1.1 / 8.8.8.8），"
+                           "所以走代理的程序（浏览器、交易客户端）不受影响。",
+                           "",
+                           "仍有风险：不走代理的程序（部分 Python / Node 库、系统组件）直接用系统 DNS，"
+                           "照样会拿到 169.254.x.x。要让整机都干净，把系统 DNS 指向本机解析"
+                           "（扩展页「本机解析」一开，127.0.0.1:53 就由程序接管）。",
+                       ]),
+                       fix="start_dns", fix_title="开启本机解析",
+                       data={"effective": effective, "bad": bad, "policy": True})
+        return _ck("dns_poison", "交易域名解析（反投毒）", "bad",
+                   brief + ("，是黑洞地址" if why == "" else "，是黑洞地址（%s）" % why),
+                   detail + "\n\n" + "\n".join([
+                       "169.254.x.x / 0.0.0.0 / 127.x 出现在任何外网域名的结果里，"
+                       "只有一个解释：上游 DNS 在投毒（运营商、公共 DNS 都可能）。",
+                       "客户端会连到一个不存在的地址，TLS 拿不到 ServerHello，"
+                       "报错形如 Cannot connect to host www.okx.com:443；"
+                       "而同一时刻节点测速全绿，因为测速是节点侧解析。",
+                       "",
+                       "3.0.3 起生成的 config.yaml 会写 nameserver-policy，"
+                       "让 +.okx.com / +.binance.com 的查询本身经代理走 DoH。"
+                       "两项都要在：policy 在配置里，且查询真的经代理。缺一个就会复发。",
+                   ]),
+                   fix="flush_dns", fix_title="清空 DNS 缓存",
+                   data={"effective": effective, "bad": bad})
+    if upstream_bad:
+        server, name, hits, cname = upstream_bad[0]
+        return _ck("dns_poison", "交易域名解析（反投毒）", "ok",
+                   "本机解析正常（上游 {} 仍投毒，已被 policy 绕过）".format(server),
+                   detail + "\n\n上游直问 {} 会拿到假地址，但本机（{}）返回的是真实地址 —— "
+                            "说明 nameserver-policy 生效了，客户端拿不到投毒结果。".format(
+                                server, effective),
+                   data={"effective": effective, "upstream": upstream_bad})
+    if empty:
+        return _ck("dns_poison", "交易域名解析（反投毒）", "warn",
+                   "{} 没有 A 记录".format(empty[0][1]),
+                   detail + "\n\n能问通但没有 A 记录：可能只回了 CNAME 没给地址，"
+                            "也可能被中间设备劫持。先清缓存再复查。",
+                   fix="flush_dns", fix_title="清空 DNS 缓存")
+    if not ok_rows:
+        return _ck("dns_poison", "交易域名解析（反投毒）", "skip",
+                   "问不到 DNS，无法判断", detail)
+    return _ck("dns_poison", "交易域名解析（反投毒）", "ok",
+               "{} 个域名都是真实地址".format(len(POISON_NAMES)), detail)
+
+
 def _chk_sysproxy(app: Any) -> dict[str, Any]:
     st = netguard.system_proxy_state()
     srv = str(st.get("server") or "")
@@ -752,6 +1005,7 @@ def _chk_conflict(app: Any) -> dict[str, Any]:
 
 
 CHECKS = (_chk_link, _chk_gateway, _chk_dns_cfg, _chk_dns_local, _chk_dns_public,
+          _chk_dns_poison,
           _chk_sysproxy, _chk_kernel, _chk_direct, _chk_mtu, _chk_hosts,
           _chk_conflict, _chk_ipv6)
 
