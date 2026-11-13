@@ -64,6 +64,11 @@ foreach ($f in 'mihomo.exe', 'GeoIP.dat', 'GeoSite.dat', 'country.mmdb') {
 Write-Host "[4/5] 放入说明与 data 目录" -ForegroundColor Cyan
 Copy-Item (Join-Path $PSScriptRoot '首次使用.txt') $stage -Force
 Copy-Item (Join-Path $PSScriptRoot 'README.md') $stage -Force
+# 从网上下来的 zip 解压后每个文件都带「来自 Internet」标记，双击 exe 会被
+# SmartScreen 拦一句「Windows 已保护你的电脑」。程序自己启动后能清（ui_native.unblock_tree），
+# 但那是拦完之后的事了 —— 所以要有一个「运行前先点它」的脚本。
+$unlockSrc = Join-Path $PSScriptRoot 'assets\解除锁定.cmd'
+if (Test-Path $unlockSrc) { Copy-Item $unlockSrc $stage -Force }
 $dataDst = Join-Path $stage 'data'
 New-Item -ItemType Directory -Force -Path $dataDst | Out-Null
 Get-ChildItem $dataDst -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -82,8 +87,24 @@ if (Test-Path $puritySrc) {
 }
 
 Write-Host "[5/5] 压缩" -ForegroundColor Cyan
+# 校验和：SmartScreen 对没有签名的 exe 只会说「无法识别的应用」，不会告诉你
+# 文件有没有被替换。有了这行 SHA256，至少能自己核一遍再决定要不要点「仍要运行」。
+$sums = foreach ($rel in 'VPNTray.exe', 'bin\mihomo.exe') {
+    $p = Join-Path $stage $rel
+    if (Test-Path $p) {
+        $h = (Get-FileHash $p -Algorithm SHA256).Hash.ToLower()
+        "{0}  {1}" -f $h, ($rel -replace '\\', '/')
+    }
+}
+$sumsText = ($sums -join "`n") + "`n"
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText((Join-Path $stage 'SHA256SUMS.txt'), $sumsText, $utf8NoBom)
+Write-Host ($sumsText.TrimEnd())
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
+# 压缩包本身的校验和也留一份在 release/ 里，方便贴到 release notes
+$zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+[System.IO.File]::WriteAllText("$zip.sha256", "$zipHash  VPNTray-$ver-win64.zip`n", $utf8NoBom)
 $zipMb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
 $dirMb = [math]::Round(((Get-ChildItem $stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)
 
