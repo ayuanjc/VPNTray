@@ -956,6 +956,72 @@ INFO app: VPNTray 2.2.2 启动（frozen=True，Python 3.12.10）
 覆盖安装后 `data/` 保留。如果日志里出现「图标文件缺失（打包时漏了 assets）」，说明手上
 那份包不完整 —— 换回官方 zip（`VPNTray-<版本>-win64.zip`）即可。
 
+## 2.5.7：AI 面板报 cannot resolve —— 本地 53 端口根本没人服务
+
+2026-11-13 现场：网页、ChatGPT 面板、git 全都正常，只有 DSH 的 AI 请求一片红：
+
+```
+重试延迟：459毫秒
+失败原因：502 "cannot resolve tunnel destination dashscope.aliyuncs.com (ETIMEDOUT):
+local name resolution failed and a fresh resolver thread also failed — the local resolver
+may be unreachable or taken over by another DNS service (VPN/MagicDNS)"
+```
+
+**排查过程**（结论是一行，但要证明它）：
+
+```powershell
+node -e "console.log(require('dns').getServers())"      # → [ '127.0.0.1' ]
+node -e "require('dns').resolve4('dashscope.aliyuncs.com',(e,a)=>console.log(e&&e.code,a))"
+# → ECONNREFUSED（1 毫秒）
+node -e "require('dns').lookup('dashscope.aliyuncs.com',(e,a)=>console.log(e&&e.code,a))"
+# → ok，8.152.159.24 / 39.96.213.166
+netstat -ano | findstr ":53 "                            # → 一片空白，没人监听
+nslookup dashscope.aliyuncs.com 127.0.0.1                # → No response from server
+nslookup dashscope.aliyuncs.com 211.136.192.6            # → 正常
+```
+
+同一个域名，`lookup` 能解析、`resolve4` 不能，这是**两条完全不同的解析通道**：
+
+| 通道 | 走谁 | 谁来解析 | 这台机器上的结果 |
+| --- | --- | --- | --- |
+| `dns.lookup()` | 系统 getaddrinfo | Windows Dnscache 服务 | 正常 |
+| `dns.resolve4()` | Node 内置 c-ares | **直接问 `dns.getServers()`** | 全部失败 |
+
+而 Node 拿到的服务器列表是 `127.0.0.1`，机器上却没有任何进程在 53 上应答。浏览器、curl、
+PowerShell 都走 Dnscache 所以看不出问题；**凡是自带解析器的程序（Node/c-ares、Go 的 netgo、
+部分 Rust CLI）一律 ECONNREFUSED，表现就是“网页能开、AI 面板全挂”**。
+
+顺带排掉了两个常见误判：网络没坏（`curl --noproxy '*' https://dashscope.aliyuncs.com/` → 404，
+2.27 秒；走 7891 → 404，0.33 秒）；mihomo 也没抢 53（配置里 `tun.enable: false`，`dns` 段没有
+`listen`，`netstat` 也证明 53 空着）。真正剩下来的是**一条早就被删掉的本地解析器留下的残影**
+——注册表里接口 `{03a3aabe-…}` 还挂着 mihomo TUN 时代的静态 DNS `198.18.0.2`，Node 把
+`127.0.0.1` 和这个地址当成上游，挨个试，挨个超时。
+
+**修法：VPNTray 自己补上这个洞**（`vpntray/dnsguard.py`）
+
+- 在 `127.0.0.1:53` 起一个极小的 UDP + TCP 转发，上游 `223.5.5.5 / 119.29.29.29 / 114.114.114.114`，
+  带缓存（TTL 夹在 5–600 秒，最多 2000 条）、单查询 2 秒超时、最多 32 个并发。
+- **只在没人占 53 时启动**：bind 失败就安静退出，面板上写「端口被占用（…），已有本地解析器」。
+  所以装了 AdGuard、SmartDNS、mihomo 的 DNS 监听，或者用 TUN 模式的用户，不会被抢端口。
+- 只监听 `127.0.0.1`，不对外网开放，不当网关，不改任何系统设置。
+- 面板新增「本机解析」卡片：显示是否在服务、为什么没起来，一个「测一次解析」按钮（真的往 53 发
+  一条 A 查询，返回毫秒和记录数），一个开关（`dns_guard`，默认开）。
+
+**手工兜底（不想装新版，或者想从根上治）**
+
+改成真实 DNS 服务器，管理员 PowerShell 一次：
+
+```powershell
+netsh interface ip set dns name="WLAN" static 223.5.5.5 primary
+netsh interface ip add dns name="WLAN" 119.29.29.29 index=2
+ipconfig /flushdns
+node -e "console.log(require('dns').getServers())"   # 应该不再是 127.0.0.1
+```
+
+如果 `getServers()` 还是 `127.0.0.1`，说明是**全局**覆盖
+（`HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\NameServer`）或某个代理软件在启动时
+写回来的 —— 前者删掉那个值即可，后者请把它的“系统 DNS”关掉。
+
 ## 2.5.6：点了没反应 —— WMI 卡死时进程永久阻塞（真凶是 setuptools 钩子）
 
 2026-11-08 现场：梯子用着用着没了，双击图标毫无反应。任务管理器里躺着 **4 个 VPNTray.exe，CPU 都是 0，没有窗口、没有托盘、没有端口**，`app.log` 一行没写，事件日志也没有崩溃记录。

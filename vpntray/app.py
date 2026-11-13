@@ -16,7 +16,7 @@ from typing import Any, Callable
 import requests
 
 from . import __version__ as _VERSION
-from . import autostart, configgen, disguise, github_ops, hotspot, kernel as kernel_mod, netguard, purity, subscription, sysproxy
+from . import autostart, configgen, disguise, dnsguard, github_ops, hotspot, kernel as kernel_mod, netguard, purity, subscription, sysproxy
 from .api import ApiError, MihomoAPI
 from .kernel import Kernel
 from .paths import CONFIG, DELAYS, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
@@ -85,6 +85,8 @@ class App:
         self.state: dict[str, Any] = {
             "phase": "空闲",
             "kernel_ok": False,
+            "dns_running": False,           # 本地 DNS 兜底是否已在 127.0.0.1:53 上服务
+            "dns_reason": "",               # 没起来的原因（端口被占等）
             "error": "",
             "mode": self.settings.get("mode", "rule"),
             "main_group": self.settings.get("main_group", "节点选择"),
@@ -193,6 +195,21 @@ class App:
                 autostart.refresh()
             except Exception:  # noqa: BLE001
                 log.warning("自启路径检查失败", exc_info=True)
+        # 本地 DNS 兜底：Node/c-ares、Go 的 netgo 解析器这一类程序不走系统缓存
+        # 服务（Dnscache），而是自己判断「本机解析器」。Windows 读不到全局
+        # NameServer 时它们默认 127.0.0.1:53，本机没人监听就每次解析都
+        # ECONNREFUSED/ETIMEDOUT —— 表现为「网页能开，AI 面板和 Node 工具全 502」。
+        # 53 已经有别的软件在服务就跳过，绝不抢端口、不改系统 DNS 设置。
+        if self.settings.get("dns_guard", True):
+            try:
+                guard = dnsguard.ensure()
+                self._set(dns_running=guard.running, dns_reason=guard.reason)
+                if guard.running:
+                    log.info("本地 DNS 兜底就绪：127.0.0.1:53（给 Node/c-ares 类程序用）")
+                else:
+                    log.info("本地 DNS 兜底跳过：%s", guard.reason)
+            except Exception as e:  # noqa: BLE001
+                log.warning("本地 DNS 兜底启动失败: %s", e)
         self._set(phase="准备配置", busy="启动中")
         ok = self.prepare_config(initial=True)
         if not ok:
@@ -876,6 +893,10 @@ class App:
             except Exception as e:  # noqa: BLE001
                 log.warning("还原系统代理失败: %s", e)
         self.kernel.stop()
+        try:
+            dnsguard.stop()
+        except Exception as e:  # noqa: BLE001
+            log.warning("停止本地 DNS 兜底失败: %s", e)
         for t in self._threads:
             t.join(timeout=2)
         self._threads.clear()

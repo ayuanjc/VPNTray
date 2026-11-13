@@ -15,7 +15,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from . import __version__ as _APP_VER
-from . import disguise
+from . import disguise, dnsguard
 from .paths import ROOT, asset
 from .purity import FLAG_CC
 
@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "2.5.6"
+UI_VER = "2.5.7"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -217,6 +217,14 @@ def build_state(app) -> dict[str, Any]:
         "github": st.get("github") or {},
         "gh_busy": bool(st.get("gh_busy") or getattr(app, "_github_busy", False)),
         "git_proxy": str(st.get("git_proxy") or ""),
+        # 本地 DNS 兜底：running 表示端口在手，probe 才是「现在真能解析吗」。
+        # 这里只带静态快照，探活得走 /api/dns（会真的发一次查询，有几百毫秒开销）。
+        "dns": {
+            "running": bool(st.get("dns_running")),
+            "reason": str(st.get("dns_reason") or ""),
+            "enabled": bool(s.get("dns_guard", True)),
+            "port": 53,
+        },
         "git_proxy_note": str(st.get("git_proxy_note") or ""),
         "update": st.get("update") or {},
         "update_repo": s.get("update_repo", ""),
@@ -586,6 +594,32 @@ class WebUI:
             app.settings.save()
             return {"ok": True, "heal": on}
 
+        def dns_state(body):
+            """本地 DNS 兜底：看状态 / 探活 / 开关。
+
+            想知道「我这台机器到底能不能解析」的时候，前端只发 {"probe": true}：
+            它会真的向 127.0.0.1:53 发一条查询，把毫秒数和失败原因带回来，
+            比看「running 字段」准得多 —— 端口被别的软件占着时 running 是 false，
+            但解析其实完全正常，这时候不该报警。
+            """
+            b = body or {}
+            guard = dnsguard.ensure(enabled=bool(app.settings.get("dns_guard", True)))
+            if "on" in b:
+                on = bool(b.get("on"))
+                app.settings["dns_guard"] = on
+                app.settings.save()
+                if on:
+                    guard.start()
+                else:
+                    guard.stop()
+                app.state["dns_running"] = guard.running
+                app.state["dns_reason"] = guard.reason
+                return {"ok": True, "on": on, "dns": guard.status()}
+            out = guard.status()
+            out["probe"] = dnsguard.probe(port=guard.port,
+                                          timeout=1.5 if b.get("probe") else 0.5)
+            return {"ok": True, "dns": out}
+
         def quit(_):
             self._bg(self._do_quit)
             return {"ok": True}
@@ -665,6 +699,7 @@ class WebUI:
             "/api/connections/close": close_conns,
             "/api/auto_best": auto_best_toggle,
             "/api/heal": heal_toggle,
+            "/api/dns": dns_state,
             "/api/quit": quit,
             "/api/log": log_tail,
             "/api/update/check": update_check,

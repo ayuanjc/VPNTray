@@ -415,3 +415,24 @@ VPN Tray — 使用说明
     再重试。
   · 另外：开始菜单/桌面上的旧快捷方式可能还指着以前那个文件夹，双击等于开老版本。
     确认快捷方式属性里的目标路径就是你现在这个安装目录。
+
+二十四、AI 面板全红：cannot resolve / local name resolution failed（2.5.7）
+  · 症状：网页能开、ChatGPT 网页版照用、git 也正常，唯独 DSH 的 AI 请求一条都发不出去，
+    报错里写着 cannot resolve tunnel destination xxx.aliyuncs.com (ETIMEDOUT)，或者
+    local name resolution failed / the local resolver may be unreachable。
+  · 原因：这类程序的解析器不走 Windows 的 DNS 缓存服务，而是直接去问「本机 DNS 服务器」。
+    它拿到的地址是 127.0.0.1，可这台机器的 53 端口上根本没有程序在应答 —— 于是每条解析都
+    当场被拒（ECONNREFUSED），一秒内就失败。浏览器走的是系统缓存服务，所以完全看不出问题。
+    这种“残影”通常是以前装过 TUN 模式的代理、AdGuard、SmartDNS 又卸掉留下的。
+  · 2.5.7 的做法：VPNTray 自己在本机 127.0.0.1:53 起一个小解析器（上游阿里 223.5.5.5、
+    腾讯 119.29.29.29），只给这类程序用。端口要是已经被别的软件占着，它就不启动、也不报错，
+    面板「本机解析」卡片上会写清楚原因。
+  · 面板怎么看：右上角「本机解析」卡片 —— 绿色“本地解析在服务”就是好的；点「测一次解析」
+    会真发一条查询，返回毫秒数和记录条数。开关关掉就等于恢复原样。
+  · 想从根上治（可选，管理员身份打开 PowerShell 执行一次）：
+        netsh interface ip set dns name="WLAN" static 223.5.5.5 primary
+        netsh interface ip add dns name="WLAN" 119.29.29.29 index=2
+        ipconfig /flushdns
+    执行完用下面这行确认，输出不应该再是 127.0.0.1：
+        node -e "console.log(require('dns').getServers())"
+    （把 WLAN 换成你实际上网那块网卡的名字，`netsh interface show interface` 可以看。）

@@ -462,6 +462,16 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
         </section>
 
         <section class="card">
+          <h2>本机解析<span class="hint" id="dnsHint"></span></h2>
+          <div class="gwrap" id="dnsPills"></div>
+          <div class="acts" style="margin-top:12px">
+            <button class="btn" data-dns-probe>测一次解析</button>
+            <label class="sw" title="本地 DNS 兜底：127.0.0.1:53"><input type="checkbox" id="dnsOn"><i></i></label>
+          </div>
+          <div class="note" id="dnsNote"></div>
+        </section>
+
+        <section class="card">
           <h2>AI 通道<span class="hint"><label class="sw" title="Claude Code / Codex 走独立出口"><input type="checkbox" id="aiOn"><i></i></label></span></h2>
           <div id="aiBody"></div>
         </section>
@@ -579,7 +589,7 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
 </div>
 
 <script>
-var UI_VER = '2.5.6';
+var UI_VER = '2.5.7';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 var sig = {};
 var S = null;
@@ -928,7 +938,33 @@ function renderScenes() {
   }).join('');
   patch('#scenes', h || '<div class="empty">没有可用的场景配置</div>', '#scenes select');
   renderGithub();
+  renderDns();
   renderAI();
+}
+var dnsProbe = null;   // 探活结果单独存：S 每 1.8 秒被 /api/state 覆盖一次
+function renderDns() {
+  var d = S.dns || {};
+  var on = d.enabled !== false;
+  var pills = [];
+  // running 只说明端口在手里；真正"能不能解析"要看探活（S.dns_probe）。
+  pills.push('<span class="gp ' + (d.running ? 'ok' : (on ? 'bad' : '')) + '">'
+    + (d.running ? '本地解析在服务' : (on ? '没起来' : '已关闭')) + '</span>');
+  if (d.reason) pills.push('<span class="gp" title="' + esc(d.reason) + '">' + esc(d.reason) + '</span>');
+  var p = dnsProbe;
+  if (p) {
+    pills.push('<span class="gp ' + (p.ok ? 'ok' : 'bad') + '" title="' + esc(p.error || '') + '">'
+      + (p.ok ? '解析正常 ' + n(p.ms) + 'ms · ' + n(p.answers) + ' 条' : '解析失败') + '</span>');
+  }
+  patch('#dnsPills', pills.join(''));
+  var note = '';
+  if (p && !p.ok) note = '向 127.0.0.1:53 查询失败：' + (p.error || '未知') + '。依赖本地解析器的程序（Node/Go 写的 CLI、AI 面板、git 助手）会报 cannot resolve。';
+  else if (!on) note = '兜底已关闭。只有那些把「本机解析器」当成 127.0.0.1:53 的程序会受影响，浏览器不受影响。';
+  else if (!d.running && d.reason) note = d.reason + '。既然已经有解析器在服务，这里就不插手。';
+  else note = 'Node/c-ares、Go 的 netgo 这类程序不走系统缓存服务，而是默认去问 127.0.0.1:53。这里给它一个真解析器（上游 223.5.5.5 / 119.29.29.29），端口被别人占着就自动让位。';
+  patch('#dnsNote', '<span class="dim">' + esc(note) + '</span>');
+  $('#dnsHint').textContent = d.running ? '127.0.0.1:53' : '';
+  var sw = $('#dnsOn');
+  if (sw) sw.checked = on;
 }
 function renderGithub() {
   var g = S.github || {};
@@ -1132,6 +1168,20 @@ document.addEventListener('click', async function (e) {
     setTimeout(refresh, 500);
     return;
   }
+  if (t.closest('[data-dns-probe]')) {
+    var bp = t.closest('[data-dns-probe]');
+    bp.disabled = true;
+    var rp = await api('/api/dns', { probe: true });
+    bp.disabled = false;
+    if (!rp || rp.ok === false) { toast((rp && rp.error) || '探测失败', 'bad'); return; }
+    S.dns = rp.dns || S.dns;
+    dnsProbe = (rp.dns || {}).probe || null;
+    var pr = dnsProbe;
+    renderDns();
+    toast(pr && pr.ok ? ('解析正常 · ' + n(pr.ms) + 'ms · ' + n(pr.answers) + ' 条记录')
+      : ('解析失败：' + ((pr && pr.error) || '未知')), pr && pr.ok ? 'good' : 'bad');
+    return;
+  }
   if (t.closest('[data-gh-check]')) {
     var b = t.closest('[data-gh-check]');
     b.disabled = true;
@@ -1200,6 +1250,14 @@ document.addEventListener('change', async function (e) {
     var r2 = await api('/api/scene/toggle', { key: son.dataset.sceneOn, on: son.checked });
     if (r2.ok === false) toast(r2.error || '设置失败', 'bad'); else toast(son.checked ? '已启用' : '已关闭', 'good');
     setTimeout(refresh, 900);
+    return;
+  }
+  if (t.id === 'dnsOn') {
+    var rd3 = await api('/api/dns', { on: t.checked });
+    if (!rd3 || rd3.ok === false) { toast((rd3 && rd3.error) || '设置失败', 'bad'); t.checked = !t.checked; return; }
+    S.dns = rd3.dns || S.dns;
+    renderDns();
+    toast(t.checked ? '本地 DNS 兜底已开' : '本地 DNS 兜底已关', 'good');
     return;
   }
   if (t.id === 'aiOn') {

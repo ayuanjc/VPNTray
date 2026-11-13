@@ -48,6 +48,7 @@ DEFAULTS: dict[str, Any] = {
     "auto_best": False,             # 定时把主组切到延迟最低节点
     "auto_best_interval_min": 30,
     "heal": True,                   # 节点失效时自动换到可用节点
+    "dns_guard": True,              # 本地 DNS 兜底：127.0.0.1:53，给 Node/c-ares 类程序用
     "probe_on_select": True,        # 手动切节点后自动查一次出口 IP/纯净度
 
     # ——— 移动热点特化（本版内置）———
