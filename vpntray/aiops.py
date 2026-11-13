@@ -317,6 +317,46 @@ _reg("subs.list", "read", "订阅清单", "所有订阅、当前订阅、合并�
 _reg("log.tail", "read", "最近日志", "app.log 末尾若干行",
      {"lines": "1–400，默认 60"}, _t_log, {"lines": 80})
 
+# ── 断网急救 ──
+def _t_net_diagnose(app, args):
+    """跑一轮网络体检（网关 / DNS / 系统代理 / 内核 / 直连 / MTU / hosts）。"""
+    refresh = args.get("refresh", True)
+    return app.net_diagnose(bool(refresh))
+
+
+def _t_net_report(app, args):
+    """体检报告的可复制纯文本（专业详情，每一行都是原始证据）。"""
+    return {"text": app.net_report()}
+
+
+def _t_net_fix(app, args):
+    """修一个具体的网络问题（按体检项给出的 fix 动作名）。"""
+    action = _s(args, "action", "", 40)
+    if not action:
+        return {"ok": False, "error": "缺少 action；先 net.diagnose，再从 checks[].fix 里取"}
+    return app.net_fix_one(action)
+
+
+def _t_net_repair(app, args):
+    """一键急救：清 DNS 缓存 → 还原系统代理 → 拉起本地解析 → 重启内核，然后复检。"""
+    acts = args.get("actions")
+    if isinstance(acts, str):
+        acts = [x.strip() for x in acts.split(",") if x.strip()]
+    return app.net_repair([str(a) for a in acts] if isinstance(acts, list) else None)
+
+
+# 断网急救：read 看结论，full 才允许动手（改系统代理 / 重启内核都算重手）
+_reg("net.diagnose", "read", "网络体检",
+     "12 项检查：链路/网关/DNS 配置/本机解析/域名解析/系统代理/内核端口/直连/MTU/hosts/代理冲突/IPv6；每项带 fix 动作名",
+     {"refresh": "true 默认；false 吃缓存"}, _t_net_diagnose, {"refresh": True})
+_reg("net.report", "read", "体检报告文本", "把最近一次体检渲染成可复制的纯文本", {}, _t_net_report)
+_reg("net.fix", "full", "修单项网络问题",
+     "动作名取自体检结果里的 checks[].fix：fix_proxy / fix_dns / flush_dns / start_dns / restart_kernel / renew_ip / restart_adapter / winsock_reset / clean_hosts / open_portal",
+     {"action": "fix 动作名"}, _t_net_fix, {"action": "fix_proxy"})
+_reg("net.repair", "full", "一键网络急救",
+     "按安全顺序修一轮（不改网卡 DNS、不重置 Winsock），修完自动复检并返回新报告",
+     {"actions": "可选，动作名数组；不传就是安全集合"}, _t_net_repair)
+
 _reg("modules.save", "write", "保存模块", "新建或覆盖一个模块（改完立即热重载）",
      {"module": "完整模块对象；只改一个字段就先 modules.get 再整体回传"},
      _t_module_save,

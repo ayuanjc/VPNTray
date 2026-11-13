@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "2.5.9"
+UI_VER = "3.0.0"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -231,6 +231,8 @@ def build_state(app) -> dict[str, Any]:
             "port": 53,
         },
         "git_proxy_note": str(st.get("git_proxy_note") or ""),
+        # 断网急救：只带缓存的体检结果，真跑要走 /api/net/diagnose
+        "netdoc": st.get("netdoc") or {},
         "update": st.get("update") or {},
         "update_repo": s.get("update_repo", ""),
         "purity_count": sum(1 for n in nodes if n.get("purity") is not None),
@@ -698,6 +700,20 @@ class WebUI:
         def update_apply(_):
             return app.update_apply()
 
+        def net_diagnose(body):
+            # refresh=false 直接吃缓存：页面切回来不该重跑（一轮 ~6 秒）
+            return app.net_diagnose(bool((body or {}).get("refresh", True)))
+
+        def net_repair(body):
+            acts = (body or {}).get("actions")
+            return app.net_repair([str(a) for a in acts] if isinstance(acts, list) else None)
+
+        def net_fix_one(body):
+            return app.net_fix_one(str((body or {}).get("action") or ""))
+
+        def net_report(_body):
+            return {"ok": True, "text": app.net_report()}
+
         def net_scan(_):
             return app.net_scan()
 
@@ -763,6 +779,10 @@ class WebUI:
             "/api/log": log_tail,
             "/api/update/check": update_check,
             "/api/update/apply": update_apply,
+            "/api/net/diagnose": net_diagnose,
+            "/api/net/repair": net_repair,
+            "/api/net/fix": net_fix_one,
+            "/api/net/report": net_report,
             "/api/netguard": net_scan,
             "/api/netguard/fix": net_fix,
             "/api/feedback": feedback_send,

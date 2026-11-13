@@ -2125,6 +2125,105 @@ class App:
             pass
         return pids
 
+    # ────────────────────── 断网急救 ──────────────────────
+    # 体检结果缓存在 state["netdoc"]：页面来回切不该重跑一遍（一轮 ~6 秒）。
+    # 单项修复会顺带复检那一项，UI 就地刷新，不用整轮重来。
+    def net_diagnose(self, refresh: bool = True) -> dict[str, Any]:
+        from . import netdoctor
+
+        if not refresh:
+            with self._lock:
+                cached = self.state.get("netdoc")
+            if isinstance(cached, dict) and cached.get("checks"):
+                return dict(cached, cached=True)
+        self._set(busy="网络体检")
+        try:
+            res = netdoctor.probe(self)
+        finally:
+            self._set(busy="")
+        with self._lock:
+            self.state["netdoc"] = res
+        try:
+            log.info("网络体检：%s（bad=%s warn=%s %.0fms）", res.get("level"),
+                     res.get("bad"), res.get("warn"), res.get("elapsed_ms") or 0)
+        except Exception:  # noqa: BLE001
+            pass
+        self._changed()
+        return res
+
+    def net_fix_one(self, action: str) -> dict[str, Any]:
+        from . import netdoctor
+
+        res = netdoctor.fix(self, action)
+        # 单项修完，把新报告里对应那一条塞回去，避免 UI 拿着旧结论
+        with self._lock:
+            doc = self.state.get("netdoc")
+        check = res.get("check")
+        if isinstance(doc, dict) and check and doc.get("checks"):
+            checks = [check if c.get("id") == check.get("id") else c for c in doc["checks"]]
+            doc = dict(doc, checks=checks)
+            bad = sum(1 for c in checks if c.get("level") == "bad")
+            warn = sum(1 for c in checks if c.get("level") == "warn")
+            doc["bad"], doc["warn"] = bad, warn
+            doc["level"] = "bad" if bad else ("warn" if warn else "ok")
+            with self._lock:
+                self.state["netdoc"] = doc
+            res["report"] = doc
+            self._changed()
+        try:
+            log.info("网络急救：%s -> ok=%s", action, res.get("ok"))
+        except Exception:  # noqa: BLE001
+            pass
+        return res
+
+    def net_repair(self, actions: list[str] | None = None) -> dict[str, Any]:
+        from . import netdoctor
+
+        self._set(busy="网络急救")
+        try:
+            acts = [str(a) for a in (actions or []) if a]
+            res = netdoctor.repair(self, acts or None)
+        finally:
+            self._set(busy="")
+        try:
+            doc = netdoctor.probe(self)
+            with self._lock:
+                self.state["netdoc"] = doc
+            res["report"] = doc
+        except Exception as e:  # noqa: BLE001
+            log.warning("急救后复检失败: %s", e)
+        self._changed()
+        return res
+
+    def net_report(self) -> str:
+        from . import netdoctor
+
+        with self._lock:
+            doc = self.state.get("netdoc")
+        return netdoctor.report_text(doc if isinstance(doc, dict) else {})
+
+    def set_dns_running(self, on: bool) -> dict[str, Any]:
+        """本地解析开关。断网急救的「拉起本地解析」直接调它。"""
+        want = bool(on)
+        try:
+            self.settings["dns_guard"] = want
+            self.settings.save()
+        except Exception as e:  # noqa: BLE001
+            log.warning("保存 dns_guard 失败: %s", e)
+        try:
+            if want:
+                guard = dnsguard.ensure()
+                self._set(dns_running=guard.running, dns_reason=guard.reason)
+            else:
+                dnsguard.stop()
+                self._set(dns_running=False, dns_reason="已关闭")
+        except Exception as e:  # noqa: BLE001
+            log.warning("切换本地解析失败: %s", e)
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        self._changed()
+        return {"ok": True, "running": bool(self.state.get("dns_running")),
+                "reason": str(self.state.get("dns_reason") or "")}
+
     def net_scan(self) -> dict[str, Any]:
         """查一遍有没有别的代理软件在抢系统代理 / 开着 TUN。"""
         from . import netguard

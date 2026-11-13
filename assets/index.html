@@ -292,6 +292,57 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
 .mbox p{font-size:12.5px;color:var(--ink2);line-height:1.8;margin-bottom:8px}
 .mbox p:last-of-type{margin-bottom:18px}
 .macts{display:flex;justify-content:flex-end;gap:8px}
+/* ───── 动效（3.0.1）：只动 transform / opacity / filter，不触发布局 ───── */
+@keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+@keyframes viewInR{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:none}}
+@keyframes viewInL{from{opacity:0;transform:translateX(-12px)}to{opacity:1;transform:none}}
+@keyframes pop{from{opacity:0;transform:translateY(8px) scale(.975)}to{opacity:1;transform:none}}
+@keyframes veil{from{opacity:0}to{opacity:1}}
+@keyframes tout{to{opacity:0;transform:translateY(-5px) scale(.985)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes halo{0%{box-shadow:0 0 0 0 var(--acc-soft)}70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
+
+.view.on.right{animation:viewInR .24s cubic-bezier(.2,.7,.3,1)}
+.view.on.left{animation:viewInL .24s cubic-bezier(.2,.7,.3,1)}
+/* 进入页面时，卡片按顺序浮上来（只排前 6 张，再多就显得拖沓） */
+.view.on .card,.view.on .tile{animation:rise .26s cubic-bezier(.2,.7,.3,1) both}
+.view.on .card:nth-of-type(2),.view.on .tile:nth-of-type(2){animation-delay:.035s}
+.view.on .card:nth-of-type(3),.view.on .tile:nth-of-type(3){animation-delay:.07s}
+.view.on .card:nth-of-type(4),.view.on .tile:nth-of-type(4){animation-delay:.105s}
+.view.on .card:nth-of-type(n+5),.view.on .tile:nth-of-type(n+5){animation-delay:.14s}
+
+.card,.tile{transition:border-color .18s ease,background .18s ease,transform .18s ease}
+@media (hover:hover){
+  .card:hover,.tile:hover{border-color:var(--line2)}
+  .row2:hover,.ndrow:hover{background:var(--surface2)}
+}
+.row2,.ndrow{transition:background .13s ease}
+.btn,.chip,.sel,.pill{transition:background .13s ease,border-color .13s ease,color .13s ease,transform .1s ease}
+.btn:active:not(:disabled),.chip:active{transform:scale(.97)}
+.sw i::after{transition:transform .2s cubic-bezier(.3,1.5,.5,1),background .16s}
+.sw input:checked + i{box-shadow:inset 0 0 0 1px transparent}
+.sw input:active + i::after{transform:scale(.92)}
+.sw input:checked:active + i::after{transform:translateX(14px) scale(.92)}
+
+/* 当前节点：小光晕呼吸一次，提醒「就是这个出口」 */
+.pill.on i,.state i{animation:halo 2.6s ease-out 1}
+
+/* 按钮忙碌：左边一个小圈转着，文字照旧可读 */
+.btn.busy{position:relative;padding-left:27px}
+.btn.busy::before{content:"";position:absolute;left:10px;top:50%;width:11px;height:11px;margin-top:-5.5px;
+  border-radius:50%;border:1.6px solid currentColor;border-top-color:transparent;
+  animation:spin .72s linear infinite;opacity:.85}
+
+.toast{animation:tin .2s cubic-bezier(.2,.7,.3,1)}
+.toast.out{animation:tout .18s ease-in forwards}
+.modal:not([hidden]){animation:veil .16s ease-out}
+.modal:not([hidden]) .mbox{animation:pop .2s cubic-bezier(.2,.8,.3,1)}
+
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.001ms !important;animation-iteration-count:1 !important;
+    transition-duration:.001ms !important;scroll-behavior:auto !important}
+}
+
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-thumb{background:var(--line2);border-radius:10px;border:3px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-thumb:hover{background:var(--ink3);background-clip:content-box}
@@ -313,6 +364,22 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
   .row2 .sel{grid-column:1 / -1}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+/* 断网急救：一行一个检查项，坏的在最上面 */
+.ndlist { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.ndrow { border: 1px solid var(--line, #e6e6e6); border-radius: 9px; padding: 8px 10px; }
+.ndrow .h { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ndrow .t { font-weight: 600; font-size: 13px; }
+.ndrow .b { color: var(--mute, #777); font-size: 12px; flex: 1 1 220px; }
+.ndrow.bad { border-color: #e08a8a; background: rgba(224, 110, 110, .06); }
+.ndrow.warn { border-color: #e0bb7a; background: rgba(224, 180, 90, .06); }
+.ndrow details { margin-top: 6px; }
+.ndrow summary { cursor: pointer; font-size: 12px; color: var(--mute, #777); }
+.ndrow pre { margin: 6px 0 0; padding: 8px; border-radius: 7px; background: rgba(127, 127, 127, .1);
+  font: 11.5px/1.6 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow: auto; }
+.ndrow .btn { padding: 2px 8px; font-size: 12px; }
+.ndbadge { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: 0 0 8px; }
+.ndbadge.ok { background: #43a047; } .ndbadge.warn { background: #e0a800; }
+.ndbadge.bad { background: #d9534f; } .ndbadge.info { background: #8a8a8a; } .ndbadge.skip { background: #c0c0c0; }
 </style>
 </head>
 <body>
@@ -468,6 +535,17 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
     <!-- 扩展：搬家过来的小工具（GitHub 链路、本机 DNS、AI 通道、AI 接口） -->
     <section class="view" id="view-tools">
       <div class="stack">
+        <section class="card">
+          <h2>断网急救<span class="hint" id="ndHint">先体检，再照着红的那条修</span></h2>
+          <div class="gwrap" id="ndPills"></div>
+          <div class="acts" style="margin-top:12px">
+            <button class="btn" data-act="nd-run">一键体检</button>
+            <button class="btn" data-act="nd-repair" title="清 DNS 缓存 → 还原系统代理 → 拉起本地解析 → 重启内核">一键急救</button>
+            <button class="btn" data-act="nd-copy">复制报告</button>
+          </div>
+          <div id="ndList" class="ndlist"></div>
+          <div class="note" id="ndNote"></div>
+        </section>
         <section class="card">
           <h2>GitHub<span class="hint" id="ghHint"></span></h2>
           <div class="gwrap" id="ghPills"></div>
@@ -636,7 +714,7 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
 </div>
 
 <script>
-var UI_VER = '2.5.9';
+var UI_VER = '3.0.0';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 var sig = {};
 var S = null;
@@ -726,8 +804,8 @@ function toast(msg, kind) {
   el.className = 'toast' + (kind ? ' ' + kind : '');
   el.textContent = msg;
   box.appendChild(el);
-  setTimeout(function () { el.style.opacity = '0'; el.style.transition = 'opacity .2s'; }, 2400);
-  setTimeout(function () { el.remove(); }, 2700);
+  setTimeout(function () { el.classList.add('out'); }, 2400);
+  setTimeout(function () { el.remove(); }, 2680);
 }
 function ask(title, text, okText) {
   return new Promise(function (resolve) {
@@ -776,11 +854,22 @@ var TITLES = {
 
 function setView(v) {
   if (!TITLES[v]) v = 'home';
+  var prev = VIEW;
   VIEW = v;
   localStorage.setItem('vpn.view', v);
   var i;
+  var ORDER = ['home', 'nodes', 'scenes', 'tools', 'subs', 'settings'];
+  var dir = '';
+  if (prev && ORDER.indexOf(v) > ORDER.indexOf(prev)) dir = 'right';
+  else if (prev && ORDER.indexOf(v) < ORDER.indexOf(prev)) dir = 'left';
   var views = document.querySelectorAll('.view');
-  for (i = 0; i < views.length; i += 1) views[i].classList.toggle('on', views[i].id === 'view-' + v);
+  for (i = 0; i < views.length; i += 1) {
+    var el = views[i];
+    el.classList.remove('right', 'left');
+    var on = el.id === 'view-' + v;
+    el.classList.toggle('on', on);
+    if (on && dir) el.classList.add(dir);
+  }
   var btns = document.querySelectorAll('#nav button');
   for (i = 0; i < btns.length; i += 1) btns[i].classList.toggle('on', btns[i].dataset.view === v);
   $('#pageTitle').textContent = TITLES[v][0];
@@ -1050,6 +1139,115 @@ async function modReset() {
   setTimeout(refresh, 700);
 }
 
+/* ───── 断网急救 ───── */
+var ND_BUSY = false;
+var ND_ORDER = { bad: 0, warn: 1, info: 2, ok: 3, skip: 4 };
+var ND_TEXT = { bad: '故障', warn: '注意', info: '参考', ok: '正常', skip: '跳过' };
+
+function renderNetDoc() {
+  var d = S.netdoc || {};
+  var checks = (d.checks || []).slice();
+  if (!checks.length) {
+    patch('#ndPills', '<span class="gp">还没体检过</span>');
+    patch('#ndList', '');
+    patch('#ndNote', '点「一键体检」跑一遍：链路 / 网关 / DNS / 系统代理 / 内核 / 直连 / MTU / hosts / 代理冲突，一轮约 6 秒。');
+    return;
+  }
+  var pills = [];
+  pills.push('<span class="gp ' + (d.level === 'ok' ? 'ok' : (d.level === 'bad' ? 'bad' : '')) + '">' + esc(ND_TEXT[d.level] || d.level) + '</span>');
+  pills.push('<span class="gp">故障 ' + n(d.bad || 0) + '</span>');
+  pills.push('<span class="gp">注意 ' + n(d.warn || 0) + '</span>');
+  pills.push('<span class="gp">' + n(d.elapsed_ms || 0) + 'ms</span>');
+  pills.push('<span class="gp">' + (d.is_admin ? '管理员' : '普通权限') + '</span>');
+  patch('#ndPills', pills.join(''));
+
+  checks.sort(function (a, b) {
+    var x = ND_ORDER[a.level] == null ? 9 : ND_ORDER[a.level];
+    var y = ND_ORDER[b.level] == null ? 9 : ND_ORDER[b.level];
+    return x - y;
+  });
+  var html = checks.map(function (c) {
+    var lv = c.level || 'info';
+    var fixBtn = c.fix
+      ? '<button class="btn" data-act="nd-fix" data-a="' + esc(c.fix) + '" data-cid="' + esc(c.id) + '"'
+        + (c.need_admin ? ' title="需要管理员权限"' : '') + '>' + esc(c.fix_title || '修') + (c.need_admin ? ' · 需管理员' : '') + '</button>'
+      : '';
+    var det = c.detail
+      ? '<details><summary>详细</summary><pre>' + esc(c.detail) + '</pre></details>'
+      : '';
+    return '<div class="ndrow ' + lv + '"><div class="h">'
+      + '<span class="ndbadge ' + lv + '"></span>'
+      + '<span class="t">' + esc(c.title || c.id) + '</span>'
+      + '<span class="b">' + esc(c.brief || '') + '</span>'
+      + fixBtn + '</div>' + det + '</div>';
+  }).join('');
+  patch('#ndList', html);
+  patch('#ndNote', '体检时间 ' + esc(d.at || '') + ' · 「详细」里是原始命令和输出，可以直接复制给别人。');
+}
+
+async function ndRun() {
+  if (ND_BUSY) return;
+  ND_BUSY = true;
+  var b = document.querySelector('[data-act="nd-run"]');
+  var old = b ? b.textContent : '';
+  if (b) { b.disabled = true; b.classList.add('busy'); b.textContent = '体检中'; }
+  patch('#ndNote', '正在跑：网关 / DNS / 系统代理 / 内核 / 直连 / MTU / hosts …');
+  try {
+    var r = await api('/api/net/diagnose', { refresh: true });
+    if (r && r.checks) { S.netdoc = r; renderNetDoc(); }
+    else if (r && r.error) toast(r.error, 'bad');
+  } catch (e) {
+    toast('体检失败：' + e, 'bad');
+  } finally {
+    ND_BUSY = false;
+    if (b) { b.disabled = false; b.classList.remove('busy'); b.textContent = old || '一键体检'; }
+  }
+}
+
+async function ndRepair() {
+  if (ND_BUSY) return;
+  ND_BUSY = true;
+  var b = document.querySelector('[data-act="nd-repair"]');
+  if (b) { b.disabled = true; b.classList.add('busy'); b.textContent = '急救中'; }
+  try {
+    var r = await api('/api/net/repair', {});
+    if (r && r.report) { S.netdoc = r.report; renderNetDoc(); }
+    var done = (r && r.steps) ? r.steps.filter(function (s) { return s.ok; }).length : 0;
+    var total = (r && r.steps) ? r.steps.length : 0;
+    if (r && r.ok) toast('急救完成：' + done + '/' + total + ' 步成功，结论 ' + (r.level_after || ''), 'good');
+    else toast('急救没成功，看下面每条的详细', 'bad');
+  } catch (e) {
+    toast('急救失败：' + e, 'bad');
+  } finally {
+    ND_BUSY = false;
+    if (b) { b.disabled = false; b.classList.remove('busy'); b.textContent = '一键急救'; }
+  }
+}
+
+async function ndFix(action, cid, btn) {
+  if (!action) return;
+  if (btn) { btn.disabled = true; btn.classList.add('busy'); btn.textContent = '修'; }
+  try {
+    var r = await api('/api/net/fix', { action: action });
+    if (r && r.report) { S.netdoc = r.report; renderNetDoc(); }
+    if (r && r.ok) toast('已执行：' + (r.title || action), 'good');
+    else if (r && r.need_admin) toast('这一步要管理员权限：退出后右键「以管理员身份运行」', 'bad');
+    else toast((r && (r.error || (r.steps && r.steps[0] && r.steps[0].out))) || '没修成', 'bad');
+  } catch (e) {
+    toast('修复失败：' + e, 'bad');
+  } finally {
+    if (btn && document.body.contains(btn)) { btn.disabled = false; btn.classList.remove('busy'); btn.textContent = '修'; }
+  }
+}
+
+async function ndCopy() {
+  var r = await api('/api/net/report', {});
+  var text = (r && r.text) || '';
+  if (!text) { toast('还没体检过', 'bad'); return; }
+  if (await copyText(text)) toast('报告已复制', 'good');
+  else toast('复制失败，到「详细」里手动选', 'bad');
+}
+
 /* ───── AI 接口卡片 ───── */
 function renderModulesApi() {
   var a = S.ai_api || {};
@@ -1059,7 +1257,6 @@ function renderModulesApi() {
   pills.push('<span class="gp">' + esc(a.level_text || a.level || '') + '</span>');
   pills.push('<span class="gp">' + n(a.tools || 0) + ' 个工具</span>');
   patch('#apiPills', pills.join(''));
-  var base = 'http://127.0.0.1:' + ((S.ports && S.ports.api) ? '' : '') + '7892';
   var body = '<div class="kv" style="margin-top:10px">'
     + '<div class="l"><span class="k">Token</span><span class="v" style="font:12px ui-monospace,Consolas,monospace">'
     + esc(tok ? tok.slice(0, 8) + '…' + tok.slice(-4) : '（未生成）') + '</span></div>'
@@ -1074,11 +1271,26 @@ function renderModulesApi() {
   if (lv && a.level) lv.value = a.level;
   patch('#apiNote', esc(a.hint || ''));
 }
+async function copyText(text) {
+  if (!text) return false;
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch (e) {
+    // 面板不是 https、或用户禁了剪贴板权限时，clipboard API 直接抛异常，退回 execCommand
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      var ok = document.execCommand('copy');
+      ta.remove();
+      return !!ok;
+    } catch (e2) { return false; }
+  }
+}
 async function apiCopy() {
   var tok = (S.ai_api || {}).token || '';
   if (!tok) { toast('还没有 token', 'bad'); return; }
-  try { await navigator.clipboard.writeText(tok); toast('token 已复制', 'good'); }
-  catch (e) { toast('剪贴板不可用，token 是：' + tok, 'warn'); }
+  toast((await copyText(tok)) ? 'token 已复制' : '剪贴板不可用，token 是：' + tok,
+    'good');
 }
 async function apiRegen() {
   if (!(await ask('重置 token', '所有已经用旧 token 配好的 AI 客户端都会失效，要重新填。继续？', '重置'))) return;
@@ -1230,7 +1442,7 @@ function renderView(v) {
   if (v === 'home') renderHome();
   else if (v === 'nodes') { renderChips(); renderNodes(); }
   else if (v === 'scenes') renderScenes();
-  else if (v === 'tools') { renderGithub(); renderDns(); renderAI(); renderModulesApi(); }
+  else if (v === 'tools') { renderNetDoc(); renderGithub(); renderDns(); renderAI(); renderModulesApi(); }
   else if (v === 'subs') renderSubs();
   else if (v === 'settings') renderSettings();
 }
@@ -1396,6 +1608,10 @@ document.addEventListener('click', function (e) {
   else if (a === 'mod-reset') modReset();
   else if (a === 'api-copy') apiCopy();
   else if (a === 'api-regen') apiRegen();
+  else if (a === 'nd-run') ndRun();
+  else if (a === 'nd-repair') ndRepair();
+  else if (a === 'nd-copy') ndCopy();
+  else if (a === 'nd-fix') ndFix(el.dataset.a, el.dataset.cid, el);
 });
 
 $('#modYes').addEventListener('click', function () { modSave(); });
