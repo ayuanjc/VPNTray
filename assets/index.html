@@ -372,6 +372,8 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
   .row2 .sel{grid-column:1 / -1}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.cprow{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+@media (max-width:760px){.cprow{grid-template-columns:1fr}}
 /* 断网急救：一行一个检查项，坏的在最上面 */
 .ndlist { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
 .ndrow { border: 1px solid var(--line, #e6e6e6); border-radius: 9px; padding: 8px 10px; }
@@ -573,6 +575,29 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
           <div class="note" id="ndNote"></div>
         </section>
         <section class="card">
+          <h2>校园网<span class="hint" id="cpHint">掉线自动重登，不用每次手动开认证页</span></h2>
+          <div class="gwrap" id="cpPills"></div>
+          <div class="row2" style="margin-top:12px">
+            <select class="sel" id="cpProvider" title="认证方式"></select>
+            <button class="btn" data-act="cp-detect">认一下门户</button>
+            <button class="btn" data-act="cp-login">立即登录</button>
+            <label class="sw" title="掉线后自动用上面的账号重登"><input type="checkbox" id="cpOn"><i></i></label>
+          </div>
+          <div class="cprow">
+            <input class="txt" id="cpUser" placeholder="学号 / 账号" autocomplete="username" spellcheck="false">
+            <input class="txt" id="cpPass" type="password" placeholder="密码（留空 = 不改）" autocomplete="current-password">
+          </div>
+          <div class="cprow">
+            <input class="txt" id="cpPortal" placeholder="认证页地址（留空自动识别）" spellcheck="false">
+            <input class="txt" id="cpTemplate" placeholder="自定义登录模板（可选）" spellcheck="false">
+          </div>
+          <div class="acts" style="margin-top:10px">
+            <button class="btn" data-act="cp-save">保存</button>
+            <span class="hint">认不出门户时：在浏览器打开一次认证页，复制地址填到「认证页地址」；要验证码的门户只能手动登录一次。</span>
+          </div>
+          <div class="note" id="cpNote"></div>
+        </section>
+        <section class="card">
           <h2>GitHub<span class="hint" id="ghHint"></span></h2>
           <div class="gwrap" id="ghPills"></div>
           <div class="acts" style="margin-top:12px">
@@ -743,7 +768,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '3.3.0';
+var UI_VER = '1.0.0';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1461,6 +1486,115 @@ async function ndCopy() {
 }
 
 /* ───── AI 接口卡片 ───── */
+/* ───── 校园网 ───── */
+var CP_BUSY = false;
+function cpFill() {
+  var c = (S && S.campus) || {};
+  var sel = $('#cpProvider');
+  if (sel) {
+    var want = c.provider_cfg || 'auto';
+    if (!sel.dataset.ready) {
+      sel.innerHTML = (c.providers || []).map(function (x) {
+        return '<option value="' + esc(x.key) + '">' + esc(x.text) + '</option>';
+      }).join('');
+      sel.dataset.ready = '1';
+    }
+    if (document.activeElement !== sel) sel.value = want;
+  }
+  // 输入框只在「没聚焦」且值不同的时候回填，否则会把正在输入的字擦掉
+  var u = $('#cpUser');
+  if (u && document.activeElement !== u && u.value !== (c.user_cfg || '')) u.value = c.user_cfg || '';
+  var po = $('#cpPortal');
+  if (po && document.activeElement !== po && po.value !== (c.portal_cfg || '')) po.value = c.portal_cfg || '';
+  var tp = $('#cpTemplate');
+  if (tp && document.activeElement !== tp && tp.value !== (c.template || '')) tp.value = c.template || '';
+  var on = $('#cpOn');
+  if (on && document.activeElement !== on) on.checked = !!c.enabled;
+}
+
+function renderCampus() {
+  var c = (S && S.campus) || {};
+  var pills = [];
+  var online = c.online;
+  pills.push('<span class="gp ' + (online === true ? 'ok' : (online === false ? 'bad' : '')) + '">'
+    + (online === true ? '已认证' : (online === false ? '未认证' : '未探测')) + '</span>');
+  var pu = c.portal || c.portal_cfg || '';
+  if (pu) {
+    var host = pu;
+    try { host = new URL(pu).host; } catch (e) { /* 非标准地址就原样显示 */ }
+    pills.push('<span class="gp" title="' + esc(pu) + '">' + esc(host) + '</span>');
+  }
+  var kindText = { drcom: 'Dr.COM', srun: '深澜', eportal: 'ePortal', portal: '通用表单', custom: '自定义' };
+  if (c.kind) pills.push('<span class="gp">' + esc(kindText[c.kind] || c.kind) + '</span>');
+  if (c.user_cfg) pills.push('<span class="gp">' + esc(c.user_cfg) + '</span>');
+  pills.push('<span class="gp ' + (c.has_pass ? 'ok' : '') + '">' + (c.has_pass ? '密码已存' : '还没存密码') + '</span>');
+  if (c.enabled) pills.push('<span class="gp ok">自动重登 · ' + n(c.interval, 30) + 's</span>');
+  if (c.last_ok) pills.push('<span class="gp">上次成功 ' + esc(ago(c.last_ok)) + '</span>');
+  patch('#cpPills', pills.join(''));
+
+  var note = [];
+  if (c.error) note.push('上次失败：' + c.error);
+  else if (c.detail) note.push(c.detail);
+  if (c.need_manual) note.push('这个门户要验证码：需要手动登录一次（点「立即登录」会告诉你地址）。');
+  if (!c.user_cfg) note.push('填学号和密码 → 打开右侧开关，之后掉线会自动重登。');
+  patch('#cpNote', esc(note.join(' · ')) || '密码存在本机（DPAPI 加密），不会写进日志，也不会发给任何服务器。');
+  cpFill();
+}
+
+async function cpSave(extra) {
+  var body = {
+    enabled: !!($('#cpOn') && $('#cpOn').checked),
+    provider: ($('#cpProvider') && $('#cpProvider').value) || 'auto',
+    user: ($('#cpUser') && $('#cpUser').value.trim()) || '',
+    portal: ($('#cpPortal') && $('#cpPortal').value.trim()) || '',
+    template: ($('#cpTemplate') && $('#cpTemplate').value.trim()) || '',
+    interval: 30,
+  };
+  var pw = $('#cpPass');
+  if (pw && pw.value) { body.pass = pw.value; }
+  if (extra) Object.assign(body, extra);
+  var r = await api('/api/campus/save', body);
+  if (r && r.ok) {
+    if (pw) pw.value = '';                 // 密码不在内存里多留一秒
+    if (r.campus) { S.campus = r.campus; renderCampus(); }
+    toast('已保存', 'good');
+  } else {
+    toast((r && r.error) || '保存失败', 'bad');
+  }
+  return r;
+}
+
+async function cpDetect() {
+  if (CP_BUSY) return;
+  CP_BUSY = true;
+  try {
+    var r = await api('/api/campus/detect', {}, { timeout: API_SLOW });
+    if (r && r.campus) { S.campus = r.campus; renderCampus(); }
+    if (r && r.online) toast('当前网络已经通了，不用登录', 'good');
+    else if (r && r.portal) toast('认出来了：' + r.portal, 'good');
+    else toast((r && r.detail) || '没找到认证页（可能是真断网）', 'bad');
+  } finally { CP_BUSY = false; }
+}
+
+async function cpLogin() {
+  if (CP_BUSY) return;
+  CP_BUSY = true;
+  var b = document.querySelector('[data-act="cp-login"]');
+  var old = b ? b.textContent : '';
+  if (b) { b.disabled = true; b.classList.add('busy'); b.textContent = '登录中'; }
+  try {
+    var r = await api('/api/campus/login', {}, { timeout: API_SLOW });
+    if (r && r.campus) { S.campus = r.campus; renderCampus(); }
+    if (r && r.ok) toast(r.msg || '登录成功', 'good');
+    else toast((r && (r.msg || r.error)) || '登录失败', 'bad');
+  } catch (e) {
+    toast('登录失败：' + e, 'bad');
+  } finally {
+    if (b) { b.disabled = false; b.classList.remove('busy'); b.textContent = old || '立即登录'; }
+    CP_BUSY = false;
+  }
+}
+
 function renderModulesApi() {
   var a = (S && S.ai_api) || {};
   // /api/state 里的 token 是掩码，只能拿来显示；明文只走 reveal 那一次请求，不进 S
@@ -1685,7 +1819,7 @@ function renderView(v) {
   if (v === 'home') renderHome();
   else if (v === 'nodes') { renderChips(); renderNodes(); }
   else if (v === 'scenes') renderScenes();
-  else if (v === 'tools') { renderNetDoc(); renderGithub(); renderDns(); renderAI(); renderModulesApi(); }
+  else if (v === 'tools') { renderNetDoc(); renderCampus(); renderGithub(); renderDns(); renderAI(); renderModulesApi(); }
   else if (v === 'subs') renderSubs();
   else if (v === 'settings') renderSettings();
 }
@@ -1921,6 +2055,9 @@ document.addEventListener('click', function (e) {
   else if (a === 'nd-repair') ndRepair();
   else if (a === 'nd-copy') ndCopy();
   else if (a === 'nd-fix') ndFix(el.dataset.a, el.dataset.cid, el);
+  else if (a === 'cp-save') cpSave();
+  else if (a === 'cp-detect') cpDetect();
+  else if (a === 'cp-login') cpLogin();
 });
 
 $('#modYes').addEventListener('click', function () { modSave(); });
@@ -1961,6 +2098,18 @@ document.addEventListener('change', async function (e) {
     var r2 = await api('/api/scene/toggle', { key: son.dataset.sceneOn, on: son.checked });
     if (r2.ok === false) toast(r2.error || '设置失败', 'bad'); else toast(son.checked ? '已启用' : '已关闭', 'good');
     setTimeout(refresh, 900);
+    return;
+  }
+  if (t.id === 'cpOn') {
+    // 只翻开关也要立刻落盘：用户以为「打开就走」，结果重启后又关着最气人
+    var rc4 = await api('/api/campus/save', { enabled: t.checked });
+    if (!rc4 || rc4.ok === false) {
+      toast((rc4 && rc4.error) || '保存失败', 'bad');
+      t.checked = !t.checked;
+      return;
+    }
+    if (rc4.campus) { S.campus = rc4.campus; renderCampus(); }
+    toast(t.checked ? '校园网自动重登已开' : '校园网自动重登已关', 'good');
     return;
   }
   if (t.id === 'dnsOn') {

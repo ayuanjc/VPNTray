@@ -22,7 +22,7 @@ log = logging.getLogger("settings")
 SCHEMA_VERSION = 2
 
 # 这几个字段是凭据：写盘前用 DPAPI 封装，只有当前 Windows 账户能解开
-SECRET_KEYS = ("secret", "ai_api_token")
+SECRET_KEYS = ("secret", "ai_api_token", "campus_pass")
 _DPAPI_PREFIX = "dpapi:v1:"
 
 # 2.x 遗留键：模块首次物化时读它们，物化完就没用了
@@ -74,6 +74,26 @@ DEFAULTS: dict[str, Any] = {
     # 出问题发一条托盘通知（只读，不动节点、不动系统代理）。
     "okx_guard": True,
     "okx_guard_interval": 60,       # 秒；实际下限 10，太小会打爆 ip-api 免费额度
+    # ——— 本地 OCR 桥（ocrbridge，3.5.0）———
+    # 127.0.0.1:8791 是 DSH 的「图片 -> 文字」代理：图片在本地换成文本再进
+    # DeepSeek。这个端口没人听的时候，模型调用直接 ECONNREFUSED，界面上表现
+    # 成「模型不可用」，看着像节点挂了。托盘常驻，所以由它盯着：掉了就拉起来。
+    "ocr_bridge": True,
+    "ocr_bridge_dir": "",           # 留空 = 自动找（E:\Desktop\AI\wechat\ocr-router）
+    "ocr_bridge_port": 8791,
+    "ocr_bridge_interval": 30,      # 秒；实际下限 10
+    # ——— 校园网自动登录（campus，3.4.0）———
+    # 校园网是「先连上 WiFi 还得过认证」的网络：不过认证就只有内网，
+    # 所有 HTTP 被劫持到认证页。这里存账号密码 + 认出来的门户地址，
+    # 掉线时自动重登。密码进 SECRET_KEYS（DPAPI 封装），不落明文。
+    "campus_enabled": False,        # 默认关：没填账号密码之前开着只会刷日志
+    "campus_provider": "auto",      # auto / drcom / srun / eportal / portal / custom
+    "campus_user": "",
+    "campus_pass": "",
+    "campus_portal": "",            # 自动发现后回填，也可手填（门户页地址）
+    "campus_template": "",          # custom：{user} {pass} {ip} {mac} {portal} 占位
+    "campus_interval": 30,          # 秒；实际夹在 15~600
+    "campus_auto_open": False,      # 需要验证码/人工登录时自动弹认证页
     "probe_on_select": True,        # 手动切节点后自动查一次出口 IP/纯净度
 
     # ——— 移动热点特化（本版内置）———

@@ -364,6 +364,34 @@ def _t_net_repair(app, args):
     return app.net_repair([str(a) for a in acts] if isinstance(acts, list) else None)
 
 
+# ── 校园网 ──
+def _t_campus_status(app, args):
+    """校园网状态：在线与否、认出来的门户、上次登录结果（不含密码）。"""
+    return app.campus_status()
+
+
+def _t_campus_login(app, args):
+    return app.campus_login_now(_s(args, "portal", ""))
+
+
+def _t_campus_config(app, args):
+    """改校园网配置。password 留空 = 不改；enabled 决定守护线程起停。"""
+    cfg: dict[str, Any] = {}
+    if "enabled" in args:
+        cfg["enabled"] = _b(args, "enabled", False)
+    for k in ("provider", "user", "pass", "portal", "template"):
+        v = _s(args, k, "")
+        if v:
+            cfg[k] = v
+    if "interval" in args:
+        cfg["interval"] = _i(args, "interval", 30, 15, 600)
+    if "auto_open" in args:
+        cfg["auto_open"] = _b(args, "auto_open", False)
+    if not cfg:
+        return {"ok": False, "error": "没有要改的字段"}
+    return app.campus_save(cfg)
+
+
 # 断网急救：read 看结论，full 才允许动手（改系统代理 / 重启内核都算重手）
 _reg("trade.status", "read", "交易通道监控",
      "出口 IP（绑定白名单会用到）、OKX REST 延迟、行情 WS 可达性、交易域名是否被投毒（dns_ok / dns_sys_ok / dns_bad）",
@@ -378,6 +406,19 @@ _reg("net.fix", "full", "修单项网络问题",
 _reg("net.repair", "full", "一键网络急救",
      "按安全顺序修一轮（不改网卡 DNS、不重置 Winsock），修完自动复检并返回新报告",
      {"actions": "可选，动作名数组；不传就是安全集合"}, _t_net_repair)
+
+_reg("campus.status", "read", "校园网状态",
+     "是否已过认证（online）、认出来的门户地址与类型（drcom/srun/eportal/portal）、上次登录结果、是否设置了账号密码",
+     {}, _t_campus_status)
+_reg("campus.login", "write", "校园网立刻登录",
+     "用已保存的账号密码登一次，登完复验 204；失败会返回门户原文摘要（密码已打码）",
+     {"portal": "可选，指定认证页地址；不传用已保存的 / 现场探测到的"}, _t_campus_login)
+_reg("campus.config", "write", "改校园网配置",
+     "provider=auto|drcom|srun|eportal|portal|custom；user/pass；template 里 {user} {pass} {ip} {mac} {portal} 会被替换；enabled 控制自动重登",
+     {"enabled": "true 开启自动重登", "provider": "auto", "user": "学号", "pass": "密码",
+      "portal": "http://172.32.253.17/", "template": "", "interval": 30, "auto_open": False},
+     _t_campus_config,
+     {"enabled": True, "provider": "auto", "user": "20230001"})
 
 _reg("modules.save", "write", "保存模块", "新建或覆盖一个模块（改完立即热重载）",
      {"module": "完整模块对象；只改一个字段就先 modules.get 再整体回传"},

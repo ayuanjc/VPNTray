@@ -15,7 +15,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__ as _APP_VER
-from . import aiops, disguise, dnsguard, okxguard
+from . import aiops, campus, disguise, dnsguard, okxguard
 from .paths import ROOT, asset
 from .purity import FLAG_CC
 
@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "3.3.0"
+UI_VER = "1.0.0"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -274,6 +274,8 @@ def build_state(app) -> dict[str, Any]:
         "netdoc_error": str(st.get("netdoc_error") or ""),
         # 交易通道监控（出口 IP / REST 延迟 / 行情 WS / 交易域名解析）
         "trade": okxguard.status(),
+        # 校园网：在线状态 / 认出来的门户 / 上次登录结果（不含密码）
+        "campus": app.campus_status(),
         "update": st.get("update") or {},
         "update_repo": s.get("update_repo", ""),
         "purity_count": sum(1 for n in nodes if n.get("purity") is not None),
@@ -659,6 +661,23 @@ class WebUI:
             self._bg(app.check_purity, [node], 0)
             return {"ok": True, "queued": node}
 
+        def campus_save(body):
+            return app.campus_save(body or {})
+
+        def campus_login(body):
+            return app.campus_login_now(str((body or {}).get("portal") or ""))
+
+        def campus_detect(_body):
+            """只探测不改配置：给「认一下门户」按钮用。"""
+            info = campus.discover()
+            if info.get("portal"):
+                app.settings["campus_portal"] = info["portal"]
+                try:
+                    app.settings.save()
+                except Exception:  # noqa: BLE001
+                    pass
+            return {"ok": True, **info, "campus": app.campus_status()}
+
         return {
             "/api/ai/node": ai_node,
             "/api/ai/toggle": ai_toggle,
@@ -678,6 +697,9 @@ class WebUI:
             "/api/module/reset": module_reset,
             "/api/module/import": module_import,
             "/api/module/export": module_export,
+            "/api/campus/save": campus_save,
+            "/api/campus/login": campus_login,
+            "/api/campus/detect": campus_detect,
         }
 
     # ── 杂项：拓扑 / 内核 / 连接 / 更新 / 冲突清理 / 反馈 ──

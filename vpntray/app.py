@@ -17,7 +17,7 @@ from typing import Any, Callable
 import requests
 
 from . import __version__ as _VERSION
-from . import autostart, configgen, disguise, dnsguard, github_ops, hotspot, kernel as kernel_mod, modules as modules_mod, netguard, okxguard, purity, subscription, sysproxy
+from . import autostart, campus, configgen, disguise, dnsguard, github_ops, hotspot, kernel as kernel_mod, modules as modules_mod, netguard, ocrbridge, okxguard, purity, subscription, sysproxy
 from .api import ApiError, MihomoAPI
 from .kernel import Kernel
 from .paths import CONFIG, DELAYS, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
@@ -297,6 +297,40 @@ class App:
                 okxguard.start(self)
             except Exception as e:  # noqa: BLE001
                 log.warning("交易通道守护启动失败: %s", e)
+
+        # 校园网守护：默认关（没账号密码时开着只会每 30 秒刷一条「没填账号」）。
+        # 开了以后掉线自动重登，登完把因为没过认证而让路的系统代理接回来。
+        if self.settings.get("campus_enabled", False):
+            try:
+                campus.start(self)
+                log.info("校园网守护已启动（provider=%s，间隔 %ss）",
+                         self.settings.get("campus_provider", "auto"),
+                         self.settings.get("campus_interval", 30))
+            except Exception as e:  # noqa: BLE001
+                log.warning("校园网守护启动失败: %s", e)
+
+        # 本地 OCR 桥：DSH 那边选「阿里云·OCR路由」时，图片先送到
+        # 127.0.0.1:8791 换成文字。那个 node 进程和本程序没关系，但它死掉时
+        # 症状是「模型不可用」——用户会以为是节点问题。端口没人听就拉起来，
+        # 之后交给自检线程；没装 ocr-router 的机器只留一条日志，不算故障。
+        if self.settings.get("ocr_bridge", True):
+            try:
+                _ob_dir = str(self.settings.get("ocr_bridge_dir") or "") or None
+                _ob_port = int(self.settings.get("ocr_bridge_port", 8791) or 8791)
+                _ob_ok, _ob_why = ocrbridge.ensure(dir=_ob_dir, port=_ob_port)
+                self._set(ocr_bridge_ok=_ob_ok, ocr_bridge_reason=_ob_why)
+                if _ob_ok:
+                    log.info("OCR 桥就绪：127.0.0.1:%s（%s）", _ob_port, _ob_why)
+                else:
+                    log.info("OCR 桥未启用：%s", _ob_why)
+                ocrbridge.watch(
+                    interval=int(self.settings.get("ocr_bridge_interval", 30) or 30),
+                    dir=_ob_dir, port=_ob_port,
+                    enabled=lambda: bool(self.settings.get("ocr_bridge", True)),
+                    on_change=lambda ok, why: self._set(ocr_bridge_ok=ok, ocr_bridge_reason=why),
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("OCR 桥守护启动失败: %s", e)
 
         if self.settings.get("system_proxy", True):
             # 开机/刚连上 WiFi 时，校园网这类网络往往还没过门户认证。
@@ -1067,6 +1101,14 @@ class App:
             okxguard.stop()
         except Exception as e:  # noqa: BLE001
             log.warning("停止交易通道守护失败: %s", e)
+        try:
+            campus.stop()
+        except Exception as e:  # noqa: BLE001
+            log.warning("停止校园网守护失败: %s", e)
+        try:
+            ocrbridge.stop()
+        except Exception as e:  # noqa: BLE001
+            log.warning("停止 OCR 桥自检失败: %s", e)
         for t in self._threads:
             t.join(timeout=2)
         self._threads.clear()
@@ -2449,6 +2491,140 @@ class App:
                 cur = parent.get(cur, 0)
         return out
 
+    # ══════════ 校园网（自动登录 / 适配，3.4.0）══════════
+    def campus_status(self) -> dict[str, Any]:
+        """给前端和 AI 用的校园网状态（不含密码）。"""
+        st = campus.status()
+        st["enabled"] = bool(self.settings.get("campus_enabled", False))
+        st["interval"] = int(self.settings.get("campus_interval", 30) or 30)
+        st["provider_cfg"] = str(self.settings.get("campus_provider", "auto") or "auto")
+        st["user_cfg"] = str(self.settings.get("campus_user", "") or "")
+        st["portal_cfg"] = str(self.settings.get("campus_portal", "") or "")
+        st["template"] = str(self.settings.get("campus_template", "") or "")
+        st["auto_open"] = bool(self.settings.get("campus_auto_open", False))
+        st["has_pass"] = bool(self.settings.get("campus_pass", ""))
+        return st
+
+    def campus_save(self, cfg: dict[str, Any]) -> dict[str, Any]:
+        """保存校园网配置。密码留空 = 不改（前端不显示、也不回传明文）。"""
+        if not isinstance(cfg, dict):
+            return {"ok": False, "error": "参数要是对象"}
+        prov = str(cfg.get("provider") or "").strip().lower()
+        if prov and prov not in campus.PROVIDERS:
+            return {"ok": False, "error": f"不认识的认证方式：{prov}"}
+        tpl = str(cfg.get("template") or "").strip()
+        if tpl and not tpl.lower().startswith(("http://", "https://")):
+            return {"ok": False, "error": "自定义登录地址要以 http:// 或 https:// 开头"}
+        portal = str(cfg.get("portal") or "").strip()
+        if portal and not portal.lower().startswith(("http://", "https://")):
+            return {"ok": False, "error": "认证页地址要以 http:// 或 https:// 开头"}
+        try:
+            gap = int(cfg.get("interval") or 30)
+        except (TypeError, ValueError):
+            gap = 30
+        gap = max(campus.MIN_INTERVAL, min(campus.MAX_INTERVAL, gap))
+
+        with self._lock:
+            if prov:
+                self.settings["campus_provider"] = prov
+            if "user" in cfg:
+                self.settings["campus_user"] = str(cfg.get("user") or "").strip()[:64]
+            pw = cfg.get("pass")
+            if isinstance(pw, str) and pw:
+                self.settings["campus_pass"] = pw
+            if "portal" in cfg:
+                self.settings["campus_portal"] = portal
+            if "template" in cfg:
+                self.settings["campus_template"] = tpl
+            self.settings["campus_interval"] = gap
+            if "auto_open" in cfg:
+                self.settings["campus_auto_open"] = bool(cfg.get("auto_open"))
+            self.settings["campus_enabled"] = bool(cfg.get("enabled"))
+            self.settings.save()
+        # 开关要立刻生效：关掉就停线程，打开就起线程（已起则不动）
+        if self.settings.get("campus_enabled", False):
+            try:
+                campus.start(self)
+            except Exception as e:  # noqa: BLE001
+                log.warning("校园网守护启动失败: %s", e)
+        else:
+            try:
+                campus.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self._set(campus_enabled=bool(self.settings.get("campus_enabled")))
+        self._changed()
+        return {"ok": True, "campus": self.campus_status()}
+
+    def campus_login_now(self, portal: str = "") -> dict[str, Any]:
+        """手动「立即登录」：不依赖守护线程，跑一次完整流程。"""
+        portal = str(portal or self.settings.get("campus_portal", "") or "")
+        info: dict[str, Any] = {"online": False, "portal": portal, "kind": "", "detail": ""}
+        if not portal:
+            info = campus.discover()
+            if info.get("online"):
+                self._set(campus_online=True)
+                return {"ok": True, "msg": "当前网络已经通了，不用登录",
+                        "campus": self.campus_status()}
+            portal = info.get("portal") or ""
+            if portal:
+                self.settings["campus_portal"] = portal
+                try:
+                    self.settings.save()
+                except Exception:  # noqa: BLE001
+                    pass
+        res = campus.login(
+            str(self.settings.get("campus_provider", "auto") or "auto"),
+            portal,
+            str(self.settings.get("campus_user", "") or ""),
+            str(self.settings.get("campus_pass", "") or ""),
+            str(self.settings.get("campus_template", "") or ""),
+        )
+        self._set(campus_online=bool(res.get("ok")), campus_portal=portal)
+        if res.get("ok"):
+            log.info("校园网手动登录成功（%s）", res.get("provider"))
+            self.notify("校园网已登录")
+            self.on_campus_online(campus.gateway())
+        elif res.get("need_manual"):
+            self.notify("校园网需要人工登录一次（有验证码）")
+            if self.settings.get("campus_auto_open", False):
+                try:
+                    webbrowser.open(portal or str(res.get("url") or ""))
+                except Exception:  # noqa: BLE001
+                    pass
+        self._changed()
+        res["campus"] = self.campus_status()
+        return res
+
+    def on_campus_online(self, before_gw: str = "") -> None:
+        """登录成功后：清 DNS 缓存、接回系统代理、网关变了就重启内核。
+
+        这三件事单独做很容易忘：校园网掉线时系统代理会「让路」关掉，
+        用户登录完发现网页还是打不开，其实是代理没接回来。
+        """
+        try:
+            from . import netdoctor as _nd
+            _nd.fix(self, "flush_dns")
+        except Exception as e:  # noqa: BLE001
+            log.debug("清 DNS 缓存失败: %s", e)
+        if self.settings.get("system_proxy", True) and not self.state.get("sysproxy"):
+            try:
+                self.toggle_system_proxy(True, silent=True)
+                log.info("校园网登录后重新接管系统代理")
+            except Exception as e:  # noqa: BLE001
+                log.warning("重新接管系统代理失败: %s", e)
+        now_gw = campus.gateway()
+        if before_gw and now_gw and before_gw != now_gw:
+            log.info("校园网网关变了（%s → %s），重启内核重建连接", before_gw, now_gw)
+            threading.Thread(target=self._restart_after_net, name="campus-restart",
+                             daemon=True).start()
+
+    def _restart_after_net(self) -> None:
+        try:
+            self.restart_kernel()
+        except Exception as e:  # noqa: BLE001
+            log.warning("换网关后重启内核失败: %s", e)
+
     # ────────────────────── 断网急救 ──────────────────────
     # 体检结果缓存在 state["netdoc"]：页面来回切不该重跑一遍（一轮 ~6 秒）。
     # 单项修复会顺带复检那一项，UI 就地刷新，不用整轮重来。
@@ -2810,6 +2986,20 @@ class App:
             if info.get("ok") and info.get("has_update") and force:
                 log.info("发现新版本 %s（当前 %s）", info.get("latest"), cur)
                 self.notify(f"有新版本 {info.get('latest')}，控制台可一键更新")
+            # 版本号从 3.x 重编成 1.x：远端「更小」不代表更旧，
+            # 不解释一句的话用户只会看到「已是最新」而错过真正的更新。
+            latest = str(info.get("latest") or "")
+            if info.get("ok") and not info.get("has_update") and latest and latest != cur:
+                try:
+                    from .updater import parse_version  # 同一条解析规则，别写两套
+                    a_, b_ = parse_version(latest), parse_version(cur)
+                    n_ = max(len(a_ or ()), len(b_ or ()))
+                    pad = lambda v: tuple(v) + (0,) * (n_ - len(v))  # noqa: E731
+                    if a_ and b_ and pad(a_) < pad(b_):
+                        info["note"] = (f"远端最新标签是 v{latest}，低于本机的 v{cur}："
+                                        "版本号已从 3.x 重编为 1.x，历史标签保持原样。")
+                except Exception:  # noqa: BLE001
+                    pass
         with self._lock:
             self.state["update"] = {**info, "checked_at": time.time(), "installing": False}
         self._changed()
