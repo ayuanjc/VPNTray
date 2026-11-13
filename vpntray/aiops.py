@@ -327,6 +327,13 @@ _reg("subs.list", "read", "订阅清单", "所有订阅、当前订阅、合并�
 _reg("log.tail", "read", "最近日志", "app.log 末尾若干行",
      {"lines": "1–400，默认 60"}, _t_log, {"lines": 80})
 
+# ── 交易通道 ──
+def _t_trade_status(app, args):
+    """交易通道监控快照：出口 IP、OKX REST 延迟、行情 WS、交易域名解析。"""
+    from . import okxguard
+    return okxguard.status()
+
+
 # ── 断网急救 ──
 def _t_net_diagnose(app, args):
     """跑一轮网络体检（网关 / DNS / 系统代理 / 内核 / 直连 / MTU / hosts）。"""
@@ -358,6 +365,9 @@ def _t_net_repair(app, args):
 
 
 # 断网急救：read 看结论，full 才允许动手（改系统代理 / 重启内核都算重手）
+_reg("trade.status", "read", "交易通道监控",
+     "出口 IP（绑定白名单会用到）、OKX REST 延迟、行情 WS 可达性、交易域名是否被投毒（dns_ok / dns_sys_ok / dns_bad）",
+     {}, _t_trade_status)
 _reg("net.diagnose", "read", "网络体检",
      "12 项检查：链路/网关/DNS 配置/本机解析/域名解析/系统代理/内核端口/直连/MTU/hosts/代理冲突/IPv6；每项带 fix 动作名",
      {"refresh": "false 默认吃缓存（快）；true 现场重跑（6s+）"}, _t_net_diagnose, {"refresh": False})

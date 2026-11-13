@@ -15,7 +15,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__ as _APP_VER
-from . import aiops, disguise, dnsguard
+from . import aiops, disguise, dnsguard, okxguard
 from .paths import ROOT, asset
 from .purity import FLAG_CC
 
@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "3.1.0"
+UI_VER = "3.2.0"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -272,6 +272,8 @@ def build_state(app) -> dict[str, Any]:
         # 异步体检的运行态：前端据此决定显示「体检中…」还是错误提示
         "netdoc_running": bool(st.get("netdoc_running")),
         "netdoc_error": str(st.get("netdoc_error") or ""),
+        # 交易通道监控（出口 IP / REST 延迟 / 行情 WS / 交易域名解析）
+        "trade": okxguard.status(),
         "update": st.get("update") or {},
         "update_repo": s.get("update_repo", ""),
         "purity_count": sum(1 for n in nodes if n.get("purity") is not None),

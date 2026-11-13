@@ -344,13 +344,31 @@ class Kernel:
 
     # ——— 自愈 ———
     def _watchdog(self) -> None:
+        dead = 0        # 连续「进程还在、API 不应答」的次数
         while not self._stop.wait(1.5):
             p = self.proc
             if not p:
                 return
-            if p.poll() is None:
-                continue
-            code = p.returncode
+            code = p.poll()
+            if code is None:
+                # 进程活着不等于内核可用：配置把 DNS 写死、监听队列打满、被系统
+                # 挂起时进程照样在，9091 却再也不应答 —— 系统代理还指着这个死端口，
+                # 表现为「网卡好好的，所有网页 502」。连续 3 次（≈4.5 秒）无应答才动手，
+                # 避免把一次慢配置重载当成崩溃。
+                if self.api.alive(timeout=1.5):
+                    dead = 0
+                else:
+                    dead += 1
+                    if dead < 3:
+                        continue
+                    log.error("内核进程在（pid=%s）但 API 连续 %d 次无应答，按崩溃处理",
+                              p.pid, dead)
+                    dead = 0
+                    self._terminate(wait=3.0)
+                    code = p.poll()
+                    if code is None:
+                        log.error("僵死内核杀不掉（pid=%s），保留句柄等下次重试", p.pid)
+                        continue
             log.warning("内核异常退出 code=%s，准备重启", code)
             with self._lock:
                 if self.proc is p:      # 别把别的线程刚拉起的新进程抹掉

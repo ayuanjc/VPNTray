@@ -68,6 +68,12 @@ DEFAULTS: dict[str, Any] = {
     "auto_best_interval_min": 30,
     "heal": True,                   # 节点失效时自动换到可用节点
     "dns_guard": True,              # 本地 DNS 兜底：127.0.0.1:53，给 Node/c-ares 类程序用
+    # ——— 交易通道守护（okxguard，3.2.0）———
+    # 做市的程序挂了不会喊「网页打不开」，只会静默不报价或者一直 50113。
+    # 每 okx_guard_interval 秒探一次出口 IP / REST 延迟 / 行情 WS / 交易域名解析，
+    # 出问题发一条托盘通知（只读，不动节点、不动系统代理）。
+    "okx_guard": True,
+    "okx_guard_interval": 60,       # 秒；实际下限 10，太小会打爆 ip-api 免费额度
     "probe_on_select": True,        # 手动切节点后自动查一次出口 IP/纯净度
 
     # ——— 移动热点特化（本版内置）———

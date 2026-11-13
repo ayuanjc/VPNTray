@@ -17,7 +17,7 @@ from typing import Any, Callable
 import requests
 
 from . import __version__ as _VERSION
-from . import autostart, configgen, disguise, dnsguard, github_ops, hotspot, kernel as kernel_mod, modules as modules_mod, netguard, purity, subscription, sysproxy
+from . import autostart, configgen, disguise, dnsguard, github_ops, hotspot, kernel as kernel_mod, modules as modules_mod, netguard, okxguard, purity, subscription, sysproxy
 from .api import ApiError, MihomoAPI
 from .kernel import Kernel
 from .paths import CONFIG, DELAYS, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
@@ -254,6 +254,8 @@ class App:
         # 53 已经有别的软件在服务就跳过，绝不抢端口、不改系统 DNS 设置。
         if self.settings.get("dns_guard", True):
             try:
+                # 兜底转发只该转发答案，不该替投毒背书：交易域名走经代理的 DoH。
+                dnsguard.set_doh_proxy(int(self.settings.get("mixed_port", 7891) or 7891))
                 guard = dnsguard.ensure()
                 self._set(dns_running=guard.running, dns_reason=guard.reason)
                 if guard.running:
@@ -287,6 +289,14 @@ class App:
         self._set(kernel_ok=True, error="", started_at=time.time())
         self._apply_saved_selection()
         self._apply_mode(self.settings.get("mode", "rule"))
+
+        # 交易通道守护：内核已经起来了才开始探（内部还会先等 20 秒，
+        # 避开刚启动时还没测速、节点未就绪的必然误报）。
+        if self.settings.get("okx_guard", True):
+            try:
+                okxguard.start(self)
+            except Exception as e:  # noqa: BLE001
+                log.warning("交易通道守护启动失败: %s", e)
 
         if self.settings.get("system_proxy", True):
             # 开机/刚连上 WiFi 时，校园网这类网络往往还没过门户认证。
@@ -1053,6 +1063,10 @@ class App:
             dnsguard.stop()
         except Exception as e:  # noqa: BLE001
             log.warning("停止本地 DNS 兜底失败: %s", e)
+        try:
+            okxguard.stop()
+        except Exception as e:  # noqa: BLE001
+            log.warning("停止交易通道守护失败: %s", e)
         for t in self._threads:
             t.join(timeout=2)
         self._threads.clear()

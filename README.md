@@ -35,7 +35,8 @@
 | 健康看护 | 每 45 秒探当前节点，连续失败自动换；每 20 秒检查系统代理有没有被别人改走 |
 | 场景模块 | 「一组域名 + 一个出口」写成 `data/modules/*.json`，面板里可增删改，改完热重载 |
 | 断网急救 | 13 项逐项体检 + 13 个就地修复动作 + 可复制的纯文本报告 |
-| AI 接口 | `/ai/v1` 双端点，36 个工具，三级权限，让 AI 直接读状态、改配置、跑动作 |
+| 交易通道监控 | 出口 IP / OKX REST 延迟 / 行情 WS / 交易域名是否被投毒，异常直接弹托盘通知 |
+| AI 接口 | `/ai/v1` 双端点，37 个工具，三级权限，让 AI 直接读状态、改配置、跑动作 |
 
 端口：混合代理 `7891`、内核 API `9091`、控制台 `7892`、本机 DNS `127.0.0.1:53`（可选），
 全部只监听 `127.0.0.1`。特意避开常见客户端用的 `7890 / 7897`，可以和别的代理软件共存。
@@ -266,7 +267,7 @@ curl -s -X POST http://127.0.0.1:7892/ai/v1/call -H "X-AI-Token: $TOKEN" \
 | `write` | 改配置、切节点 | `modules.save` `modules.delete` `scene.select` `node.select` `mode.set` `sub.*` |
 | `full` | 会断网 / 会退出的动作 | `kernel.restart` `proxy.system` `winsock` 类、`test.speed` `update.apply` `app.quit` |
 
-36 个工具，分四组：状态与清单（read）、模块与出口（write）、内核与系统（full）、网络体检（read/full 混合）。
+37 个工具，分四组：状态与清单（read）、模块与出口（write）、内核与系统（full）、网络体检（read/full 混合）。
 超权限调用返回 `{"ok":false,"error":"「重启内核」需要 full 权限，当前上限是 write","need":"full"}`，
 不会半执行。`test.speed` / `test.purity` 是后台排队，立刻返回 `{"ok":true,"queued":true}`。
 
@@ -426,6 +427,38 @@ python -m pytest tests -q           # 单元测试
 ---
 
 ## 11. 更新日志
+
+### 3.2.0 — 交易通道守护 + 兜底 DNS 不再转发投毒答案
+
+修的是「代理通、直连死」这一类最难查的状态：2026-11-13 那次系统 DNS 把
+www.okx.com 解成 CNAME awscn.okpool.top → 169.254.0.2（APIPA 黑洞），五个交易
+进程全报 `Cannot connect to host www.okx.com:443`，而节点测速 120ms 全绿。
+
+- **新增交易通道守护（okxguard）**：每 60 秒（`okx_guard_interval`）探四件事，
+  异常直接发托盘通知，只在状态翻转时发一条，不刷屏：
+  | 探什么 | 判定 | 为什么 |
+  | --- | --- | --- |
+  | 出口 IP | 与上次不同 | OKX API Key 绑了 IP 白名单，换 IP 会整片拒绝 |
+  | REST 延迟 | 热连接 ≥ 800ms 或不通 | 挂单已过期、撤单赶不上 |
+  | 行情 WS | `ws.okx.com:8443` 建连失败 | 盘口停在旧价，做市继续按死价报价 |
+  | 交易域名解析 | 内核侧 / 系统侧分别查 | 唯一能提前发现「投毒复发」的信号 |
+- **内核侧脏会自愈**：`/dns/query` 查出黑洞地址（169.254/16、0.0.0.0/8、127/8、
+  198.18/15 等）时立刻 `log.error` + 请求 mihomo 重载配置；只有系统侧脏则只告警
+  （现状如此：代理正常，直连会失败）。
+- **兜底 DNS 不再转发投毒答案**：`127.0.0.1:53` 对 `okx.com` / `binance.com`
+  改走「经代理的 DoH」（1.1.1.1 / 8.8.8.8，POST `application/dns-message`），
+  取不到才退回国内上游（而且退回时如果上游给的是黑洞地址，直接回 SERVFAIL、
+  不缓存 —— 宁可让客户端立刻重试，也不把 169.254.x.x 当答案发出去）。
+  Node/c-ares、Go netgo 这类走本机 53 的程序（包括 okx_mm）因此拿到真地址。实测 `www.okx.com` 从 169.254.0.2 变成 104.18.43.174 / 172.64.144.82。
+- **mihomo 活体检查**：以前看门狗只看 `poll()`，进程在但 API 不应答（配置把 DNS
+  写死、监听队列打满、被系统挂起）时系统代理会一直指着死端口。现在连续 3 次
+  （≈4.5 秒）`GET /version` 失败就按崩溃处理并走既有的自动重启流程。
+- **AI 接口新增 `trade.status`**（read）：出口 IP、REST 延迟、WS、`dns_ok` /
+  `dns_sys_ok` / `dns_bad`，工具总数 36 → 37；`/api/state` 多一个 `trade` 字段。
+- **做市侧断路断言**：okx_mm 的 `setup()` 在缺 `HTTPS_PROXY/ALL_PROXY` 或代理端口
+  连不上时直接退出（以前会静默直连黑洞地址，只在日志里刷 Cannot connect）。
+- 测试：`tests/test_trade_guard.py` 23 例（黑洞判定、报文解析、内核侧/系统侧分离、
+  告警边沿、DoH 命中与回退、活体检查）；全量 214 例通过。
 
 ### 3.1.0 — 每个耗时任务都有真进度条
 

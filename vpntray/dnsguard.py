@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import socket
@@ -154,6 +155,124 @@ def _read_ttl(resp: bytes) -> int:
 def _cache_key(data: bytes) -> bytes:
     """事务 ID 和标志位之后的整段：同一问题的不同 ID 命中同一条缓存。"""
     return data[2:]
+
+
+# ——— 交易域名不转发给国内 DNS（3.2.0）———
+# 2026-11-13 的事故：223.5.5.5 把 www.okx.com 解成 CNAME awscn.okpool.top → 169.254.0.2
+# （APIPA 黑洞）。nameserver-policy 只作用于 mihomo 自己的解析器，管不到这里的转发：
+# 兜底原样把投毒答案回给客户端，于是走 127.0.0.1:53 的程序（Node/c-ares、Go netgo，
+# 包括 okx_mm）全被送进黑洞，而浏览器/代理侧一切正常 —— 极难排查。
+# 所以这些域名改走「经代理的 DoH」，取不到再退回原上游（至少比 SERVFAIL 好）。
+DOH_DOMAINS = ("okx.com", "binance.com")
+DOH_SERVERS = ("https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query")
+DOH_TIMEOUT = 4.0
+_DOH_PORT = 0          # 0 = 不知道混合端口，不做 DoH（启动时由 app 设置）
+
+
+def set_doh_proxy(port: int) -> None:
+    """告诉兜底走哪个本地混合端口去发 DoH（0/非法值＝关闭 DoH）。"""
+    global _DOH_PORT
+    try:
+        _DOH_PORT = int(port or 0)
+    except (TypeError, ValueError):
+        _DOH_PORT = 0
+
+
+def _qname(data: bytes) -> str:
+    """从查询报文里取出问题域名（小写、无尾点）；取不到返回空串。"""
+    if len(data) < 13:
+        return ""
+    labels: list[str] = []
+    i = 12
+    for _ in range(32):
+        if i >= len(data):
+            return ""
+        n = data[i]
+        if n == 0:
+            return ".".join(labels).lower()
+        if n & 0xC0:            # 问题段不该出现压缩指针
+            return ""
+        labels.append(data[i + 1:i + 1 + n].decode("ascii", "replace"))
+        i += 1 + n
+    return ""
+
+
+def _doh_wanted(data: bytes) -> bool:
+    name = _qname(data)
+    return bool(name) and any(name == d or name.endswith("." + d) for d in DOH_DOMAINS)
+
+
+# 这些网段出现在 A 记录里就说明是投毒/占位答案（169.254/16 是 APIPA 黑洞、
+# 198.18/15 是 fake-ip、100.64/10 是运营商 NAT、0/8 与 127/8 是本机）：
+# 客户端连上去不是立刻失败就是连错地方，比 SERVFAIL 更难查。
+POISON_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "169.254.0.0/16", "0.0.0.0/8", "127.0.0.0/8", "198.18.0.0/15",
+    "100.64.0.0/10", "224.0.0.0/4", "255.255.255.255/32"))
+
+
+def _a_records(resp: bytes) -> list[str]:
+    """列出应答里的 A 记录地址（只读报文，不缓存）。"""
+    out: list[str] = []
+    try:
+        if len(resp) < 12:
+            return out
+        qd, an = struct.unpack("!HH", resp[4:8])
+        i = 12
+        for _ in range(qd):
+            i = _skip_name(resp, i) + 4
+        for _ in range(an):
+            i = _skip_name(resp, i)
+            if i + 10 > len(resp):
+                break
+            rtype, _cls, _ttl, rdlen = struct.unpack("!HHIH", resp[i:i + 10])
+            i += 10
+            if rtype == 1 and rdlen == 4 and i + 4 <= len(resp):
+                out.append(".".join(str(b) for b in resp[i:i + 4]))
+            i += rdlen
+    except Exception:              # noqa: BLE001
+        return out
+    return out
+
+
+def _poisoned(resp: bytes) -> bool:
+    """应答里有没有黑洞地址（只对交易域名用）。"""
+    for ip in _a_records(resp):
+        try:
+            if any(ipaddress.ip_address(ip) in net for net in POISON_NETS):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _doh(data: bytes) -> bytes | None:
+    """经本地混合端口（= 走代理）发一次 DoH，失败返回 None。"""
+    if not _DOH_PORT:
+        return None
+    try:
+        import requests            # 局部导入：没装也不能影响 UDP 转发
+    except Exception:              # noqa: BLE001
+        return None
+    proxies = {"https": f"http://127.0.0.1:{_DOH_PORT}"}
+    try:
+        with requests.Session() as s:
+            s.trust_env = False    # 环境里的 ALL_PROXY 不该改变这里的选路
+            for url in DOH_SERVERS:
+                try:
+                    with s.post(url, data=data, proxies=proxies, timeout=DOH_TIMEOUT,
+                                headers={"Content-Type": "application/dns-message",
+                                         "Accept": "application/dns-message",
+                                         "User-Agent": "VPNTray-dnsguard/1.0"}) as r:
+                        if r.status_code != 200 or not r.content:
+                            continue
+                        if not _reply_ok(data, r.content):
+                            continue     # ID 对不上就不算答案
+                        return r.content
+                except Exception:  # noqa: BLE001 —— 换下一个服务器
+                    continue
+    except Exception:              # noqa: BLE001
+        return None
+    return None
 
 
 def probe(port: int = DEFAULT_PORT, host: str = PROBE_HOST,
@@ -290,6 +409,16 @@ class DnsGuard:
                 return data[:2] + hit[1][2:]
             if hit:
                 self._cache.pop(key, None)
+        if _doh_wanted(data):
+            resp = _doh(data)
+            if resp is not None:
+                ttl = _read_ttl(resp)
+                with self._lock:
+                    if len(self._cache) >= CACHE_MAX_ITEMS:
+                        self._cache.clear()
+                    self._cache[key] = (now + ttl, resp)
+                return resp
+            log.debug("交易域名 DoH 失败，退回国内上游：%s", _qname(data))
         last = ""
         for host in self.upstreams:
             resp = self._query_udp(host, data)
@@ -304,6 +433,13 @@ class DnsGuard:
                     last = f"{host} 应答被截断且 TCP 重查失败"
                     continue
                 resp = tcp
+            if _doh_wanted(data) and _poisoned(resp):
+                # DoH 没成功才走到这里：国内上游把交易域名解成黑洞地址。
+                # 这种答案绝不能回给客户端、也不能进缓存 —— 宁可 SERVFAIL
+                # 让客户端立刻重试/报错，也好过连一个连不上的地址。
+                last = f"{host} 返回黑洞地址 {','.join(_a_records(resp))}"
+                log.warning("兜底拒绝上游投毒答案：%s via %s", _qname(data), host)
+                continue
             rcode = resp[3] & 0x0F
             if rcode in (2, 5):
                 # SERVFAIL / REFUSED 是「这家上游自己有问题」，不是答案；
