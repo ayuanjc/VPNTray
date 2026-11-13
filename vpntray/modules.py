@@ -468,7 +468,192 @@ def builtins() -> list[dict[str, Any]]:
                 ],
             },
         }),
-    ]
+    ] + _launcher_builtins()
+
+
+# 各游戏启动器 / 平台的出厂场景。数据放在这里而不是写死在 builtins() 里，
+# 是因为 2026 年这批启动器的域名还会变（Epic 换 CDN、EA 从 Origin 迁到 EA app），
+# 追加一项只改这个元组，不用动 builtins() 的结构。
+# 字段顺序：key, 标题, 图标, 排序, 说明, 探测 URL, 偏好地区, 域名, 规则
+_LAUNCHERS: tuple[tuple, ...] = (
+    (
+        "xbox", "Xbox 加速", "🎮", 30, "Xbox 主机 / Xbox App / 微软商店 / 账号登录",
+        "https://xsts.auth.xboxlive.com/xsts/authorize",
+        ["香港", "日本", "新加坡", "台湾", "美国"],
+        [
+            "xboxlive.com",          # 认证、好友、云存档、assets*.xboxlive.com
+            "xboxab.com",            # Xbox Live 实验域
+            "xbox.com",              # 官网 / 商店页
+            "xboxservices.com",
+            "xboxcdn.net",           # 封面与截图 CDN
+            "login.live.com",        # 微软账号登录
+            "account.live.com",
+            "account.microsoft.com",
+            "login.microsoftonline.com",
+            "microsoftonline.com",
+            "mp.microsoft.com",      # 商店后端（displaycatalog / purchase / licenses）
+            "store-images.s-microsoft.com",
+            "img-prod-cms-rt-microsoft-com.akamaized.net",
+            "storeedgefd.dsx.mp.microsoft.com",
+            "displaycatalog.mp.microsoft.com",
+            "purchase.mp.microsoft.com",
+            "licenses.mp.microsoft.com",
+            "collections.mp.microsoft.com",
+            "dl.delivery.mp.microsoft.com",      # 游戏本体下载
+            "tlu.dl.delivery.mp.microsoft.com",
+        ],
+        ["DOMAIN-KEYWORD,xboxlive", "DOMAIN-KEYWORD,xboxab", "DOMAIN-KEYWORD,xboxservices"],
+    ),
+    (
+        "epic", "Epic 加速", "🕹", 40, "Epic 商店 / 虚幻引擎 / EAC 反作弊",
+        "https://www.epicgames.com/robots.txt",
+        ["香港", "日本", "新加坡", "台湾", "韩国"],
+        [
+            "epicgames.com",
+            "epicgamescdn.com",      # 游戏下载 CDN
+            "epicgames.dev",
+            "unrealengine.com",
+            "unrealenginecdn.com",
+            "fortnite.com",
+            "easyanticheat.net",     # EAC 反作弊握手
+            "epicgames-download1.akamaized.net",
+        ],
+        ["DOMAIN-KEYWORD,epicgames", "DOMAIN-KEYWORD,easyanticheat"],
+    ),
+    (
+        "battlenet", "暴雪战网加速", "❄️", 50, "Battle.net / 魔兽 / 守望 / 暗黑",
+        "https://www.blizzard.com/robots.txt",
+        ["香港", "台湾", "日本", "韩国", "新加坡"],
+        [
+            "battle.net",
+            "blizzard.com",
+            "blizzard.cn",
+            "battlenet.com.cn",
+            "blzstatic.cn",          # 国服静态资源
+            "blizzard.vo.llnwd.net",
+            "blzddist1-a.akamaihd.net",
+            "bnetproduct-a.akamaihd.net",
+            "blizzard.akamaized.net",
+        ],
+        ["DOMAIN-KEYWORD,battle.net", "DOMAIN-KEYWORD,blizzard"],
+    ),
+    (
+        "ea", "EA 加速", "🎯", 60, "EA app / Origin / EA 反作弊",
+        "https://www.ea.com/robots.txt",
+        ["香港", "日本", "新加坡", "台湾", "美国"],
+        [
+            "ea.com",
+            "origin.com",
+            "ea-play.com",
+            "eadescs.com",
+            "eaassets-a.akamaihd.net",
+            "eac-cdn.ea.com",        # 反作弊组件
+            "cloudsync.ea.com",
+            "origin-a.akamaihd.net",
+        ],
+        ["DOMAIN-KEYWORD,eaassets", "DOMAIN-KEYWORD,eac-cdn"],
+    ),
+    (
+        "ubisoft", "育碧加速", "🌀", 70, "Ubisoft Connect / 彩虹六号 / 刺客信条",
+        "https://www.ubisoft.com/robots.txt",
+        ["香港", "日本", "新加坡", "台湾", "欧洲"],
+        [
+            "ubisoft.com",
+            "ubi.com",
+            "ubisoftconnect.com",
+            "uplay.com",
+            "ubiservices.ubi.com",
+            "ubisoft-orbit.s3.amazonaws.com",
+            "ubisoft-orbit-legacy.s3.amazonaws.com",
+            "ubistatic-a.akamaihd.net",
+        ],
+        ["DOMAIN-KEYWORD,ubisoft", "DOMAIN-KEYWORD,ubi.com"],
+    ),
+    (
+        "gog", "GOG 加速", "💾", 80, "GOG Galaxy / 商店 / CDN",
+        "https://www.gog.com/robots.txt",
+        ["香港", "日本", "新加坡", "台湾", "欧洲"],
+        [
+            "gog.com",
+            "gog-statics.com",
+            "gogcdn.net",           # 游戏下载
+            "gogalaxy.com",
+            "gogapis.com",
+            "gog.akamaized.net",
+        ],
+        ["DOMAIN-KEYWORD,gog-statics"],
+    ),
+    (
+        "riot", "拳头加速", "🔫", 90, "LOL / 无畏契约 / Riot Client",
+        "https://www.riotgames.com/robots.txt",
+        ["香港", "台湾", "日本", "新加坡", "韩国"],
+        [
+            "riotgames.com",
+            "riotcdn.net",
+            "riotclient.com",
+            "leagueoflegends.com",
+            "leagueoflegendstw.com",
+            "valorant.com",
+            "playvalorant.com",
+            "rgpub.io",
+        ],
+        ["DOMAIN-KEYWORD,riotgames", "DOMAIN-KEYWORD,riotcdn"],
+    ),
+    (
+        "rockstar", "Rockstar 加速", "⭐", 100, "Rockstar Launcher / GTA / 大镖客",
+        "https://www.rockstargames.com/robots.txt",
+        ["香港", "日本", "新加坡", "美国", "欧洲"],
+        [
+            "rockstargames.com",
+            "rockstarwarehouse.com",
+            "rockstarsocialclub.com",
+            "socialclub.rockstargames.com",
+            "rsg.sc.llnwd.net",
+            "prod.telemetry.ros.rockstargames.com",
+        ],
+        ["DOMAIN-KEYWORD,rockstargames"],
+    ),
+    (
+        "playstation", "PlayStation 加速", "🎮", 110, "PS App / PSN 商店 / 串流",
+        "https://www.playstation.com/robots.txt",
+        ["香港", "日本", "台湾", "新加坡", "美国"],
+        [
+            "playstation.com",
+            "playstation.net",
+            "sonyentertainmentnetwork.com",
+            "psnow.playstation.com",
+        ],
+        ["DOMAIN-KEYWORD,playstation"],
+    ),
+)
+
+
+def _launcher_builtins() -> list[dict[str, Any]]:
+    """把 _LAUNCHERS 展开成和内置场景同形状的模块（自动子组 + 偏好地区）。"""
+    out: list[dict[str, Any]] = []
+    for key, title, icon, order, desc, probe, regions, domains, rules in _LAUNCHERS:
+        out.append(normalize({
+            "key": key,
+            "title": title,
+            "desc": desc,
+            "kind": "scene",
+            "builtin": True,
+            "icon": icon,
+            "order": order,
+            # 和 GitHub 一样带自动子组：节点池里总有死节点，钉死一个出口
+            # 会让整个启动器打不开；自动子组按探测结果挑活的。
+            "group": {
+                "type": "select",
+                "auto": True,
+                "auto_title": title.replace("加速", "自动"),
+                "probe": probe,
+                "interval": 180,
+                "timeout": 3000,
+            },
+            "prefer_regions": list(regions),
+            "match": {"domains": list(domains), "rules": list(rules)},
+        }))
+    return out
 
 
 def ensure_builtins(settings: Any = None) -> int:

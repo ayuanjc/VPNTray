@@ -357,6 +357,11 @@ class Kernel:
                 # 避免把一次慢配置重载当成崩溃。
                 if self.api.alive(timeout=1.5):
                     dead = 0
+                    # 必须 continue：这一段是在「进程活着」分支里，往下走就是
+                    # 「异常退出」的重启流程。少了它，健康内核每个 tick 都会被
+                    # 当成崩溃重启一次（实测 2 秒一次，把 _restarts 打满后停掉自愈，
+                    # 期间 7891 反复被自己杀掉重建，全网断）。
+                    continue
                 else:
                     dead += 1
                     if dead < 3:

@@ -184,7 +184,7 @@ def test_ensure_builtins_with_real_settings():
             assert "steam_enabled" in s          # __contains__ 现在真的在
             assert 0 not in s                    # 别再把整数键当迭代入口
             made = modules.ensure_builtins(s)
-            assert made == 2
+            assert made == len(modules.builtins())
             steam = json.loads((d / "steam.json").read_text(encoding="utf-8"))
             assert steam["enabled"] is False
             assert steam["prefer_regions"][0] == "日本"
@@ -195,8 +195,18 @@ def test_ensure_builtins_with_real_settings():
 
 def test_builtins_seed_once():
     with sandbox() as d:
-        assert modules.ensure_builtins() == 2
-        assert {m["key"] for m in modules.load_all()} == {"steam", "github"}
+        seeded = {m["key"] for m in modules.builtins()}
+        assert modules.ensure_builtins() == len(seeded)
+        keys = {m["key"] for m in modules.load_all()}
+        assert keys == seeded
+        # 出厂必须带齐：两个老场景 + Xbox + 八家启动器
+        assert {"steam", "github", "xbox", "epic", "battlenet", "ea",
+                "ubisoft", "gog", "riot", "rockstar", "playstation"} <= keys
+        # 每个启动器都要有域名、有组、能通过 validate
+        for m in modules.load_all():
+            errs = modules.validate(m)
+            assert not errs, (m["key"], errs)
+            assert m["match"]["domains"] or m["match"]["rules"] or m["match"]["cidrs"]
         assert modules.ensure_builtins() == 0            # 第二次不做事
         modules.remove("steam")
         assert modules.ensure_builtins() == 0            # 删掉的不复活

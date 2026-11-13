@@ -372,6 +372,22 @@ class KernelLiveness(unittest.TestCase):
         killed, _k = self._run(True)
         self.assertEqual(killed, [])
 
+    def test_healthy_kernel_not_restarted(self):
+        """回归：健康内核每个 tick 都不能走重启流程（曾因少了 continue 每 2 秒重启一次）。"""
+        k = K.Kernel.__new__(K.Kernel)
+        k.proc = _Proc()
+        k._stop = _Ev(12)
+        k._restarts = 0
+        k.last_error = ""
+        k._lock = threading.Lock()
+        k.api = type("A", (), {"alive": lambda self, timeout=1.0: True})()
+        calls = []
+        k._terminate = lambda wait=3.0: calls.append("kill")
+        k.start = lambda *a, **kw: calls.append("start") or True
+        k._watchdog()
+        self.assertEqual(calls, [], "API 正常时不该 kill、不该重启")
+        self.assertEqual(k._restarts, 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

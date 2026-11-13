@@ -437,10 +437,12 @@ def tick(app: Any, st: Any) -> dict[str, Any]:
         if _once("dns:kernel", 600):
             first = kernel_bad[0]
             _notify(app, f"DNS 投毒已穿透内核：{first['domain']} → {', '.join(first['bad'])}（代理也会失败）")
-        log.error("DNS 投毒（内核侧）：%s", kernel_bad)
-        res = _reload_kernel(app)
-        log.warning("已请求 mihomo 重载配置以重建解析：%s", res)
-        _STATE["dns_reload"] = res
+            log.error("DNS 投毒（内核侧）：%s", kernel_bad)
+            # 重载也跟着节流：每 60 秒重载一次配置等于一直重启内核，
+            # 中间那几十秒全网抖动比投毒本身还伤。
+            res = _reload_kernel(app)
+            log.warning("已请求 mihomo 重载配置以重建解析：%s", res)
+            _STATE["dns_reload"] = res
     elif sys_bad:
         # 现状：系统 DNS（含本机 53 兜底）返回黑洞，但内核 nameserver-policy 挡住了。
         # 只记一条低频告警，避免 60 秒刷一次。
@@ -448,7 +450,8 @@ def tick(app: Any, st: Any) -> dict[str, Any]:
             first = sys_bad[0]
             _notify(app, "系统 DNS 仍被投毒：" + first["domain"] + " → " + ", ".join(first["bad"])
                      + "（走代理的流量正常，直连会失败）")
-        log.warning("系统 DNS 投毒（内核侧已绕过）：%s", [(d["via"], d["ips"]) for d in sys_bad[:2]])
+            # 日志同样节流，否则 60 秒一条，一天 1440 条把 app.log 刷满
+            log.warning("系统 DNS 投毒（内核侧已绕过）：%s", [(d["via"], d["ips"]) for d in sys_bad[:2]])
     else:
         if _ALERTED.pop("dns:kernel", None) or _ALERTED.pop("dns:sys", None):
             _notify(app, "交易域名解析已恢复正常")

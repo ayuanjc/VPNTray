@@ -428,6 +428,38 @@ python -m pytest tests -q           # 单元测试
 
 ## 11. 更新日志
 
+### 3.3.0 — 游戏平台全家桶：Xbox / 微软商店 + 八家启动器
+
+之前只有 Steam 和 GitHub 两个场景，其它启动器全靠订阅自带的「微软服务」等组，
+而那个组默认是 **DIRECT**（直连国内出口）。结果就是：微软商店能打开但下载和登录时好时坏，
+Xbox App 登录卡住、云存档同步失败，Epic / EA / 育碧第一次登录转圈。
+
+3.3.0 把「游戏平台」做成一等公民：每个平台一个模块、一个策略组、一条探测地址。
+
+| 模块 | 覆盖 | 出口策略 | 探测 |
+| --- | --- | --- | --- |
+| Xbox 加速 | xboxlive / xboxab / xbox.com / Xbox 商店 mp.microsoft.com / dl.delivery 下载 / 微软账号登录 | 香港 → 日本 → 新加坡 → 台湾 → 美国 | xsts.auth.xboxlive.com |
+| Epic 加速 | epicgames.com / 商店 CDN / 虚幻引擎 / EAC 反作弊 | 香港 → 日本 → 新加坡 → 台湾 → 韩国 | www.epicgames.com |
+| 暴雪战网加速 | battle.net / blizzard.com / 国服 blzstatic.cn / 下载 CDN | 香港 → 台湾 → 日本 → 韩国 → 新加坡 | www.blizzard.com |
+| EA 加速 | ea.com / origin.com / EA app / EAC 组件 | 香港 → 日本 → 新加坡 → 台湾 → 美国 | www.ea.com |
+| 育碧加速 | ubisoft.com / Ubisoft Connect / ubi.com / uplay | 香港 → 日本 → 新加坡 → 台湾 → 欧洲 | www.ubisoft.com |
+| GOG 加速 | gog.com / GOG Galaxy / gogcdn 下载 | 香港 → 日本 → 新加坡 → 台湾 → 欧洲 | www.gog.com |
+| 拳头加速 | riotgames / riotcdn / LOL / 无畏契约 | 香港 → 台湾 → 日本 → 新加坡 → 韩国 | www.riotgames.com |
+| Rockstar 加速 | Rockstar Launcher / GTA / 大镖客 / Social Club | 香港 → 日本 → 新加坡 → 美国 → 欧洲 | www.rockstargames.com |
+| PlayStation 加速 | PS App / PSN 商店 / playstation.net | 香港 → 日本 → 台湾 → 新加坡 → 美国 | www.playstation.com |
+
+几个细节：
+
+- 每个组都自带「XX 自动」fallback 子组（interval 180s、timeout 3000ms），节点池里死了几个也不会整个平台打不开；想固定只用某个节点，在场景页的下拉里选一个就是钉死。
+- 平台规则插在订阅规则**之前**，所以「微软服务 = DIRECT」不会再把这些域名抢走直连。
+- Windows Update（windowsupdate.com）仍然直连，没有被卷进来 —— 系统更新走代理只会更慢。
+- 出厂场景从 2 个增加到 11 个，只在首次运行（`data/modules/.seeded` 不存在时）物化；已经装过的用户不会被追加，需要的话用「新建模块」或重置内置模块。
+- 新装用户第一次启动就有这 11 个模块，不用手写 JSON。
+
+**Xbox 主机（同网段的实体机）还差一步**：主机不经过 PC 的 7891，只有 PC 开 TUN 并让主机把网关指向 PC 才吃得到代理。当前 TUN 需要管理员权限启动，非管理员启动时开关会提示「内核重启失败」。PC 上的 Xbox App / 微软商店不受这个限制。
+
+测试：218 例（新增 `test_builtins_seed_once` 断言 11 个场景齐全且都能通过 validate）。
+
 ### 3.2.0 — 交易通道守护 + 兜底 DNS 不再转发投毒答案
 
 修的是「代理通、直连死」这一类最难查的状态：2026-11-13 那次系统 DNS 把
@@ -457,7 +489,11 @@ www.okx.com 解成 CNAME awscn.okpool.top → 169.254.0.2（APIPA 黑洞），�
   `dns_sys_ok` / `dns_bad`，工具总数 36 → 37；`/api/state` 多一个 `trade` 字段。
 - **做市侧断路断言**：okx_mm 的 `setup()` 在缺 `HTTPS_PROXY/ALL_PROXY` 或代理端口
   连不上时直接退出（以前会静默直连黑洞地址，只在日志里刷 Cannot connect）。
-- 测试：`tests/test_trade_guard.py` 23 例（黑洞判定、报文解析、内核侧/系统侧分离、
+- **同类告警不刷屏**：投毒告警与内核重载都按 10 分钟节流（以前 60 秒一条，
+  一天 1440 行把 app.log 刷满，重载还会让全网每 60 秒抖一次）。
+- **活体检查不误杀**：健康内核只记「活着」直接进下一轮（回归测试盯住这点，
+  否则每个 tick 都会当成崩溃重启一次，2 秒一轮地把自愈次数打满）。
+- 测试：`tests/test_trade_guard.py` 24 例（黑洞判定、报文解析、内核侧/系统侧分离、
   告警边沿、DoH 命中与回退、活体检查）；全量 214 例通过。
 
 ### 3.1.0 — 每个耗时任务都有真进度条
