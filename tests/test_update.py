@@ -412,5 +412,60 @@ class AutoStartCommand(unittest.TestCase):
         self.assertTrue(Path(target).exists())
 
 
+class ReleaseCdnRedirect(unittest.TestCase):
+    """3.0.2 回归：release 资产 302 到 release-assets.githubusercontent.com。
+
+    以前 ALLOWED_HOSTS 里只有 objects.githubusercontent.com，跟第二跳时
+    _check_host 抛「拒绝访问非 GitHub 地址」，_head_size 一律返回 0，
+    检查更新就永远报「最新版没挂 VPNTray-x-win64.zip」——资产明明在。
+    """
+
+    class _Resp:
+        def __init__(self, code, headers):
+            self.status_code = code
+            self.headers = headers
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    def _fake(self, hosts, seen):
+        def fake(method, url, **kw):
+            seen.append(url)
+            host = (url.split("/")[2] if url.startswith("http") else "").lower()
+            if host == "github.com":
+                return self._Resp(302, {"Location": "https://" + hosts[0] + "/blob?a=1"})
+            if host == hosts[0]:
+                return self._Resp(200, {"Content-Length": "69987210"})
+            raise AssertionError("不该请求 " + url)   # 被白名单挡住时到不了这里
+        return fake
+
+    def test_release_assets_host_allowed(self):
+        for h in ("release-assets.githubusercontent.com",
+                  "objects.githubusercontent.com",
+                  "github-releases.githubusercontent.com"):
+            self.assertIn(h, updater.ALLOWED_HOSTS)
+
+    def test_foreign_host_rejected(self):
+        with self.assertRaises(updater.UpdateError):
+            updater._check_host("https://evil.example.com/x.zip")
+
+    def test_head_size_follows_redirect(self):
+        seen = []
+        fake = self._fake(["release-assets.githubusercontent.com"], seen)
+        url = "https://github.com/a/b/releases/download/v1.0.0/VPNTray-1.0.0-win64.zip"
+        with mock.patch.object(updater.requests, "request", side_effect=fake):
+            size = updater._head_size(url, None, 5.0)
+        self.assertEqual(size, 69987210)
+        self.assertEqual(len(seen), 2)
+        self.assertIn("release-assets.githubusercontent.com", seen[1])
+
+    def test_head_size_zero_on_404(self):
+        def fake(method, url, **kw):
+            return self._Resp(404, {})
+        with mock.patch.object(updater.requests, "request", side_effect=fake):
+            self.assertEqual(updater._head_size("https://github.com/a/b/x.zip", None, 5.0), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

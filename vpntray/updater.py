@@ -37,9 +37,15 @@ from .logger import get as _get_logger
 
 log = _get_logger("update")
 
-# 只允许从这两个域下载，重定向后的 objects.githubusercontent.com 是 GitHub 的
-# release 文件 CDN，其余一律拒绝。
+# 只允许 GitHub 自家域名，其余一律拒绝。release 资产的 302 目标换过好几次：
+# 早期是 objects.githubusercontent.com，2024 起改成 release-assets.githubusercontent.com
+# （旧域名 github-releases.githubusercontent.com 仍可能出现在老 release 上）。
+# 少写一个的后果不是「不安全」，而是 _check_host 在跟第二跳时直接抛
+# 「拒绝访问非 GitHub 地址」，于是检查更新永远报「最新版没挂 zip」——
+# 3.0.1 / 3.0.2 都踩了这个坑。新增 CDN 域名时要一起加进来。
 ALLOWED_HOSTS = {"github.com", "api.github.com", "objects.githubusercontent.com",
+                 "release-assets.githubusercontent.com",
+                 "github-releases.githubusercontent.com",
                  "codeload.github.com", "raw.githubusercontent.com"}
 
 MAX_ZIP_BYTES = 300 * 1024 * 1024     # 发布包 70MB 上下，留足余量
