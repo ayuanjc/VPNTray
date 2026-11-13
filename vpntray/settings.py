@@ -188,6 +188,12 @@ class Settings:
         with self._lock:
             return self.data.get(k, default)
 
+    def __contains__(self, k: object) -> bool:
+        # 没有它的时候，`x in settings` 会退化成 __getitem__(0) 的迭代协议，
+        # 直接 KeyError(0)（2.5.9 启动即崩就是这么来的）。
+        with self._lock:
+            return k in self.data
+
     def update(self, **kw: Any) -> None:
         with self._lock:
             self.data.update(kw)

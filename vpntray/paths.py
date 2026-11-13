@@ -29,6 +29,7 @@ SETTINGS = DATA / "settings.json"
 KERNEL_LOG = LOGS / "kernel.log"
 APP_LOG = LOGS / "app.log"
 UI_DIR = DATA / "ui"
+MODULES = DATA / "modules"        # 用户可自由增删的场景 / 规则模块（每模块一个 json）
 LOCK_FILE = DATA / "app.lock"
 DELAYS = DATA / "delays.json"          # 上次测速结果，重启/刷新面板后直接复用
 
@@ -43,7 +44,7 @@ def ensure_dirs() -> None:
     只在「目录真的建不出来」时记日志：windowed 进程没有控制台，
     这里直接抛异常等于程序双击后什么都不发生，用户完全无从排查。
     """
-    for d in (DATA, LOGS, UI_DIR, APPDATA_DIR):
+    for d in (DATA, LOGS, UI_DIR, MODULES, APPDATA_DIR):
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -75,6 +76,6 @@ def kernel_workdir_args() -> list[str]:
 __all__ = [
     "ROOT", "BIN", "DATA", "LOGS", "MIHOMO", "GEOIP", "GEOSITE", "MMDB",
     "CONFIG", "SUB_CACHE", "SETTINGS", "KERNEL_LOG", "APP_LOG", "UI_DIR",
-    "LOCK_FILE", "ensure_dirs", "kernel_workdir_args", "asset",
+    "MODULES", "LOCK_FILE", "ensure_dirs", "kernel_workdir_args", "asset",
     "APPDATA_DIR", "SYSProxy_BACKUP",
 ]

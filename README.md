@@ -52,8 +52,10 @@ Windows 托盘工具：内嵌 [mihomo](https://github.com/MetaCubeX/mihomo) 内�
 2. **节点列表**：每行 `序号 · 国旗 · 节点名 · 纯净度 · 延迟`，当前节点高亮；
    上面一行是搜索框 + 地区 chip（点一下只看这个地区，再点「全部」取消）+ 排序下拉
    （按延迟 / 按纯净度 / 按名称）；列表自己滚动，不带走整页
-3. **场景加速**（Steam / GitHub 各一条专线，GitHub 自带「自动组」与五项链路自检）+ **AI 稳定**（出口 IP、时区对齐、启动器）+
+3. **场景加速**（每个场景一个模块：一组域名 + 一个出口，可自由增删改；内置 Steam / GitHub，
+   GitHub 自带「自动组」与五项链路自检）+ **AI 稳定**（出口 IP、时区对齐、启动器）+
    **订阅**（多条订阅、剩余流量、合并模式）
+   左侧栏「扩展」页放零碎小件：GitHub 链路自检、本机 DNS 兜底、AI 通道、AI 接口（token / 权限）
 4. **流量曲线**、**日志**（最近 200 行，可折叠）、**高级**（纯净度·当前 / 纯净度·全部 /
    带宽测速 / 重启内核 / 断开全部连接 / 扫描代理冲突 / 检查更新 / 退出程序）
 
@@ -226,6 +228,130 @@ Windows 托盘工具：内嵌 [mihomo](https://github.com/MetaCubeX/mihomo) 内�
 **说清楚局限**：这套只处理网络层和时区层的一致性。
 浏览器 Canvas/WebGL 指纹、账号历史地域、支付方式、手机号归属这些，工具改不了，
 也不该假装能改。
+
+## 3.6 场景模块化（`data/modules/*.json`）
+
+2.5.8 之前「Steam 专线」「GitHub 专线」是写死在 `configgen.py` 里的两个 dict，
+加第三个就得改代码。2.5.9 起场景变成**数据**：一个模块一个 JSON，扔进
+`data/modules/` 就生效，删掉就消失，面板里也能直接编辑。
+
+```jsonc
+// data/modules/steam.json
+{
+  "schema": 1,
+  "key": "steam",                  // 文件名，也是模块 id（小写字母/数字/-/_，2~32 位）
+  "title": "Steam",                // 策略组名，全局不能重名
+  "desc": "商店 / 社区 / CDN",
+  "kind": "scene",                 // scene=建策略组；rule=只插规则
+  "enabled": true,                 // 关掉=不建组、不插规则
+  "builtin": true,                 // 内置（删了不会自己长回来）
+  "icon": "🎮",
+  "order": 10,                     // 规则顺序，小的在前
+  "group": {                       // kind=scene 时才用
+    "type": "select",              // select / fallback / url-test / load-balance
+    "auto": true,                  // 额外建一个「Steam 自动」子组（成员≥2 时）
+    "auto_title": "Steam 自动",
+    "probe": "https://store.steampowered.com/robots.txt",
+    "interval": 300,
+    "timeout": 5000
+  },
+  "match": {
+    "domains": ["steampowered.com", "steamstatic.com"],   // DOMAIN-SUFFIX
+    "rules":   ["DOMAIN-KEYWORD,steamcontent"],           // 原样插，只准白名单类型
+    "cidrs":   ["23.32.0.0/11"]                            // IP-CIDR + no-resolve
+  },
+  "prefer_regions": ["香港", "日本"],  // 自动组优先挑这些地区的节点
+  "pinned": ""                         // 钉住的节点名，空=自动
+}
+```
+
+几条硬规则（写错了面板会直接告诉你哪一行不对）：
+
+| 规则 | 说明 |
+|---|---|
+| `key` 就是文件名 | 存 `foo.json` 但里面写 `"key": "bar"`，会被改回 `foo` |
+| `title` 全局唯一 | 策略组重名会让 mihomo 起不来；和订阅自带的组重名时，这个模块本轮跳过并写日志 |
+| `domains` 会被洗 | `https://`、`*.Foo.COM.`、`www.` 前缀都会被去掉并转小写 |
+| `rules` 只认白名单 | DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX / GEOSITE / IP-CIDR / IP-CIDR6 / IP-ASN / SRC-IP-CIDR / SRC-PORT / DST-PORT / PROCESS-NAME / PROCESS-PATH / RULE-SET / AND / OR / NOT / MATCH，且只写「类型,值」，目标组由程序拼 |
+| 上限 | 最多 64 个模块；每个模块 400 个域名、200 条规则 |
+| 内置只物化一次 | 首次运行写 `data/modules/.seeded`；你删掉 Steam 就不会再长回来，要恢复点面板「恢复内置」 |
+
+规则插进配置的位置（`configgen._rules`）：
+
+```
+LAN 直连 → AI 通道 → 模块（按 order 升序，逐个模块：domains → rules → cidrs）
+→ 国内补充 → 订阅自带规则 → GEOSITE,cn → GEOIP,cn → MATCH,主组
+```
+
+`kind` 两种：
+
+- **scene**：建一个策略组，模块里的域名默认走它，组里能选节点（或自动子组）。原来 Steam/GitHub 就是这个。
+- **rule**：不建组，规则直接指向 `group.target`——空或 `$main`/`PROXY` 走主组，也可写 `DIRECT`、`REJECT` 或订阅里已有的组名。适合「这几个域名想直连」「这批 IP 想走 AI 线」这种一行配置。
+
+面板「场景加速」页：卡片标题右边四个按钮（新增模块 / 导入 / 导出 / 恢复内置），
+每个模块一行，行尾「编辑」打开 JSON 编辑框，Ctrl+Enter 保存，改完自动重建配置并热加载，不用重启。
+
+## 3.7 AI 接口（`/ai/v1`）
+
+给本机的 AI 客户端（Claude Code、Codex、自己的脚本）一个**能真的动手**的入口，
+不是只读面板。协议极简：一个清单 + 一个调用端点。
+
+```
+GET  /ai/v1/manifest        # 自描述：有哪些工具、参数、需要什么权限
+POST /ai/v1/call            # {"tool": "modules.save", "args": {...}}
+```
+
+鉴权（三选一，都行）：
+
+```bash
+curl -H "X-AI-Token: $TOKEN" http://127.0.0.1:7892/ai/v1/manifest
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7892/ai/v1/manifest
+curl "http://127.0.0.1:7892/ai/v1/manifest?token=$TOKEN"
+```
+
+`$TOKEN` 在面板「扩展 → AI 接口」卡片里「复制 token」拿；它存在 `settings.json` 的
+`ai_api_token`，首次启动自动生成（32 位），「重置 token」立刻换新的、旧的当场失效。
+
+**三级权限**（`AI 接口` 卡片的下拉框，存 `ai_api_level`）：
+
+| 级别 | 能做什么 |
+|---|---|
+| `read` | 看：状态、模块清单/详情、节点、订阅、AI 通道、日志尾巴 |
+| `write` | 改：模块增删改/开关/导入/恢复、切场景节点、切 AI 节点/开关、切节点、换模式、订阅增删改、导出 |
+| `full` | 全控：重启内核、系统代理开关、开机自启、TUN、测速/纯净度、总开关、检查/安装更新、退出程序 |
+
+超权的调用会明确回 `{"ok": false, "error": "「重启内核」需要 full 权限，当前上限是 write", "need": "full"}`，
+不会静默失败。卡片最上面的开关（`ai_api_enabled`）关掉后所有 `/ai/v1` 一律 401。
+
+调用示例：
+
+```bash
+# 看看现在有什么模块
+curl -s -X POST http://127.0.0.1:7892/ai/v1/call \
+  -H "Content-Type: application/json" -H "X-AI-Token: $TOKEN" \
+  -d '{"tool":"modules.list"}'
+
+# 让 AI 自己加一个「OpenAI 走日本」的场景
+curl -s -X POST http://127.0.0.1:7892/ai/v1/call \
+  -H "Content-Type: application/json" -H "X-AI-Token: $TOKEN" \
+  -d '{"tool":"modules.save","args":{"key":"openai","title":"OpenAI","kind":"scene",
+       "match":{"domains":["openai.com","oaistatic.com"]},"prefer_regions":["日本"]}}'
+
+# 只让某个域名直连（rule 型模块）
+curl -s -X POST http://127.0.0.1:7892/ai/v1/call \
+  -H "Content-Type: application/json" -H "X-AI-Token: $TOKEN" \
+  -d '{"tool":"modules.save","args":{"key":"lan-nas","title":"NAS","kind":"rule",
+       "group":{"target":"DIRECT"},"match":{"domains":["nas.local"]}}}'
+
+# 长任务不会堵住 HTTP：立即回 queued，结果看 status / substitutions
+curl -s -X POST http://127.0.0.1:7892/ai/v1/call \
+  -H "Content-Type: application/json" -H "X-AI-Token: $TOKEN" \
+  -d '{"tool":"test.speed","args":{"names":["HK-1","JP-1"]}}'
+```
+
+面板「扩展 → AI 接口」卡片会把 token 和一段能直接粘给 AI 的说明打出来（点「复制」），
+粘给 Claude Code / Codex 它就知道该怎么调。**token 等于本机全控制权**，别贴到公网、
+别提交进仓库；怀疑泄露就点「重置 token」。接口只监听 `127.0.0.1`，外网访问不到。
 
 ## 4. 托盘菜单
 
@@ -436,6 +562,13 @@ VPNTray-1.8.1\
 | `auto_best` | `false` | 定时切到最快节点（会覆盖手动选择） |
 | `heal` | `true` | 当前节点失效时自动换 |
 | `autostart` | 跟随 | 开机自启 |
+| `ai_api_token` | 自动生成 | AI 接口的 token（32 位，首次启动写入，重置会换新） |
+| `ai_api_enabled` | `true` | AI 接口总开关，关掉后 `/ai/v1` 一律 401 |
+| `ai_api_level` | `full` | AI 权限上限：`read` / `write` / `full` |
+| `scene_auto` | `true` | 给 `group.auto` 的场景建「XX 自动」子组 |
+
+> 场景相关的 `steam_*` / `github_*` 等键在 2.5.9 已废弃，只用于首次把老配置迁移成
+> `data/modules/*.json`；之后一切以模块文件为准（面板里改的就是文件）。
 
 ## 10. 从源码运行 / 重新打包
 
@@ -955,6 +1088,44 @@ INFO app: VPNTray 2.2.2 启动（frozen=True，Python 3.12.10）
 
 覆盖安装后 `data/` 保留。如果日志里出现「图标文件缺失（打包时漏了 assets）」，说明手上
 那份包不完整 —— 换回官方 zip（`VPNTray-<版本>-win64.zip`）即可。
+
+## 2.5.9：场景变成模块，AI 能直接操作它
+
+两件事：**场景从代码里搬出来变成数据**，**程序对外开了一个能让 AI 动手的接口**。
+
+### 一、场景 = `data/modules/*.json`
+
+之前加一个专线要改 `configgen.py` 里的 `SCENES` 字面量，再重新打包发版。
+现在模块就是文件：写进 `data/modules/` 立刻生效，删掉立刻消失，面板里能直接编辑 JSON。
+
+- `kind: "scene"` 建策略组（Steam / GitHub 那种），`kind: "rule"` 只插规则不建组
+  （适合「这几个域名直连」「这批 IP 走 AI 线」）
+- 组类型支持 `select` / `fallback` / `url-test` / `load-balance`；`auto: true` 且成员 ≥2 时
+  额外建「XX 自动」子组
+- 域名自动洗（去 `https://`、`www.`、`*.`、结尾点、转小写）；规则只允许 18 种类型且只写
+  「类型,值」，目标组由程序拼，防止写出内核不认的配置
+- 内置的两个（Steam / GitHub）只在首次运行物化，写 `data/modules/.seeded` 做标记。
+  删掉不会复活，要回来点「恢复内置」
+- 组名全局唯一：模块之间重名直接拒绝保存；和订阅自带组重名时该模块本轮跳过 + 写日志
+  （重名的组会让 mihomo 起不来，这条是硬拦）
+
+面板「场景加速」页右上角：新增模块 / 导入 / 导出 / 恢复内置；每行「编辑」开 JSON 框，
+Ctrl+Enter 保存，改完自动重建配置 → 写盘 → 热加载，不用重启程序。
+
+### 二、`/ai/v1`：清单 + 单端点
+
+```
+GET  /ai/v1/manifest   # 有哪些工具 / 参数 / 需要什么权限
+POST /ai/v1/call       # {"tool": "...", "args": {...}}
+```
+
+鉴权 `X-AI-Token` / `Authorization: Bearer` / `?token=` 三选一，token 在面板
+「扩展 → AI 接口」复制，存 `settings.json`。三级权限 `read` < `write` < `full`，
+默认 `full`；超权调用回明确的 `need` 字段，不是静默失败。长任务（测速 / 纯净度）
+后台线程跑，HTTP 立刻回 `queued`。
+
+顺手把这些小卡片从「场景」页挪到了新的侧栏「扩展」页：GitHub 链路、本机解析、
+AI 通道、AI 接口——场景页只留场景，一屏一件事。
 
 ## 2.5.8：机场订阅把 fake-ip 设成 28.0.0.1/8 —— 半个互联网当场消失
 

@@ -16,7 +16,7 @@ from typing import Any, Callable
 import requests
 
 from . import __version__ as _VERSION
-from . import autostart, configgen, disguise, dnsguard, github_ops, hotspot, kernel as kernel_mod, netguard, purity, subscription, sysproxy
+from . import autostart, configgen, disguise, dnsguard, github_ops, hotspot, kernel as kernel_mod, modules as modules_mod, netguard, purity, subscription, sysproxy
 from .api import ApiError, MihomoAPI
 from .kernel import Kernel
 from .paths import CONFIG, DELAYS, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
@@ -68,6 +68,9 @@ class App:
     def __init__(self) -> None:
         ensure_dirs()
         self.settings = Settings()
+        # 场景/规则模块是数据文件：首次运行把内置的 Steam / GitHub 物化到
+        # data/modules/，之后用户删改都由文件说了算（不再写回）。
+        modules_mod.ensure_builtins(self.settings)
         self.api = MihomoAPI(
             port=_int(self.settings.get("controller_port"), 9091, 1024, 65535),
             secret=self.settings.get("secret", ""),
@@ -469,11 +472,16 @@ class App:
         return {str(k): _int(v, 0, 1) for k, v in d.items() if _int(v, 0, 1) > 0}
 
     def scenes_status(self) -> list[dict[str, Any]]:
-        """两个场景组的实时状态（每轮轮询都调，保持便宜）。"""
+        """模块列表的实时状态（每轮轮询都调，保持便宜）。
+
+        kind=scene 的模块会真的在核心里建组：给出组名 / 当前出口 / 自动子组 /
+        钉住的节点。kind=rule 的模块只产规则、不建组，所以 active 恒为 False。
+        """
         proxies = self.state.get("proxies") or {}
         delays = self.state.get("delays") or {}
+        main_now = str(self.state.get("group_now") or "")
         out: list[dict[str, Any]] = []
-        for sc in configgen.SCENES:
+        for sc in modules_mod.load_all():
             name = sc["title"]
             g = proxies.get(name) or {}
             cur = str(g.get("now") or "")
@@ -481,39 +489,47 @@ class App:
             # 自动子组：select 的 now 会是 "GitHub 自动"，真正的出口在
             # 那个 fallback 组的 now 里。界面上要显示真实节点，不然用户
             # 只知道「在自动」，不知道自动跳到了哪台机器。
-            aname = configgen.auto_name(sc)
-            real = cur
-            auto_g = proxies.get(aname) or {}
-            if cur == aname:
-                real = str(auto_g.get("now") or "")
+            aname = configgen.auto_name(sc) if (sc.get("group") or {}).get("auto") else ""
+            auto_g = (proxies.get(aname) or {}) if aname else {}
+            real = str(auto_g.get("now") or "") if (aname and cur == aname) else cur
+            mt = sc.get("match") or {}
             out.append({
                 "key": sc["key"],
                 "title": name,
                 "desc": sc.get("desc", ""),
-                "enabled": bool(self.settings.get(sc["settings_key"], True)),
+                "kind": sc.get("kind", "scene"),
+                "icon": sc.get("icon", ""),
+                "builtin": bool(sc.get("builtin")),
+                "enabled": bool(sc.get("enabled", True)),
                 "active": bool(g),          # 内核里真有这个组（关掉/无节点时没有）
                 "node": cur,
                 "exit": real,               # 真实出口节点
                 "auto": bool(auto_g),        # 有没有自动子组
                 "auto_name": aname if auto_g else "",
                 "auto_members": len([m for m in (auto_g.get("all") or []) if m]),
-                "pinned": str(self.settings.get(sc["node_key"]) or ""),
+                "pinned": str(sc.get("pinned") or ""),
                 "delay": delays.get(real),
                 "members": len(members),
-                "domains": len(sc["domains"]),
-                "main": str(self.state.get("group_now") or ""),
+                "domains": (len(mt.get("domains") or []) + len(mt.get("rules") or [])
+                            + len(mt.get("cidrs") or [])),
+                "target": str((sc.get("group") or {}).get("target") or ""),
+                "main": main_now,
             })
         return out
 
     def set_scene_node(self, key: str, name: str) -> tuple[bool, str]:
-        sc = configgen.scene_by_key(key)
+        """把某个模块的出口钉到指定节点（写进模块文件，不再进 settings）。"""
+        sc = modules_mod.load(key)
         if not sc:
-            return False, f"未知场景：{key}"
+            return False, f"未知模块：{key}"
+        if sc.get("kind") != "scene":
+            return False, "纯规则模块没有出口，不能钉节点"
         name = (name or "").strip()
         if not name:
             return False, "缺少节点名"
-        self.settings[sc["node_key"]] = name
-        self.settings.save()
+        ok, err = modules_mod.update(key, pinned=name)
+        if not ok:
+            return False, err
         try:
             self.api.select(sc["title"], name)
         except ApiError as e:
@@ -523,14 +539,24 @@ class App:
         return True, ""
 
     def set_scene_enabled(self, key: str, on: bool) -> tuple[bool, str]:
-        sc = configgen.scene_by_key(key)
+        sc = modules_mod.load(key)
         if not sc:
-            return False, f"未知场景：{key}"
-        self.settings[sc["settings_key"]] = bool(on)
-        self.settings.save()
+            return False, f"未知模块：{key}"
+        ok, err = modules_mod.update(key, enabled=bool(on))
+        if not ok:
+            return False, err
+        ok, err = self._rebuild_from_modules(f"已{'启用' if on else '关闭'}{sc['title']}")
+        return (True, "") if ok else (False, err)
+
+    def _rebuild_from_modules(self, notify: str = "") -> tuple[bool, str]:
+        """模块数据变了之后重建配置并热重载。
+
+        只 reload 不重启内核：重启会断掉所有连接，而模块改动（加个域名、
+        关一个组）本质上只是换了一份规则表，reload 就够。
+        """
         cached = subscription.load_cache()
         if not cached:
-            return False, "没有订阅缓存"
+            return False, "没有订阅缓存，无法重建配置"
         sub = subscription.normalize(cached)
         cfg = configgen.build(sub, self.settings, self._delay_map())
         path = configgen.write(cfg)
@@ -540,11 +566,17 @@ class App:
             except ApiError as e:
                 return False, f"重载失败：{e}"
             self._apply_saved_selection()
-            if on:
-                self._sync_scene_nodes()
+            self._sync_scene_nodes()
             self.refresh_now()
-        self.notify(f"已{'启用' if on else '关闭'}{sc['title']}")
+        if notify:
+            self.notify(notify)
         return True, ""
+
+    def _pin(self, key: str, name: str) -> None:
+        """把钉住的节点写回模块文件（失败只记日志：选节点已经生效了）。"""
+        ok, err = modules_mod.update(key, pinned=name)
+        if not ok:
+            log.warning("写回模块 %s 的钉节点失败: %s", key, err)
 
     def _sync_scene_nodes(self) -> None:
         """把场景组的出口钉到一个真实存在的节点上。
@@ -555,34 +587,83 @@ class App:
         配置后都校验一遍，失效就从组头（偏好地区）挑一个。
         """
         proxies = self.state.get("proxies") or {}
-        for sc in configgen.SCENES:
-            if not bool(self.settings.get(sc["settings_key"], True)):
+        for sc in modules_mod.load_all():
+            if not bool(sc.get("enabled", True)) or sc.get("kind") != "scene":
                 continue
             g = proxies.get(sc["title"]) or {}
             members = [str(m) for m in (g.get("all") or []) if m and str(m) != sc["title"]]
             if not members:
                 continue
-            pinned = str(self.settings.get(sc["node_key"]) or "")
+            pinned = str(sc.get("pinned") or "")
             # 钉住的节点要是已经测不通（机场节点大面积失效的常态），就别死抱着它，
             # 直接退回自动组 —— 那正是「GitHub 组锁死在挂掉的香港-IEPL 01」的解法
-            auto_n = configgen.auto_name(sc) if sc.get("auto") else ""
+            auto_n = configgen.auto_name(sc) if (sc.get("group") or {}).get("auto") else ""
             alive = self._delay_map()
             if (auto_n and auto_n in members and pinned and pinned != auto_n
                     and alive and pinned not in alive):
                 log.info("%s 钉住的 %s 没有测速数据，改走 %s", sc["title"], pinned, auto_n)
-                self.settings[sc["node_key"]] = auto_n
-                self.settings.save()
+                self._pin(sc["key"], auto_n)
                 pinned = auto_n
             if pinned not in members:
                 pick = members[0]
                 log.info("%s 原钉节点 %r 不在成员里，改钉 %s", sc["title"], pinned, pick)
-                self.settings[sc["node_key"]] = pick
-                self.settings.save()
+                self._pin(sc["key"], pick)
                 pinned = pick
             try:
                 self.api.select(sc["title"], pinned)
             except ApiError as e:
                 log.info("%s 选节点失败: %s", sc["title"], e)
+
+    # ══════════ 模块管理（面板 / AI 接口共用同一套实现）══════════
+    # 一条原则：改了数据就立刻重建配置，用户不用记得「还要重启一下」。
+    def modules_status(self) -> list[dict[str, Any]]:
+        return modules_mod.summary()
+
+    def module_get(self, key: str) -> dict[str, Any] | None:
+        return modules_mod.load(key)
+
+    def module_save(self, payload: Any) -> tuple[bool, str]:
+        """新建 / 覆盖一个模块。
+
+        payload 可以是模块对象本身，也可以是 {module: {...}}（前端两种都发）。
+        校验失败直接返回原因，不落盘 —— 坏配置一旦写进去，下次启动内核就起不来。
+        """
+        mod = payload.get("module") if isinstance(payload, dict) and isinstance(payload.get("module"), dict) else payload
+        if not isinstance(mod, dict):
+            return False, "需要模块对象"
+        ok, err = modules_mod.save(mod)
+        if not ok:
+            return False, err
+        title = str((modules_mod.load(str(mod.get("key") or "")) or {}).get("title") or mod.get("title") or "")
+        ok2, err2 = self._rebuild_from_modules(f"模块已保存：{title}")
+        return (True, "") if ok2 else (False, f"已保存，但重建配置失败：{err2}")
+
+    def module_delete(self, key: str) -> tuple[bool, str]:
+        key = (key or "").strip().lower()
+        mod = modules_mod.load(key)
+        if not mod:
+            return False, f"未知模块：{key}"
+        ok, err = modules_mod.remove(key)
+        if not ok:
+            return False, err
+        ok2, err2 = self._rebuild_from_modules(f"模块已删除：{mod['title']}")
+        return (True, "") if ok2 else (False, f"已删除，但重建配置失败：{err2}")
+
+    def module_reset(self) -> tuple[bool, str]:
+        n = modules_mod.reset_builtins()
+        ok, err = self._rebuild_from_modules(f"已恢复 {n} 个内置模块")
+        return (True, "") if ok else (False, err)
+
+    def module_export(self) -> dict[str, Any]:
+        return modules_mod.export_all()
+
+    def module_import(self, payload: Any) -> tuple[bool, str]:
+        ok_n, errs = modules_mod.import_all(payload)
+        if not ok_n:
+            return False, "；".join(errs[:4]) or "没有可导入的模块"
+        ok, err = self._rebuild_from_modules(f"已导入 {ok_n} 个模块")
+        tail = f"（{len(errs)} 个跳过：{'；'.join(errs[:2])}）" if errs else ""
+        return (True, tail) if ok else (False, f"已导入，但重建配置失败：{err}")
 
     # ══════════ GitHub 特化：自检 + git 代理对齐 ══════════
     # 实现整体搬到 vpntray/github_ops.GithubOps（约 200 行），这里只保留原有

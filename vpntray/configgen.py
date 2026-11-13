@@ -104,78 +104,39 @@ AI_DOMAINS = [
 # 分流优先级：比订阅规则高（订阅常把它们丢进「国际媒体」，那条线往往绕地球
 # 一圈），比 GEOSITE,cn 高（GitHub 在国内有 CDN，但 Pages / Release 资产
 # 一律走境外，geo 分类不可靠）。
-SCENES: list[dict[str, Any]] = [
-    {
-        "key": "steam",
-        "title": "Steam 加速",
-        "desc": "商店 / 社区 / 下载 CDN",
-        "settings_key": "steam_enabled",
-        "node_key": "steam_node",
-        "prefer_key": "steam_prefer_regions",
-        "prefer": ["香港", "台湾", "日本", "韩国", "新加坡"],
-        "domains": [
-            "steampowered.com",       # 商店 / 登录 / 支付
-            "steamcommunity.com",     # 社区、创意工坊、市场
-            "steamstatic.com",        # 图片与静态资源
-            "steamcontent.com",       # 下载 CDN（游戏本体）
-            "steamusercontent.com",   # 工坊内容
-            "steamgames.com",
-            "steamserver.net",
-            "steam-chat.com",
-            "steamconnecttest.com",
-            "steamdeck.com",
-            "s.team",                 # 短链与登录跳转
-        ],
-    },
-    {
-        "key": "github",
-        "title": "GitHub 加速",
-        "desc": "git / Release / Pages / 容器镜像",
-        "settings_key": "github_enabled",
-        "node_key": "github_node",
-        "prefer_key": "github_prefer_regions",
-        "prefer": ["香港", "日本", "新加坡", "台湾", "美国"],
-        # 自动子组：一个 select 组只能钉死一个出口，钉到的节点一挂，整个
-        # GitHub 就打不开（这台机器 100 个节点里 88 个是死的，机场中转段
-        # 大面积失效）。所以组里第一位放一个 fallback 子组，它拿 GitHub
-        # 自己的地址每 180s 探一次，探测超时 3s，第一个通的就是出口。
-        "auto": True,
-        "auto_title": "GitHub 自动",
-        "probe": "https://github.com/robots.txt",
-        "domains": [
-            "github.com",             # 含 api / gist / codeload / uploads / npm.pkg
-            "githubusercontent.com",  # raw / objects / media(LFS) / release-assets
-            "githubassets.com",       # 页面静态资源
-            "github.io",              # Pages
-            "ghcr.io",                # 容器镜像
-            "github.dev",             # 网页编辑器
-            "githubcopilot.com",
-            "github.blog",
-            "githubstatus.com",       # 状态页
-        ],
-        # Release 老式直链会 302 到 S3，那些域名不属于上面任何一个后缀，
-        # 掉到 MATCH 就按 Netlfix 的落地点绕地球一圈，下载速度掉到几十 KB/s。
-        "extra_rules": [
-            "DOMAIN-KEYWORD,github-production-release-asset",
-            "DOMAIN,github-cloud.s3.amazonaws.com",
-        ],
-    },
-]
+# 2.5.9 起场景不是代码里的常量，而是 data/modules/*.json 里的数据（见
+# modules.py）。下面这些函数只负责「把模块数据翻译成 mihomo 的策略组和规则」，
+# 所以用户自己加一个「Epic 加速」不需要改这里的任何一行，也不用重新出包。
+#
+# 场景要的是延迟、带宽、下载 CDN 命中，IP 会变也无所谓：各自一个独立 select
+# 组，组内按偏好地区排序（港台日最省事），用户钉住哪个就哪个；不钉就用组里
+# 第一个。分流优先级比订阅规则高（订阅常把它们丢进「国际媒体」，那条线往往
+# 绕地球一圈），也比 GEOSITE,cn 高（GitHub 在国内有 CDN，但 Pages / Release
+# 资产一律走境外，geo 分类不可靠）。
+from . import modules as _modules  # noqa: E402
+
+
+def all_modules() -> list[dict[str, Any]]:
+    """全部模块（含纯规则模块），已按 order / 组名排好序。"""
+    return _modules.load_all()
+
+
+def scenes() -> list[dict[str, Any]]:
+    """只有 kind=scene 的模块，也就是会真的建策略组的那些。"""
+    return [m for m in _modules.load_all() if m.get("kind") == "scene"]
 
 
 AUTO_SUFFIX = " 自动"
 
 
 def scene_by_key(key: str) -> dict[str, Any] | None:
-    for sc in SCENES:
-        if sc["key"] == key:
-            return sc
-    return None
+    return _modules.load(key)
 
 
 def auto_name(sc: dict[str, Any]) -> str:
-    """场景的自动子组名（"GitHub 自动"）。关掉自动的组没有这个名字。"""
-    return str(sc.get("auto_title") or f"{sc['title']}{AUTO_SUFFIX}")
+    """场景的自动子组名（"GitHub 自动"）。关掉自动的模块没有这个名字。"""
+    g = sc.get("group") or {}
+    return str(g.get("auto_title") or f"{sc['title']}{AUTO_SUFFIX}")
 
 FAKE_IP_FILTER = [    "*.lan",
     "*.local",
@@ -241,12 +202,12 @@ def _scene_members(sc: dict[str, Any], node_names: list[str], settings) -> list[
     """
     from . import hotspot as _hs
 
-    pref: list[str] = []
-    try:
-        pref = list(settings.get(sc["prefer_key"]) or [])
-    except Exception:  # noqa: BLE001
-        pref = []
-    pref = pref or list(sc["prefer"])
+    # 偏好地区属于模块自己的数据（用户/AI 都能改），不再走 settings 的 *_prefer_regions
+    pref: list[str] = [str(x) for x in (sc.get("prefer_regions") or []) if str(x).strip()]
+    if not pref:
+        from .modules import builtins as _builtin_mods
+        base = next((m for m in _builtin_mods() if m["key"] == sc.get("key")), None)
+        pref = list((base or {}).get("prefer_regions") or [])
 
     def rank(n: str) -> int:
         reg = _hs.region_of(n)
@@ -256,7 +217,7 @@ def _scene_members(sc: dict[str, Any], node_names: list[str], settings) -> list[
         # 没命中偏好地区的不剔除（订阅节点命名千奇百怪），排后面就行
         return len(pref) + 5
 
-    pinned = str(settings.get(sc["node_key"]) or "")
+    pinned = str(sc.get("pinned") or "")
     rest = sorted((n for n in node_names if n != pinned), key=lambda n: (rank(n), n))
     return ([pinned] if pinned and pinned in node_names else []) + rest
 
@@ -271,7 +232,8 @@ def _scene_layout(sc: dict[str, Any], node_names: list[str], settings,
     由组自己的健康检查去筛 —— 这样不会因为「还没测过」就把组建成空的。
     """
     members = _scene_members(sc, node_names, settings)
-    if not members or not sc.get("auto") or not bool(settings.get("scene_auto", True)):
+    grp = sc.get("group") or {}
+    if not members or not grp.get("auto") or not bool(settings.get("scene_auto", True)):
         return members, []
     d = delays or {}
 
@@ -360,26 +322,34 @@ def _scene_groups(node_names: list[str], settings, delays) -> tuple[list[dict[st
     """
     scene_on: set[str] = set()
     scene_groups: list[dict[str, Any]] = []
-    for sc in SCENES:
-        if not bool(settings.get(sc["settings_key"], True)) or not node_names:
+    if not node_names:
+        return scene_groups, scene_on
+    for sc in scenes():
+        if not bool(sc.get("enabled", True)):
             continue
         members, auto = _scene_layout(sc, node_names, settings, delays)
         if not members:
+            log.info("模块 %s 没有可用成员，本轮不建组", sc.get("key"))
             continue
-        if auto and len(auto) >= 2:
+        grp = sc.get("group") or {}
+        gtype = str(grp.get("type") or "select")
+        # 探测地址优先用模块自己的域名：拿 gstatic 探出来的「快」，在 GitHub 上
+        # 完全可能 502 / TLS 被掐，测了等于没测。
+        probe = str(grp.get("probe") or "") or "https://www.gstatic.com/generate_204"
+        interval = int(grp.get("interval") or 180)
+        timeout = int(grp.get("timeout") or 3000)
+        pinned = str(sc.get("pinned") or "")
+        if grp.get("auto") and gtype == "select" and len(auto) >= 2:
             aname = auto_name(sc)
             scene_groups.append({
                 "name": aname,
                 "type": "fallback",
-                # 探测地址用场景自己的域名：拿 gstatic 探出来的「快」，在
-                # GitHub 上完全可能 502 / TLS 被掐，测了等于没测。
-                "url": sc.get("probe") or "https://www.gstatic.com/generate_204",
-                "interval": 180,
-                "timeout": 3000,     # 3s 还没握手完的节点在 GitHub 上就是不可用
+                "url": probe,
+                "interval": interval,
+                "timeout": timeout,   # 3s 还没握手完的节点在 GitHub 上就是不可用
                 "lazy": False,
                 "proxies": auto,
             })
-            pinned = str(settings.get(sc["node_key"]) or "")
             if pinned and pinned in members:
                 # 用户明确钉了节点：钉的优先，自动组退到第二位（还能手动选回来）
                 head = [pinned, aname] + [m for m in members if m != pinned]
@@ -387,14 +357,24 @@ def _scene_groups(node_names: list[str], settings, delays) -> tuple[list[dict[st
                 # 没钉（或钉的是自动组本身）：默认走自动组，组内自己挑活的
                 head = [aname] + [m for m in members if m != aname]
             scene_groups.append({"name": sc["title"], "type": "select", "proxies": head})
-        else:
+        elif gtype == "select":
             scene_groups.append({"name": sc["title"], "type": "select", "proxies": members})
+        else:
+            # 用户把组类型改成 url-test / fallback / load-balance 时按类型建，
+            # 这几个参数是 mihomo 必填项，不填会直接报配置错。
+            g: dict[str, Any] = {
+                "name": sc["title"], "type": gtype, "proxies": members,
+                "url": probe, "interval": interval, "timeout": timeout, "lazy": False,
+            }
+            if gtype == "url-test":
+                g["tolerance"] = 50
+            scene_groups.append(g)
         scene_on.add(sc["title"])
     return scene_groups, scene_on
 
 
 def _rules(sub: dict[str, Any], main_group: str, ai_on: bool,
-           scene_on: set[str]) -> list[str]:
+           scene_on: set[str], groups: list[dict[str, Any]] | None = None) -> list[str]:
     """规则拼装：本地规则 → AI → 场景 → 国内补充 → 订阅规则 → GEOSITE/GEOIP → MATCH。"""
     sub_rules = [r for r in sub["rules"] if not r.upper().startswith("MATCH")]
     out_rules: list[str] = []
@@ -404,11 +384,36 @@ def _rules(sub: dict[str, Any], main_group: str, ai_on: bool,
         out_rules += [f"DOMAIN-SUFFIX,{d},{AI_GROUP}" for d in AI_DOMAINS]
     # 场景加速同样排在订阅规则前面：订阅把这些域名丢进「国际媒体」时，
     # 那条线按 Netflix 的落地点走，Steam 下载和 git clone 会慢到没法用。
-    for sc in SCENES:
-        if sc["title"] in scene_on:
-            out_rules += [f"DOMAIN-SUFFIX,{d},{sc['title']}" for d in sc["domains"]]
-            # 场景自带的非后缀规则（Release 的 S3 直链用 KEYWORD 才盖得住）
-            out_rules += [f"{pat},{sc['title']}" for pat in (sc.get("extra_rules") or [])]
+    # 模块（场景 + 纯规则模块）：场景模块的目标就是自己的组名，纯规则模块
+    # 指向 group.target（留空/写 $main 就是主组，也可以 DIRECT / REJECT / 订阅组名）。
+    valid = {g["name"] for g in (groups or [])} | {"DIRECT", "REJECT", "PASS"}
+
+    def _target(raw: str) -> str:
+        t = str(raw or "").strip()
+        if not t or t in ("$main", "MAIN", "PROXY"):
+            return main_group
+        if t in valid:
+            return t
+        log.warning("模块规则目标 %s 不存在，已改走主组 %s", t, main_group)
+        return main_group
+
+    for sc in all_modules():
+        if not bool(sc.get("enabled", True)):
+            continue
+        match = sc.get("match") or {}
+        if sc.get("kind") == "scene":
+            if sc["title"] not in scene_on:
+                continue
+            tgt = sc["title"]
+        else:
+            tgt = _target((sc.get("group") or {}).get("target") or "")
+        out_rules += [f"DOMAIN-SUFFIX,{d},{tgt}" for d in (match.get("domains") or [])]
+        # 模块自带的非后缀规则（Release 的 S3 直链用 KEYWORD 才盖得住）
+        out_rules += [f"{pat},{tgt}" for pat in (match.get("rules") or [])]
+        for cidr in match.get("cidrs") or []:
+            kind = "IP-CIDR6" if ":" in str(cidr) else "IP-CIDR"
+            # no-resolve：让内核按 IP 直接判定，不要为了匹配再去解析一次域名
+            out_rules.append(f"{kind},{cidr},{tgt},no-resolve")
     out_rules += [r for r in CN_EXTRA_RULES if r not in sub_rules]
     out_rules += sub_rules
     # 国内兜底：geosite:cn 域名直连（fake-ip 下比 GEOIP 更可靠）
@@ -588,14 +593,26 @@ def build(sub: dict[str, Any], settings,
     ai = _ai_group(node_names, settings)
     if ai:
         groups.insert(0, ai)
-    # AI 组占了第 0 位，场景组从 1 开始插，顺序即面板顺序
-    scene_groups, scene_on = _scene_groups(node_names, settings, delays)
-    for i, g in enumerate(scene_groups):
-        groups.insert((1 if ai else 0) + i, g)
-    if scene_on:
-        log.info("场景加速：%s", "、".join(sorted(scene_on)))
+    # AI 组占了第 0 位，场景组从 1 开始插，顺序即面板顺序。
+    # 模块的组名是用户自己起的，可能和订阅里的组重名 —— mihomo 遇到同名组
+    # 直接拒绝启动，所以这里必须去重（重名的模块本轮跳过并记日志）。
+    scene_groups, _ = _scene_groups(node_names, settings, delays)
+    taken = {g["name"] for g in groups}
+    kept: list[dict[str, Any]] = []
+    for g in scene_groups:
+        if g["name"] in taken:
+            log.warning("模块组名 %r 与订阅里的策略组重名，本轮跳过（改个组名即可）", g["name"])
+            continue
+        kept.append(g)
+        taken.add(g["name"])
+    base = 1 if ai else 0
+    for i, g in enumerate(kept):
+        groups.insert(base + i, g)
+    scene_on = {g["name"] for g in kept if g.get("type") == "select"}
+    if kept:
+        log.info("模块组：%s", "、".join(g["name"] for g in kept))
 
-    rules = _rules(sub, main_group, ai is not None, scene_on)
+    rules = _rules(sub, main_group, ai is not None, scene_on, groups)
     return _assemble({**sub, "proxy-groups": groups}, settings, _dns(sub), groups, rules)
 
 

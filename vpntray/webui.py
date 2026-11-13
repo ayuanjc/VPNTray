@@ -12,10 +12,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import __version__ as _APP_VER
-from . import disguise, dnsguard
+from . import aiops, disguise, dnsguard
 from .paths import ROOT, asset
 from .purity import FLAG_CC
 
@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "2.5.8"
+UI_VER = "2.5.9"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -211,8 +211,13 @@ def build_state(app) -> dict[str, Any]:
         "delay_error": str(st.get("delay_error") or ""),
         "progress": st.get("progress") or {},
         "ai": app.ai_status(),
-        # Steam / GitHub 场景组：组名、当前出口、成员数，前端直接渲染
+        # 场景模块：组名、当前出口、成员数，前端直接渲染（2.5.9 起是数据驱动的，
+        # 用户自己加的场景也会出现在这里，字段只增不减）
         "scenes": app.scenes_status(),
+        # 模块清单（轻量版，给「模块」卡片和编辑入口用）
+        "modules": app.modules_status(),
+        # AI 接口：开关 / 权限级别 / token（本机回环，token 给用户复制用）
+        "ai_api": aiops.state(app),
         # GitHub 特化：最近一次自检结果 + git 全局代理当前指向
         "github": st.get("github") or {},
         "gh_busy": bool(st.get("gh_busy") or getattr(app, "_github_busy", False)),
@@ -545,6 +550,53 @@ class WebUI:
             ok, path = disguise.make_launcher(cc, tool, port)
             return {"ok": ok, "path": path, "cc": cc, "message": "" if ok else path}
 
+        def module_get(body):
+            key = str((body or {}).get("key") or "").strip().lower()
+            mod = app.module_get(key)
+            if not mod:
+                return {"ok": False, "error": "未知模块：" + key}
+            return {"ok": True, "module": mod}
+
+        def module_save(body):
+            """新建 / 覆盖模块。面板的编辑框和 AI 接口走的是同一个实现。"""
+            b = body or {}
+            mod = b.get("module") if isinstance(b.get("module"), dict) else b
+            ok, err = app.module_save(mod)
+            return {"ok": ok, "error": err, "modules": app.modules_status()}
+
+        def module_delete(body):
+            ok, err = app.module_delete(str((body or {}).get("key") or ""))
+            return {"ok": ok, "error": err, "modules": app.modules_status()}
+
+        def module_reset(_body):
+            ok, err = app.module_reset()
+            return {"ok": ok, "error": err, "modules": app.modules_status()}
+
+        def module_import(body):
+            b = body or {}
+            payload = b.get("modules") if "modules" in b else b.get("json")
+            ok, err = app.module_import(payload)
+            return {"ok": ok, "error": "" if ok else err, "note": err if ok else "",
+                    "modules": app.modules_status()}
+
+        def module_export(_body):
+            return {"ok": True, "export": app.module_export()}
+
+        def ai_api(body):
+            """AI 接口本身的管理：开关 / 权限上限 / 重置 token。"""
+            b = body or {}
+            s = app.settings
+            if "enabled" in b:
+                s[aiops.ENABLED_KEY] = bool(b.get("enabled"))
+            if "level" in b:
+                lv = str(b.get("level") or "").strip().lower()
+                if lv in aiops.LEVELS:
+                    s[aiops.LEVEL_KEY] = lv
+            if b.get("regen"):
+                s[aiops.TOKEN_KEY] = ""
+            s.save()
+            return {"ok": True, "ai_api": aiops.state(app)}
+
         def ai_probe(_):
             st = app.ai_status()
             node = st.get("node")
@@ -565,6 +617,13 @@ class WebUI:
             "/api/ai/restore_tz": ai_restore_tz,
             "/api/ai/launcher": ai_launcher,
             "/api/ai/probe": ai_probe,
+            "/api/ai/api": ai_api,
+            "/api/module/get": module_get,
+            "/api/module/save": module_save,
+            "/api/module/delete": module_delete,
+            "/api/module/reset": module_reset,
+            "/api/module/import": module_import,
+            "/api/module/export": module_export,
         }
 
     # ── 杂项：拓扑 / 内核 / 连接 / 更新 / 冲突清理 / 反馈 ──
@@ -780,6 +839,15 @@ class WebUI:
                 if not self._host_ok():
                     return self._json({"ok": False, "error": "bad host"}, 403)
                 path = urlparse(self.path).path
+                # AI 接口：给本机 AI 客户端自解释用的清单（需 token）
+                if path.startswith("/ai/v1/"):
+                    q = parse_qs(urlparse(self.path).query)
+                    ok, err = aiops.auth(webui.app, self.headers, (q.get("token") or [""])[0])
+                    if not ok:
+                        return self._json({"ok": False, "error": err}, 401)
+                    if path == "/ai/v1/manifest":
+                        return self._json(aiops.manifest(webui.app))
+                    return self._json({"ok": False, "error": "unknown ai endpoint"}, 404)
                 if path in ("/", "/index.html"):
                     try:
                         html = webui._index.read_bytes()
@@ -829,6 +897,15 @@ class WebUI:
                     return self._json({"ok": False, "error": "bad json"}, 400)
                 if not isinstance(body, dict):
                     return self._json({"ok": False, "error": "body must be object"}, 400)
+                # AI 调用：{tool, args} 一股脑交给 aiops（权限/参数校验都在里面）
+                if path == "/ai/v1/call":
+                    q = parse_qs(urlparse(self.path).query)
+                    ok, err = aiops.auth(webui.app, self.headers, (q.get("token") or [""])[0])
+                    if not ok:
+                        return self._json({"ok": False, "error": err}, 401)
+                    return self._json(aiops.call(webui.app,
+                                                 str(body.get("tool") or ""),
+                                                 body.get("args")))
                 fn = webui._table().get(path)
                 if not fn:
                     return self._json({"ok": False, "error": "unknown endpoint"}, 404)

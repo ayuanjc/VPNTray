@@ -169,7 +169,9 @@ class _StubApp:
 def test_webui_routes_cached():
     w = webui.WebUI(_StubApp(), on_quit=None)
     assert w._table() is w._table()
-    assert len(w._table()) == 41
+    # 2.5.9 起了 7 条新路由（/api/ai/api + /api/module/*），所以不写死总数，
+    # 只守住「表是缓存的、而且不是空的」这件事
+    assert len(w._table()) >= 41
     assert "github/check" in " ".join(w._table())
 
 
