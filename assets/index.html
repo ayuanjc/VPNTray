@@ -714,7 +714,7 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
 </div>
 
 <script>
-var UI_VER = '3.0.0';
+var UI_VER = '3.0.1';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 var sig = {};
 var S = null;
@@ -1431,7 +1431,12 @@ function renderSettings() {
       + '<div class="acts" style="margin-top:10px"><button class="btn primary" data-act="update-apply">下载并安装</button>'
       + '<button class="btn" data-act="update-page">查看说明</button></div>'
       + (u.notes ? '<div class="dim" style="margin-top:10px;max-height:110px;overflow:auto;white-space:pre-wrap">' + esc(String(u.notes).slice(0, 900)) + '</div>' : '');
-  } else if (u.error) h = '检查更新失败：' + esc(u.error);
+  } else if (u.error) {
+    h = '检查更新失败：' + esc(u.error);
+    h += '<div class="dim" style="margin-top:8px">更新仓库写成 owner/name（例如 ' + esc(S.update_repo || 'ayuanjc/VPNTray') + '），留空就是关掉检查。</div>'
+       + '<div class="acts" style="margin-top:10px"><input class="txt" id="updRepo" placeholder="' + esc(S.update_repo || 'owner/name') + '" value="' + esc(S.update_repo || '') + '" style="flex:1;min-width:180px" autocomplete="off" spellcheck="false">'
+       + '<button class="btn primary" data-act="update-fixrepo">保存并重查</button></div>';
+  }
   else if (u.ok) h = '已是最新版本 v' + esc(u.latest || S.ver) + (u.checked_at ? ' · ' + ago(u.checked_at) + '检查' : '');
   else h = '尚未检查更新';
   patch('#upd', h);
@@ -1593,6 +1598,12 @@ document.addEventListener('click', async function (e) {
   } else if (a === 'update-page') {
     var u = S.update || {};
     if (u.page) window.open(u.page, '_blank');
+  } else if (a === 'update-fixrepo') {
+    var inp = $('#updRepo');
+    var repo = (inp && inp.value.trim()) || S.update_repo || 'ayuanjc/VPNTray';
+    var rr = await run('/api/update/repo', { repo: repo }, '仓库已保存，正在检查');
+    if (rr && rr.ok) { S.update_repo = rr.repo; S.update = (rr.check ? Object.assign({}, rr.check, { checked_at: Date.now() / 1000 }) : {}); renderSettings(); }
+    else if (rr && rr.error) toast(rr.error, 'bad');
   }
 });
 

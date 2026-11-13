@@ -2442,6 +2442,26 @@ class App:
         self._changed()
         return info
 
+    def update_set_repo(self, repo: str) -> dict[str, Any]:
+        """设置页填的更新仓库。写盘后立刻重查一次，用户点一下就能看到结果。"""
+        from . import updater
+
+        ok, cleaned, err = updater.normalize_repo(repo)
+        if not ok:
+            return {"ok": False, "error": err}
+        self.settings["update_repo"] = cleaned
+        try:
+            self.settings.save()
+        except Exception as e:  # noqa: BLE001
+            log.warning("保存 update_repo 失败: %s", e)
+            return {"ok": False, "error": str(e)}
+        with self._lock:
+            self.state["update"] = {}
+        self._changed()
+        log.info("更新仓库已设为 %s", cleaned)
+        info = self.update_check(force=True)
+        return {"ok": True, "repo": cleaned, "check": info}
+
     def update_apply(self) -> dict[str, Any]:
         """下载 → 校验 → 解压 → 交给外部脚本替换，然后自己退出。
 

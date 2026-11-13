@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "3.0.0"
+UI_VER = "3.0.1"
 
 
 def _num(v: Any, default: float = 0.0) -> float:
@@ -697,6 +697,9 @@ class WebUI:
             force = bool((body or {}).get("force"))
             return app.update_check(force=force)
 
+        def update_repo(body):
+            return app.update_set_repo(str((body or {}).get("repo") or ""))
+
         def update_apply(_):
             return app.update_apply()
 
@@ -778,6 +781,7 @@ class WebUI:
             "/api/quit": quit,
             "/api/log": log_tail,
             "/api/update/check": update_check,
+            "/api/update/repo": update_repo,
             "/api/update/apply": update_apply,
             "/api/net/diagnose": net_diagnose,
             "/api/net/repair": net_repair,

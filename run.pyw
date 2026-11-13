@@ -201,6 +201,56 @@ def _open_existing(port: int = 0) -> bool:
     return res.get("r") not in (None, "none")
 
 
+def _other_instances() -> list:
+    """除本进程之外还活着的 VPNTray.exe。
+
+    为什么不能只信互斥体：互斥体只说「有别的进程拿过」，说不清对方是活着，
+    还是正在启动、还没开端口。2026-11-13 部署时就踩了这个 —— 新实例起来时
+    旧实例正在退、端口全关，被判定成「空壳」直接接管，结果两套内核抢 7891，
+    系统代理指向谁全看运气，用户体感就是「网时好时坏」。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    out = []
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == -1:
+            return out
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        me = os.getpid()
+        try:
+            ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                n = (entry.szExeFile or "").lower()
+                if n.startswith("vpntray") and entry.th32ProcessID != me:
+                    out.append(int(entry.th32ProcessID))
+                ok = k32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            k32.CloseHandle(snap)
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
 def _second_instance() -> bool:
     """判断「该不该由本进程接手」：True = 另一个活实例在，本进程退出。
 
@@ -226,7 +276,24 @@ def _second_instance() -> bool:
     if _port_open(7891):
         _msgbox("VPN Tray 已经在运行，但控制台还没起来。\n\n等几秒再点，或到任务管理器结束 VPNTray.exe 后重开。")
         return True
-    _boot("接管：互斥体是空壳（面板与内核都没应答）")
+    others = _other_instances()
+    if others:
+        # 进程还在、端口没开 —— 多半是刚双击、正在读订阅/拉内核。等它，绝不抢。
+        _boot(f"另一个实例还活着 {others}，等待它就绪")
+        for _ in range(20):          # 最多 10 秒
+            time.sleep(0.5)
+            port = _probe_console()
+            if port:
+                if not _open_existing(port):
+                    _msgbox("VPN Tray 已经在运行了。\n\n双击右下角托盘图标（绿色 V）可以打开控制台。")
+                return True
+        _msgbox(
+            "VPN Tray 正在启动（进程还在，端口未就绪）。\n\n"
+            "稍等几秒再双击托盘图标；如果一直起不来，到任务管理器结束 "
+            "VPNTray.exe 后重开。"
+        )
+        return True
+    _boot("接管：互斥体是空壳（面板、内核、进程都没了）")
     try:
         from vpntray import logger as _lg2  # noqa: PLC0415
         from vpntray import paths as _p2  # noqa: PLC0415

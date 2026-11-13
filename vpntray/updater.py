@@ -39,6 +39,37 @@ ALLOWED_HOSTS = {"github.com", "api.github.com", "objects.githubusercontent.com"
 MAX_ZIP_BYTES = 300 * 1024 * 1024     # 发布包 70MB 上下，留足余量
 MAX_JSON_BYTES = 4 * 1024 * 1024
 
+# owner/name 只允许 GitHub 的合法字符，禁止斜杠以外的路径、空格、协议头。
+# 用户从设置页手填时最容易写成 https://github.com/owner/name 或 owner/name/ ，
+# 这里统一削掉，免得检查更新直接报 404 让人以为「功能坏了」。
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}$")
+
+
+def normalize_repo(raw: Any) -> tuple[bool, str, str]:
+    """把用户填的仓库串收敛成 owner/name。返回 (ok, cleaned, error)。"""
+    s = str(raw or "").strip()
+    if not s:
+        return False, "", "仓库为空（留空=不检查更新）"
+    s = s.replace("\\", "/")
+    low = s.lower()
+    for pre in ("https://", "http://"):
+        if low.startswith(pre):
+            s = s[len(pre):]
+            low = s.lower()
+            break
+    if low.startswith("github.com/"):
+        s = s[len("github.com/"):]
+    s = s.strip("/")
+    if s.lower().endswith(".git"):
+        s = s[:-4]
+    parts = [p for p in s.split("/") if p]
+    if len(parts) < 2:
+        return False, s, "要写成 owner/name，例如 ayuanjc/VPNTray"
+    s = parts[0] + "/" + parts[1]
+    if not REPO_RE.match(s):
+        return False, s, "owner/name 里有非法字符"
+    return True, s, ""
+
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9._-]{1,100}$")
 # tag 常带后缀：v1.8.0-beta、1.8.0+build7、v2.0.0-rc1。后缀不参与比较，
 # 否则一个 -beta 后缀就能让「有没有新版本」整个判定失效。
