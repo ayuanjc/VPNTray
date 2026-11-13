@@ -956,6 +956,80 @@ INFO app: VPNTray 2.2.2 启动（frozen=True，Python 3.12.10）
 覆盖安装后 `data/` 保留。如果日志里出现「图标文件缺失（打包时漏了 assets）」，说明手上
 那份包不完整 —— 换回官方 zip（`VPNTray-<版本>-win64.zip`）即可。
 
+## 2.5.8：机场订阅把 fake-ip 设成 28.0.0.1/8 —— 半个互联网当场消失
+
+2026-11-13 现场（校园网 ZCST-CMCC）：网页能开但一切都很慢，DSH 的 AI 面板时通时断，
+DNS-Client 事件 1014 刷屏（`dashscope.aliyuncs.com` / `registry.npmjs.org` / `raw.githubusercontent.com` 全中）。
+
+翻到 mihomo 真正吃进去的配置才发现两行脏数据：
+
+```yaml
+dns:
+  fake-ip-range: 28.0.0.1/8     # ← 28.0.0.0/8 是公网段（美国国防部）
+  ipv6: true                    # ← 本机根本没有 IPv6 出口
+```
+
+**28/8 放在 fake-ip 里等于告诉 mihomo「整个 28 网段都是我的虚拟 IP」**：命中该段的真实目标会被
+拉去 fake-ip，解析结果不可信；假 IP 还会跟真实公网地址撞车。而 `dns.ipv6: true` 让每次连接先等
+一次 AAAA 超时。这两项都是**机场订阅下发的**，而 `configgen._dns()` 原来允许订阅直接覆盖。
+
+2.5.8 加的护栏（订阅说什么都不好使，只认下面这两个池）：
+
+| 项 | 规则 |
+|---|---|
+| `dns.fake-ip-range` | 必须是 IPv4、前缀 ≤ /16、且落在 `198.18.0.0/15` 或 `100.64.0.0/10` 里。不合规 → 丢弃订阅值，回退 `198.18.0.1/16`，日志记 WARNING |
+| `dns.ipv6` | 订阅要开，但本机连不上 `2400:3200::1` / `240e:4c:4008::1` 的 53 端口 → 强制 `false` |
+
+实测判定：
+
+```
+28.0.0.1/8     -> None（拒绝）
+198.18.0.1/16  -> 保留
+198.19.0.1/16  -> 保留
+10.0.0.1/8     -> None
+172.16.0.1/12  -> None
+198.18.0.1/24  -> None（前缀太宽）
+bogus          -> None
+```
+
+启动日志里现在能看到：
+
+```
+[WARNING] config: 订阅的 fake-ip-range=28.0.0.1/8 不是保留地址段，改用 198.18.0.1/16（否则整段公网会被当成虚拟 IP）
+[WARNING] config: 订阅开启了 dns.ipv6，但本机没有 IPv6 出口，已关闭（否则每次连接先卡一次 AAAA 超时）
+```
+
+### 顺带查出来的三件事（不进代码，但遇到同类问题照做）
+
+**1. 系统 DNS 别用运营商的。** 移动 `211.136.192.6` / `120.196.165.24` 在这条校园网链路上大量
+超时（事件 1014，单次解析 448ms 起）。换掉：
+
+```powershell
+# 管理员
+Set-DnsClientServerAddress -InterfaceAlias 'WLAN' -ServerAddresses 223.5.5.5,119.29.29.29
+Clear-DnsClientCache
+```
+
+**2. 卸载过 TUN 模式，注册表里可能留着死 DNS。** 特征：`Get-PnpDevice -Class Net` 里有一个
+永远「未连接」的 `Meta Tunnel [SWD\WINTUN\{GUID}]`，而
+`HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{GUID}` 下还写着
+`NameServer=198.18.0.2`。它不参与路由，但会被当成候选解析器 → 每次解析先超时一轮。清理：
+
+```powershell
+# 管理员
+pnputil /remove-device "SWD\WINTUN\{03A3AABE-C890-F9C7-7DA2-DA7B6FF35C15}"
+# 顺带清掉对应接口下的 NameServer 值
+```
+
+**3. 校园网可能根本不广播 5GHz。** 这次扫出来同一 SSID 的 4 个 AP 全在 2.4G（三个 ch6、一个 ch1），
+此时网卡里设「首选 5GHz 频带」等于让驱动白发扫描时间；真正能改善的是
+`吞吐量助推器 = 已启用`、`MIMO 节能模式 = 无 SMPS`（这两项实测把网关抖动从 max 355ms 压到 209ms，
+223.5.5.5 的 12% 丢包降到 0%）。
+
+### 升级方式
+
+覆盖 `VPNTray.exe` 与 `_internal\\`，`data\\` 不用动（订阅、设置、日志都留着）。
+
 ## 2.5.7：AI 面板报 cannot resolve —— 本地 53 端口根本没人服务
 
 2026-11-13 现场：网页、ChatGPT 面板、git 全都正常，只有 DSH 的 AI 请求一片红：

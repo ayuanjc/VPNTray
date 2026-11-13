@@ -8,9 +8,11 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import shutil
+import socket
 from typing import Any
 
 import yaml
@@ -426,6 +428,64 @@ _DNS_KEYS = ("default-nameserver", "nameserver", "proxy-server-nameserver", "enh
              "fake-ip-range", "fake-ip-filter", "ipv6", "use-hosts")
 
 
+_FAKE_IP_POOLS = (
+    ipaddress.ip_network("198.18.0.0/15"),   # RFC 2544 基准测试段，社区约定给 fake-ip
+    ipaddress.ip_network("100.64.0.0/10"),   # 运营商级 NAT 段，家用网段极少落在这里
+)
+
+
+def _valid_fake_ip_range(value: Any) -> str | None:
+    """订阅下发的 fake-ip 池必须是保留段，且不能比 /16 还碎。
+
+    见过真实案例：机场把 fake-ip-range 写成 28.0.0.1/8 —— 那是公网地址段。
+    整段 28.0.0.0/8 被当成虚拟 IP 池后，凡是规则判为 DIRECT 的域名都会拿到一个
+    28.x.x.x 的假地址，然后客户端真的去连 28.x.x.x，表现就是「个别网站莫名其妙
+    打不开」，而换一台机器又正常。这种脏值必须在本地被纠正，不能信任订阅。
+    """
+    try:
+        net = ipaddress.ip_network(str(value), strict=False)
+    except Exception:
+        return None
+    if net.version != 4 or net.prefixlen > 16:
+        return None
+    if not any(net.subnet_of(pool) for pool in _FAKE_IP_POOLS):
+        return None
+    return str(value)
+
+
+_ipv6_ok: bool | None = None
+
+
+def _ipv6_available() -> bool:
+    """本机到底有没有 IPv6 出口。
+
+    dns.ipv6=true 会让 mihomo 返回 AAAA，客户端于是先试 IPv6。没有 IPv6 出口的
+    机器（校园网、部分移动网络）每次连接都要先等一次超时，体感就是「域名解析没问题
+    但打开网页就是慢半拍」。探一次记住结果，探不通就是没有。
+    """
+    global _ipv6_ok
+    if _ipv6_ok is not None:
+        return _ipv6_ok
+    _ipv6_ok = False
+    for host in ("2400:3200::1", "240e:4c:4008::1"):
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            s.settimeout(0.35)
+            s.connect((host, 53))
+            _ipv6_ok = True
+            break
+        except Exception:
+            continue
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    return _ipv6_ok
+
+
 def _dns(sub: dict[str, Any]) -> dict[str, Any]:
     """本地 DNS 基线 + 订阅覆盖。"""
     dns = dict(DEFAULT_DNS)
@@ -433,6 +493,18 @@ def _dns(sub: dict[str, Any]) -> dict[str, Any]:
     for k in _DNS_KEYS:
         if sub_dns.get(k):
             dns[k] = sub_dns[k]
+    # —— 订阅可以覆盖上游，但不能覆盖掉"会不会把机器弄坏"的边界 ——
+    raw_range = dns.get("fake-ip-range")
+    good = _valid_fake_ip_range(raw_range)
+    if good is None:
+        log.warning("订阅的 fake-ip-range=%s 不是保留地址段，改用 %s（否则整段公网会被当成虚拟 IP）",
+                    raw_range, DEFAULT_DNS["fake-ip-range"])
+        dns["fake-ip-range"] = DEFAULT_DNS["fake-ip-range"]
+    else:
+        dns["fake-ip-range"] = good
+    if dns.get("ipv6") and not _ipv6_available():
+        log.warning("订阅开启了 dns.ipv6，但本机没有 IPv6 出口，已关闭（否则每次连接先卡一次 AAAA 超时）")
+        dns["ipv6"] = False
     if not dns.get("fake-ip-filter"):
         dns["fake-ip-filter"] = FAKE_IP_FILTER
     # 境外 DoH 在国内网络上会先卡超时，统一交给国内 DNS + fake-ip
