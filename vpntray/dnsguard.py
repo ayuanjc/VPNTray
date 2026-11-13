@@ -331,10 +331,74 @@ class DnsGuard:
 
 
 _guard: DnsGuard | None = None
+_watch_stop = threading.Event()
+_watch_thread: threading.Thread | None = None
+
+
+def watch(interval: float = 20.0, enabled=None) -> None:
+    """隔一会儿看一眼，别让兜底"悄悄死掉"。
+
+    这个模块活在托盘程序里，一跑就是几天。中间可能遇到：被别家软件抢了 53 又放开、
+    自己两个线程意外退出、上游短时全挂。启动时 ensure() 一次是不够的 —— 用户那边表现
+    就是"本来好好的，睡一觉 AI 面板又开始 cannot resolve"。
+
+    规则：没开就不起；端口被别人占着就不抢；自己活着但连查三次都答不出来就重启一遍。
+    """
+    global _watch_thread
+    if _watch_thread is not None and _watch_thread.is_alive():
+        return
+    _watch_stop.clear()
+
+    def on() -> bool:
+        if enabled is None:
+            return True
+        try:
+            return bool(enabled())
+        except Exception:
+            return True
+
+    def loop() -> None:
+        bad = 0
+        while not _watch_stop.wait(interval):
+            try:
+                if not on():
+                    if _guard is not None and _guard.running:
+                        _guard.stop()
+                    bad = 0
+                    continue
+                if _guard is None or not _guard.running:
+                    ensure(port=_guard.port if _guard is not None else DEFAULT_PORT)
+                    bad = 0          # 端口空就起来，被占就写 reason，不吵
+                    continue
+                r = probe(port=_guard.port, timeout=1.0)
+                if r.get("ok"):
+                    bad = 0
+                    continue
+                bad += 1
+                _guard.last_error = str(r.get("error") or "")
+                if bad >= 3:
+                    log.warning("DNS 兜底连续 %d 次探测失败（%s），重启一次", bad, _guard.last_error)
+                    _guard.stop()
+                    time.sleep(0.3)
+                    _guard.start()
+                    bad = 0
+            except Exception:
+                pass
+
+    _watch_thread = threading.Thread(target=loop, name="dnsguard-watch", daemon=True)
+    _watch_thread.start()
+    log.info("DNS 兜底自检已开：每 %.0f 秒一次", interval)
+
+
+def unwatch() -> None:
+    global _watch_thread
+    _watch_stop.set()
+    _watch_thread = None
 
 
 def stop() -> None:
     """退出时把端口还回去。对象留着，下次 ensure() 直接重启同一份统计。"""
+    unwatch()
     if _guard is not None:
         _guard.stop()
 

@@ -208,6 +208,9 @@ class App:
                     log.info("本地 DNS 兜底就绪：127.0.0.1:53（给 Node/c-ares 类程序用）")
                 else:
                     log.info("本地 DNS 兜底跳过：%s", guard.reason)
+                # 起完不算完：托盘一跑就是几天，中间可能被别的软件抢端口又放开、
+                # 自己的收包线程意外退出。交给自检线程每 20 秒看一眼，掉了就拉回来。
+                dnsguard.watch(enabled=lambda: bool(self.settings.get("dns_guard", True)))
             except Exception as e:  # noqa: BLE001
                 log.warning("本地 DNS 兜底启动失败: %s", e)
         self._set(phase="准备配置", busy="启动中")
