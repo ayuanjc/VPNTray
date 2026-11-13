@@ -229,6 +229,14 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
 .empty{padding:40px 8px;text-align:center;color:var(--ink3);font-size:12.5px}
 .prog{height:3px;border-radius:999px;background:var(--surface3);overflow:hidden;margin:0 0 12px}
 .prog i{display:block;height:100%;width:0;border-radius:999px;background:var(--acc);transition:width .25s}
+/* 进度条：放在按钮下面，填充 + 百分比 + 阶段文字。有条理地反映「真的在动」 */
+.pbar{position:relative;display:flex;align-items:center;height:20px;border-radius:999px;background:var(--surface3);overflow:hidden;margin:10px 0 0}
+.pbar[hidden]{display:none}
+.pbar i{position:absolute;top:0;bottom:0;left:0;width:0;border-radius:999px;background:var(--acc);opacity:.26;transition:width .35s cubic-bezier(.3,.8,.3,1)}
+.pbar b{position:relative;z-index:1;padding:0 12px;font:600 11px/1 var(--mono);letter-spacing:.02em;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pbar.run i{opacity:.30}
+.pbar.done i{background:var(--ok);opacity:.34}
+.pbar.done b{color:var(--ok)}
 
 /* ───── 行式列表（场景 / 订阅 / 设置） ───── */
 .rows{display:grid}
@@ -498,6 +506,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
             <button class="btn" id="btnRestart">重启内核</button>
             <button class="btn" id="btnCloseAll">断开全部连接</button>
           </div>
+          <div class="pbar" id="progHome" hidden><i></i><b>0%</b></div>
           <div class="note" id="homeNote"></div>
         </section>
         <section class="card">
@@ -524,7 +533,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
           <button class="btn" id="btnTest2">测速</button>
         </div>
         <div class="chips" id="chips"></div>
-        <div class="prog" id="prog" hidden><i id="progBar"></i></div>
+        <div class="pbar" id="prog" hidden><i id="progBar"></i><b>0%</b></div>
         <div class="lhead"><span class="r">#</span><span></span><span>节点</span><span class="r">纯净</span><span class="r">延迟</span></div>
         <div class="lbody" id="nlist"></div>
         <div class="lfoot" id="nfoot"></div>
@@ -665,6 +674,8 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
               <button class="btn" id="btnLog">刷新日志</button>
               <button class="btn danger" id="btnQuit">退出程序</button>
             </div>
+            <div class="pbar" id="progPurity" hidden><i></i><b>0%</b></div>
+            <div class="pbar" id="progSpeed" hidden><i></i><b>0%</b></div>
             <div class="note" id="ngNote" hidden></div>
           </section>
         </div>
@@ -674,6 +685,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
           <div class="acts">
             <button class="btn" id="btnUpdate">检查更新</button>
           </div>
+          <div class="pbar" id="progUpd" hidden><i></i><b>0%</b></div>
           <div class="note" id="upd"></div>
         </section>
 
@@ -731,7 +743,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '3.0.3';
+var UI_VER = '3.1.0';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1106,7 +1118,7 @@ function renderHome() {
 
   var note = '';
   if (S.delay_error) note = '延迟刷新失败：' + S.delay_error + (S.delay_ts ? '（显示的是 ' + ago(S.delay_ts) + '的结果）' : '');
-  else if (S.progress && S.progress.total) note = '正在执行：' + n(S.progress.done) + ' / ' + n(S.progress.total);
+  else if (S.progress && S.progress.kind) note = '正在执行：' + pctOf(S.progress) + '%' + (S.progress.text ? ' · ' + S.progress.text : '');
   patch('#homeNote', note ? '<span class="' + (S.delay_error ? '' : 'dim') + '">' + esc(note) + '</span>' : '');
 }
 
@@ -1138,6 +1150,49 @@ function pickNodes() {
   else list.sort(byDelay);
   return list;
 }
+/* ───── 进度条 ───── */
+// kind -> 需要同步的进度条 id：同一件事在概览和节点页各有一条，一起动
+var PROG_BARS = { delay: ['progHome', 'prog'], purity: ['progPurity'], speed: ['progSpeed'], update: ['progUpd'] };
+var progPrev = {}, progHide = {};
+function pctOf(p) {
+  var d = n(p && p.done), t = n(p && p.total);
+  if (!t) return 0;
+  return Math.max(0, Math.min(100, Math.round(d * 100 / t)));
+}
+function renderProgs() {
+  if (!S) return;
+  var p = S.progress || {}, kind = p.kind || '', pct = pctOf(p);
+  Object.keys(PROG_BARS).forEach(function (k) {
+    var on = k === kind;
+    PROG_BARS[k].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      var fill = el.querySelector('i'), lab = el.querySelector('b');
+      if (!fill || !lab) return;
+      if (on) {
+        if (progHide[k]) { clearTimeout(progHide[k]); progHide[k] = 0; }
+        el.hidden = false;
+        el.classList.toggle('run', pct < 100);
+        el.classList.toggle('done', pct >= 100);
+        fill.style.width = pct + '%';
+        lab.textContent = pct + '%' + (p.text ? '  ' + p.text : '');
+      } else if (progPrev[k] && !progHide[k]) {
+        // 刚跑完：先停在 100% 一秒再收，免得一闪就没
+        fill.style.width = '100%';
+        el.classList.remove('run');
+        el.classList.add('done');
+        lab.textContent = '100%';
+        progHide[k] = setTimeout(function () {
+          progHide[k] = 0;
+          el.hidden = true;
+          el.classList.remove('done');
+        }, 1200);
+      }
+    });
+    progPrev[k] = on;
+  });
+}
+
 function renderNodes() {
   var list = pickNodes();
   var h = list.map(function (x, i) {
@@ -1168,13 +1223,8 @@ function renderNodes() {
   nh.textContent = S.delay_error ? '延迟刷新失败' : (REG ? '已按地区筛选' : '');
   nh.className = S.delay_error ? 'hint err' : 'hint';
 
-  var p = S.progress || {};
-  var on = !!(S.probing || (p.kind && p.total));
-  $('#prog').hidden = !on;
-  if (on) {
-    var pct = p.total ? Math.min(100, Math.round(100 * n(p.done) / n(p.total))) : 30;
-    $('#progBar').style.width = pct + '%';
-  }
+  var on = !!(S.probing || ((S.progress || {}).kind));
+  renderProgs();
   // 重绘时不能把正在进行中的测速按钮重新点亮，否则连点仍然能并发
   $('#btnTest').disabled = on || !!BUSY.test;
   $('#btnTest2').disabled = on || !!BUSY.test;
@@ -1642,6 +1692,7 @@ function renderView(v) {
 function render() {
   if (!S) return;
   renderTop();
+  renderProgs();   // 进度条跟着任何 view 一起刷新（更新卡在设置页，测速在概览/节点页）
   renderView(VIEW);
 }
 
@@ -1680,9 +1731,13 @@ async function refresh() {
   }
 }
 function pollWait() {
-  if (!pollFails) return POLL_FAST;
-  // 2s → 4s → 8s → 16s → 30s 封顶
-  return Math.min(POLL_MAX, 2000 * Math.pow(2, Math.min(4, pollFails - 1)));
+  if (pollFails) {
+    // 2s → 4s → 8s → 16s → 30s 封顶
+    return Math.min(POLL_MAX, 2000 * Math.pow(2, Math.min(4, pollFails - 1)));
+  }
+  // 有任务在跑（延迟测速 / 纯净度 / 带宽 / 下载更新）：700ms 一轮，百分比才跟得上手
+  if (S && S.progress && S.progress.kind) return 700;
+  return POLL_FAST;
 }
 function loop() {
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }

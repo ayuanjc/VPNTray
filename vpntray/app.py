@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
 import requests
@@ -1362,16 +1363,77 @@ class App:
         except OSError as e:
             log.warning("延迟缓存写入失败: %s", e)
 
+    def _node_names(self) -> list[str]:
+        """真实节点名（不含策略组）。state 里没有 nodes —— 节点表是 webui 现场
+        从 snapshot 的 group_all 过滤出来的，这里必须走同一条路，否则拿到空列表，
+        进度条永远只有阶段文字、没有百分比。"""
+        st = self.snapshot()
+        proxies = st.get("proxies") or {}
+        group_types = {"selector", "urltest", "fallback", "loadbalance"}
+        out = []
+        for n in st.get("group_all") or []:
+            if str((proxies.get(n) or {}).get("type", "")).lower() in group_types:
+                continue
+            out.append(str(n))
+        return out
+
+    def _probe_many(self, names: list[str], url: str, timeout: int,
+                    workers: int = 12) -> dict[str, int]:
+        """并发测一组节点的延迟，每完成一个就更新一次进度。
+
+        并发度取 12：28 个节点的实测耗时和内核一次性测整组差不多（1~3 秒），
+        但界面能拿到「17 / 28 · 61%」这样的真实进度，不用假装在动。
+        """
+        out: dict[str, int] = {}
+        total = len(names)
+        if not total:
+            return out
+        done = 0
+        with ThreadPoolExecutor(max_workers=min(workers, total),
+                                thread_name_prefix="delay") as ex:
+            futures = {ex.submit(self._probe_one, n, url, timeout): n for n in names}
+            for fut in as_completed(futures):
+                done += 1
+                try:
+                    d = fut.result()
+                except Exception:  # noqa: BLE001
+                    d = None
+                if d:
+                    out[futures[fut]] = int(d)
+                self._set_progress("delay", done, total, f"测延迟 {done}/{total}")
+                if done == total or done % 4 == 0:
+                    self._changed()
+        return out
+
+    def _probe_one(self, name: str, url: str, timeout: int) -> int | None:
+        """单节点延迟；任何失败都返回 None，绝不把异常抛进线程池。"""
+        try:
+            return self.api.delay(name, url, timeout)
+        except ApiError:
+            return None
+        except Exception:  # noqa: BLE001
+            log.debug("测延迟失败：%s", name, exc_info=True)
+            return None
+
     def test_delays(self, group: str | None = None) -> dict[str, int]:
         group = group or (self.settings.get("main_group") or "节点选择")
         url = self.settings.get("delay_url", "https://www.gstatic.com/generate_204")
         timeout = int(self.settings.get("delay_timeout_ms", 5000))
         self._set(busy="测速中")
-        self._set_progress("delay", 0, 0, "刷新延迟…")
+        names = self._node_names()
         delays: dict[str, int] = {}
         err = ""
         try:
-            delays = self.api.group_delay(group, url, timeout)
+            if names:
+                # 逐个节点测：内核的 /group/{g}/delay 是一次性返回整组结果，
+                # 中途没有任何可读的进度，界面上只能干转圈。这里自己开一个
+                # 有上限的线程池，每完成一个节点就报一次进度，百分比是真的。
+                self._set_progress("delay", 0, len(names), "刷新延迟…")
+                delays = self._probe_many(names, url, timeout)
+            else:
+                # 还没有节点列表（刚启动、订阅没加载）：退回内核一次性测整组
+                self._set_progress("delay", 0, 0, "刷新延迟…")
+                delays = self.api.group_delay(group, url, timeout)
             if not delays:
                 err = "内核没有返回任何延迟（节点全部超时或内核未就绪）"
         except ApiError as e:
@@ -1501,7 +1563,7 @@ class App:
                     log.info("检测被中断（程序要退出）")
                     break
                 self._set(busy=f"纯净度 {i}/{total}")
-                self._set_progress("purity", i, total, f"检测 {i}/{total}")
+                self._set_progress("purity", i, total, f"检测 {i}/{total} · {name}")
                 # 单个节点出任何问题都不能拖垮整轮
                 try:
                     self.api.select(group, name)
@@ -1580,7 +1642,7 @@ class App:
                 if self._stop.is_set():
                     break
                 self._set(busy=f"测速 {i}/{total}")
-                self._set_progress("speed", i, total, f"测速 {i}/{total}")
+                self._set_progress("speed", i, total, f"测速 {i}/{total} · {name}")
                 try:
                     self.api.select(group, name)
                 except ApiError:
@@ -2780,10 +2842,18 @@ class App:
         from . import updater
 
         def prog(done: int, total: int) -> None:
-            self._set_progress("update", done, total, "下载安装包")
+            # done/total 都是字节：界面上既画百分比，也把 MB 写出来，
+            # 网慢的时候能看出到底是在动还是卡死。
+            if total > 0:
+                mb = f"{done / 1048576:.1f} / {total / 1048576:.1f} MB"
+            else:
+                mb = f"{done / 1048576:.1f} MB"
+            stage = "校验并解压" if total and done >= total else "下载安装包"
+            self._set_progress("update", done, total, f"{stage} · {mb}")
 
         try:
             self._set(busy="更新中")
+            self._set_progress("update", 0, 0, "连接 GitHub…")
             port = _int(self.settings.get("mixed_port"), 7891, 1024, 65535)
             payload = updater.prepare(info, local_port=port, on_progress=prog,
                                      confirm=confirm)

@@ -69,6 +69,19 @@ class FrontendStaticTest(unittest.TestCase):
         self.assertIn("visibilitychange", self.html)
         self.assertIn("POLL_MAX", self.html)
 
+    def test_progress_bars_wired(self) -> None:
+        # 进度条必须挂在按钮下面，且轮询在有任务时提速；
+        # 只写「进度条」不接线的话，界面看起来在动其实永远 0%。
+        for bar in ('id="progHome"', 'id="prog"', 'id="progPurity"', 'id="progSpeed"', 'id="progUpd"'):
+            self.assertIn(bar, self.html, "缺少进度条 " + bar)
+        self.assertIn("function renderProgs()", self.html)
+        self.assertIn("renderProgs();", self.html)
+        self.assertIn("PROG_BARS", self.html)
+        # 有进度时 700ms 一轮，没进度才回 1800ms
+        self.assertIn("if (S && S.progress && S.progress.kind) return 700;", self.html)
+        # 百分比要写进 <b>，不能只靠一条宽度
+        self.assertIn("lab.textContent = pct + '%'", self.html)
+
     def test_no_external_assets(self) -> None:
         refs = re.findall(r'(?:src|href)="([^"]+)"', self.html)
         bad = [u for u in refs if u.startswith(("http://", "https://", "//"))]
