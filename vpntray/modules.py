@@ -66,6 +66,9 @@ RULE_TYPES = {
 }
 
 SEEDED = ".seeded"
+# 已经「提案」过的内置模块 key 清单。老机器升级时新增的出厂模块靠它补种，
+# 又不会把用户删掉的模块复活（删掉了 key 仍在清单里）。
+SEEDED_KEYS = ".seeded-keys"
 _lock = threading.RLock()
 _cache: dict[str, Any] = {"sig": None, "items": []}
 
@@ -468,6 +471,29 @@ def builtins() -> list[dict[str, Any]]:
                 ],
             },
         }),
+        normalize({
+            "key": "ocr-router",
+            "title": "OCR 桥 / 阿里云直连",
+            "desc": "图片先送到本机 8791 换成文字；dashscope 等阿里云 AI 端点直连",
+            "kind": "rule",
+            "builtin": True,
+            "icon": "🔍",
+            "order": 60,
+            # 只插规则不建组：这条链路的重点是「别被代理绕出去」。
+            # 阿里云在国内，走代理反而是绕地球一圈，还容易被风控。
+            "group": {
+                "type": "select",
+                "target": "DIRECT",
+                "probe": "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+            },
+            "match": {"domains": [
+                "dashscope.aliyuncs.com",  # 兼容模式（OpenAI 风格）端点
+                "aliyuncs.com",            # 各类阿里云服务
+                "aliyun.com",
+                "aliyuncs.com.cn",
+                "aliyun-inc.com",
+            ]},
+        }),
     ] + _launcher_builtins()
 
 
@@ -656,6 +682,22 @@ def _launcher_builtins() -> list[dict[str, Any]]:
     return out
 
 
+def _read_mark(path: Path) -> set[str]:
+    """读「已提案过的内置模块」清单。文件不存在/坏了都返回空集合。"""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    return {ln.strip() for ln in text.splitlines() if ln.strip()}
+
+
+def _write_mark(path: Path, keys: set[str]) -> None:
+    try:
+        path.write_text("\n".join(sorted(keys)) + "\n", encoding="utf-8")
+    except OSError as e:
+        log.warning("写内置模块清单失败 %s: %s", path, e)
+
+
 def ensure_builtins(settings: Any = None) -> int:
     """首次运行物化内置模块；带上 settings 里 2.5.8 时代的开关/钉住/偏好。
 
@@ -669,8 +711,13 @@ def ensure_builtins(settings: Any = None) -> int:
         log.warning("模块目录建不出来 %s: %s", d, e)
         return 0
     seeded = d / SEEDED
-    if seeded.exists():
-        return 0
+    mark = d / SEEDED_KEYS
+    # 1.0.0 之前的机器只有 .seeded，没有 key 清单：那时出厂的就 steam/github，
+    # 直接按当时的事实补一份清单，别把它们当成「新模块」再写一遍。
+    done = _read_mark(mark)
+    if seeded.exists() and not done:
+        done = {"steam", "github"}
+        _write_mark(mark, done)
     made = 0
     legacy = {
         "steam": ("steam_enabled", "steam_node", "steam_prefer_regions"),
@@ -678,6 +725,10 @@ def ensure_builtins(settings: Any = None) -> int:
     }
     for mod in builtins():
         k = mod["key"]
+        # 已经播种过、且这个 key 当初就有的：说明用户见过它（可能主动删了），
+        # 不再补。只有「升级后才新增的出厂模块」才走补种。
+        if seeded.exists() and k in done:
+            continue
         if not _path(k).exists():
             if settings is not None:
                 ek, nk, pk = legacy.get(k, ("", "", ""))
@@ -695,6 +746,9 @@ def ensure_builtins(settings: Any = None) -> int:
                 made += 1
             except OSError as e:
                 log.warning("写内置模块 %s 失败: %s", k, e)
+        # 写成功与否都记进清单：用户自己删的不要下次又冒出来。
+        done.add(k)
+    _write_mark(mark, done)
     try:
         seeded.write_text(str(int(time.time())), encoding="utf-8")
     except OSError:

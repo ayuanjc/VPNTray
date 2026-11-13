@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.0.0"
+UI_VER = "1.0.1"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -159,6 +159,17 @@ def _region_of(name: str) -> tuple[str, str, str]:
     return "🌐", "其它", ""
 
 
+def _ocr_state(app) -> dict[str, Any]:
+    """OCR 桥快照。status() 只探一次 /health（1 秒超时），不联网查模型。"""
+    from . import ocrbridge
+    try:
+        st = dict(ocrbridge.status())
+    except Exception as e:  # noqa: BLE001 面板不能因为一个可选组件报错
+        st = {"ok": False, "reason": "%s: %s" % (type(e).__name__, e)}
+    st["enabled"] = bool(app.settings.get("ocr_bridge", True))
+    return st
+
+
 def build_state(app) -> dict[str, Any]:
     st = app.snapshot()
     proxies = st.get("proxies") or {}
@@ -276,6 +287,8 @@ def build_state(app) -> dict[str, Any]:
         "trade": okxguard.status(),
         # 校园网：在线状态 / 认出来的门户 / 上次登录结果（不含密码）
         "campus": app.campus_status(),
+        # OCR 桥：端口在听吗、模型、已转张数。探活用 /health，不是 TCP connect。
+        "ocr": _ocr_state(app),
         "update": st.get("update") or {},
         "update_repo": s.get("update_repo", ""),
         "purity_count": sum(1 for n in nodes if n.get("purity") is not None),
@@ -667,6 +680,40 @@ class WebUI:
         def campus_login(body):
             return app.campus_login_now(str((body or {}).get("portal") or ""))
 
+        def ocr_status(_body):
+            return {"ok": True, "ocr": _ocr_state(app)}
+
+        def ocr_restart(_body):
+            from . import ocrbridge
+            port = int(app.settings.get("ocr_bridge_port", 8791) or 8791)
+            ok, msg = ocrbridge.restart(dir=app.settings.get("ocr_bridge_dir") or None, port=port)
+            return {"ok": bool(ok), "message": msg, "ocr": _ocr_state(app)}
+
+        def ocr_config(body):
+            """开关 OCR 桥守护。只写 settings，不重建配置（这条链路与代理无关）。"""
+            from . import ocrbridge
+            b = body or {}
+            on = _flag(b.get("enabled"), "enabled")
+            app.settings["ocr_bridge"] = on
+            try:
+                app.settings.save()
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": "保存失败：%s" % e}
+            port = int(app.settings.get("ocr_bridge_port", 8791) or 8791)
+            msg = ""
+            if on:
+                ok, msg = ocrbridge.ensure(dir=app.settings.get("ocr_bridge_dir") or None, port=port)
+                if not ok:
+                    msg = "守护已开，但这次没拉起：%s" % msg
+                else:
+                    ocrbridge.watch(interval=int(app.settings.get("ocr_bridge_interval", 30) or 30),
+                                    dir=app.settings.get("ocr_bridge_dir") or None, port=port,
+                                    enabled=lambda: bool(app.settings.get("ocr_bridge", True)))
+            else:
+                ocrbridge.stop()
+                msg = "守护已关，正在跑的 node 不动（识别任务不会被你打断）"
+            return {"ok": True, "message": msg, "ocr": _ocr_state(app)}
+
         def campus_detect(_body):
             """只探测不改配置：给「认一下门户」按钮用。"""
             info = campus.discover()
@@ -700,6 +747,9 @@ class WebUI:
             "/api/campus/save": campus_save,
             "/api/campus/login": campus_login,
             "/api/campus/detect": campus_detect,
+            "/api/ocr/status": ocr_status,
+            "/api/ocr/restart": ocr_restart,
+            "/api/ocr/config": ocr_config,
         }
 
     # ── 杂项：拓扑 / 内核 / 连接 / 更新 / 冲突清理 / 反馈 ──

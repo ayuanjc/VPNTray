@@ -439,6 +439,10 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6.5V3M15 6.5V3M6.5 6.5h11v5a5.5 5.5 0 01-11 0z"/><path d="M12 17v4"/></svg>
         <span class="lbl">扩展</span>
       </button>
+      <button data-view="ai" title="AI">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.6L18.5 9.5 13.9 11.4 12 16l-1.9-4.6L5.5 9.5l4.6-1.9z"/><path d="M18 16.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9z"/></svg>
+        <span class="lbl">AI</span>
+      </button>
       <button data-view="subs" title="订阅">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 14.5a4 4 0 005.7 0l2.8-2.8a4 4 0 10-5.7-5.7L11 7.3"/><path d="M14.5 9.5a4 4 0 00-5.7 0L6 12.3a4 4 0 105.7 5.7l1.3-1.3"/></svg>
         <span class="lbl">订阅</span>
@@ -617,6 +621,13 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
           <div class="note" id="dnsNote"></div>
         </section>
 
+      </div>
+    </section>
+
+
+    <!-- AI：通道出口 / 本机接口 / OCR 桥 -->
+    <section class="view" id="view-ai">
+      <div class="stack">
         <section class="card">
           <h2>AI 通道<span class="hint"><label class="sw" title="Claude Code / Codex 走独立出口"><input type="checkbox" id="aiOn"><i></i></label></span></h2>
           <div id="aiBody"></div>
@@ -637,6 +648,16 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
             <button class="btn" data-act="api-regen">重置 token</button>
           </div>
           <div class="note" id="apiNote"></div>
+        </section>
+
+        <section class="card">
+          <h2>OCR 桥<span class="hint" id="ocrHint"></span></h2>
+          <div class="gwrap" id="ocrPills"></div>
+          <div class="acts" style="margin-top:12px">
+            <button class="btn" data-act="ocr-restart">重启桥</button>
+            <label class="sw" title="托盘内守护：端口没人听就拉起来"><input type="checkbox" id="ocrOn"><i></i></label>
+          </div>
+          <div class="note" id="ocrNote">图片先送到 127.0.0.1:8791 换成文字再转发给模型。它和代理无关：阿里云域名在规则里直连。</div>
         </section>
       </div>
     </section>
@@ -768,7 +789,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.0.0';
+var UI_VER = '1.0.1';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1019,7 +1040,8 @@ var TITLES = {
   home: ['概览', '连接状态与实时流量'],
   nodes: ['节点', '按延迟或地区挑一个出口'],
   scenes: ['场景加速', '一组域名 + 一个出口，可自由增删'],
-  tools: ['扩展', 'AI 接口 · GitHub 链路 · 本机解析'],
+  ai: ['AI', '通道出口 · 本机接口 · OCR 桥'],
+  tools: ['扩展', '断网急救 · 校园网 · GitHub 链路 · 本机解析'],
   subs: ['订阅', '管理与更新订阅链接'],
   settings: ['设置', '运行模式、维护与日志']
 };
@@ -1030,7 +1052,7 @@ function setView(v) {
   VIEW = v;
   LS.set('vpn.view', v);
   var i;
-  var ORDER = ['home', 'nodes', 'scenes', 'tools', 'subs', 'settings'];
+  var ORDER = ['home', 'nodes', 'scenes', 'ai', 'tools', 'subs', 'settings'];
   var dir = '';
   if (prev && ORDER.indexOf(v) > ORDER.indexOf(prev)) dir = 'right';
   else if (prev && ORDER.indexOf(v) < ORDER.indexOf(prev)) dir = 'left';
@@ -1712,6 +1734,46 @@ function renderGithub() {
   patch('#ghNote', note ? '<span class="' + (g.ok === false && !S.gh_busy ? '' : 'dim') + '">' + esc(note) + '</span>' : '');
   $('#ghHint').textContent = S.gh_busy ? '自检中' : (g.ok === false ? '上次有失败' : '');
 }
+/* ───── OCR 桥（图片 -> 文字，端口 8791） ───── */
+var OCR_BUSY = false;
+function renderOcr() {
+  var o = (S && S.ocr) || {};
+  var pills = [];
+  var on = o.enabled !== false;
+  pills.push('<span class="gp ' + (o.ok ? 'ok' : (on ? 'bad' : '')) + '" title="' + esc(o.reason || '') + '">'
+    + (o.ok ? '桥在服务' : (on ? '没起来' : '已关闭')) + '</span>');
+  if (o.port) pills.push('<span class="gp">127.0.0.1:' + esc(o.port) + '</span>');
+  if (o.model) pills.push('<span class="gp">' + esc(o.model) + '</span>');
+  if (o.uptime) pills.push('<span class="gp">运行 ' + esc(ago(o.uptime)) + '</span>');
+  if (n(o.requests)) pills.push('<span class="gp">已转 ' + n(o.requests) + ' 张</span>');
+  if (o.ocrOk || o.ocrFail) pills.push('<span class="gp ' + (o.ocrFail ? '' : 'ok') + '">认字 ' + n(o.ocrOk) + ' / 失败 ' + n(o.ocrFail) + '</span>');
+  if (n(o.cacheHits)) pills.push('<span class="gp">缓存命中 ' + n(o.cacheHits) + '</span>');
+  patch('#ocrPills', pills.join(''));
+  var note = '';
+  if (o.reason) note = o.reason;
+  else if (!on) note = '守护已关：桥不会自动拉起，端口没人听的时候 AI 面板会报连不上 8791。';
+  else if (!o.ok) note = '桥没在听 ' + (o.port || 8791) + '。点「重启桥」；还不行就看目录里有没有 server.mjs。';
+  patch('#ocrNote', esc(note) || ('图片先送到 127.0.0.1:' + (o.port || 8791) + ' 换成文字再转发给模型。它和代理无关：阿里云域名在规则里直连。'));
+  $('#ocrHint').textContent = o.ok ? (o.dir || '') : '';
+  var sw = $('#ocrOn');
+  if (sw && document.activeElement !== sw) sw.checked = on;
+}
+async function ocrRestart() {
+  if (OCR_BUSY) return;
+  OCR_BUSY = true;
+  var b = document.querySelector('[data-act="ocr-restart"]');
+  if (b) { b.disabled = true; b.classList.add('busy'); }
+  try {
+    var r = await api('/api/ocr/restart', {}, { timeout: API_SLOW });
+    if (r && r.ocr) { S.ocr = r.ocr; renderOcr(); }
+    toast(r && r.ok ? ((r && r.message) || '桥已重启') : ((r && (r.message || r.error)) || '重启失败'), r && r.ok ? 'good' : 'bad');
+  } catch (e) {
+    toast('重启失败：' + e, 'bad');
+  } finally {
+    if (b) { b.disabled = false; b.classList.remove('busy'); }
+    OCR_BUSY = false;
+  }
+}
 function renderAI() {
   var a = (S && S.ai) || {};
   var on = !!a.enabled;
@@ -1819,7 +1881,8 @@ function renderView(v) {
   if (v === 'home') renderHome();
   else if (v === 'nodes') { renderChips(); renderNodes(); }
   else if (v === 'scenes') renderScenes();
-  else if (v === 'tools') { renderNetDoc(); renderCampus(); renderGithub(); renderDns(); renderAI(); renderModulesApi(); }
+  else if (v === 'ai') { renderAI(); renderModulesApi(); renderOcr(); }
+  else if (v === 'tools') { renderNetDoc(); renderCampus(); renderGithub(); renderDns(); }
   else if (v === 'subs') renderSubs();
   else if (v === 'settings') renderSettings();
 }
@@ -2058,6 +2121,7 @@ document.addEventListener('click', function (e) {
   else if (a === 'cp-save') cpSave();
   else if (a === 'cp-detect') cpDetect();
   else if (a === 'cp-login') cpLogin();
+  else if (a === 'ocr-restart') ocrRestart();
 });
 
 $('#modYes').addEventListener('click', function () { modSave(); });
@@ -2098,6 +2162,19 @@ document.addEventListener('change', async function (e) {
     var r2 = await api('/api/scene/toggle', { key: son.dataset.sceneOn, on: son.checked });
     if (r2.ok === false) toast(r2.error || '设置失败', 'bad'); else toast(son.checked ? '已启用' : '已关闭', 'good');
     setTimeout(refresh, 900);
+    return;
+  }
+  if (t.id === 'ocrOn') {
+    // OCR 桥的开关和别的开关一样立刻落盘，否则重启后又是「我明明开过」
+    var ro4 = await api('/api/ocr/config', { enabled: t.checked }, { timeout: API_SLOW });
+    if (!ro4 || ro4.ok === false) {
+      toast((ro4 && ro4.error) || '保存失败', 'bad');
+      t.checked = !t.checked;
+      return;
+    }
+    if (ro4.ocr) S.ocr = ro4.ocr;
+    renderOcr();
+    toast((ro4 && ro4.message) || (t.checked ? 'OCR 桥守护已开' : 'OCR 桥守护已关'), 'good');
     return;
   }
   if (t.id === 'cpOn') {

@@ -201,7 +201,14 @@ def test_builtins_seed_once():
         assert keys == seeded
         # 出厂必须带齐：两个老场景 + Xbox + 八家启动器
         assert {"steam", "github", "xbox", "epic", "battlenet", "ea",
-                "ubisoft", "gog", "riot", "rockstar", "playstation"} <= keys
+                "ubisoft", "gog", "riot", "rockstar", "playstation",
+                "ocr-router"} <= keys
+        # OCR 路由是「只插规则不建组」的样板：目标必须是直连，否则阿里云
+        # 那几步会被绕到境外节点，识别一次卡十几秒。
+        ocr = modules.load("ocr-router")
+        assert ocr["kind"] == "rule"
+        assert ocr["group"]["target"] == "DIRECT"
+        assert "dashscope.aliyuncs.com" in ocr["match"]["domains"]
         # 每个启动器都要有域名、有组、能通过 validate
         for m in modules.load_all():
             errs = modules.validate(m)
@@ -528,3 +535,28 @@ if __name__ == "__main__":
             traceback.print_exc()
     print("失败 %d 个" % bad if bad else "全部通过")
     sys.exit(1 if bad else 0)
+
+def test_new_builtin_backfilled_on_upgrade():
+    """老机器（只有 .seeded，没有 key 清单）升级后要补上新增的出厂模块，
+    但用户删掉的老模块不能复活。"""
+    with sandbox() as d:
+        # 造一台「1.0.0 之前」的机器：只物化了 steam/github
+        (d / ".seeded").write_text("1", encoding="utf-8")
+        for key in ("steam", "github"):
+            modules.save({**_mod(key=key, title=key.title()), "builtin": True})
+        assert modules.ensure_builtins() >= 1
+        keys = {m["key"] for m in modules.load_all()}
+        assert "ocr-router" in keys
+        # 清单落盘之后，删掉就不该再被补回来
+        modules.remove("ocr-router")
+        assert modules.ensure_builtins() == 0
+        assert modules.load("ocr-router") is None
+
+
+def test_seeded_keys_file_written():
+    with sandbox() as d:
+        modules.ensure_builtins()
+        mark = d / modules.SEEDED_KEYS
+        assert mark.is_file()
+        written = set(mark.read_text(encoding="utf-8").split())
+        assert {m["key"] for m in modules.builtins()} <= written

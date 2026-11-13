@@ -37,7 +37,9 @@
 | 断网急救 | 13 项逐项体检 + 13 个就地修复动作 + 可复制的纯文本报告 |
 | 交易通道监控 | 出口 IP / OKX REST 延迟 / 行情 WS / 交易域名是否被投毒，异常直接弹托盘通知 |
 | 校园网自动登录 | 自动认门户（Dr.COM / 深澜 / ePortal / 通用表单 / 自定义），掉线自动重登，登完把系统代理接回来 |
+| AI 页 | 独立一级界面：AI 通道 + AI 接口 + OCR 桥，一眼看到「AI 这条路通不通」 |
 | AI 接口 | `/ai/v1` 双端点，40 个工具，三级权限，让 AI 直接读状态、改配置、跑动作 |
+| OCR 桥 | 托盘内守护 `127.0.0.1:8791`：端口没人听就拉起，掉线自动补；阿里云 AI 端点规则直连 |
 
 端口：混合代理 `7891`、内核 API `9091`、控制台 `7892`、本机 DNS `127.0.0.1:53`（可选），
 全部只监听 `127.0.0.1`。特意避开常见客户端用的 `7890 / 7897`，可以和别的代理软件共存。
@@ -146,8 +148,8 @@ VPN 标记 −22、落地国家与节点标称不符 −18、爬虫库 −15、�
 | **GitHub 链路** | 五项链路自检（DNS / TCP / TLS / 响应 / 实际拉取），失败可自动把出口切到能连上的节点 |
 | **本机解析** | 拉起 `127.0.0.1:53` 的本地 DNS 兜底，专门伺候 Node / c-ares 这类绕过系统代理的程序 |
 | **校园网** | 认门户、存学号密码、掉线自动重登（1.0.0 新增），见 [3.5.1](#351-校园网) |
-| **AI 通道** | AI 专用出口组的当前节点、出口 IP、时区对齐、启动器 |
-| **AI 接口** | token、权限级别、工具清单，见 [第 5 章](#5-ai-接口) |
+
+AI 那两块（AI 通道 / AI 接口）从 1.0.1 起搬到独立的一级页面，见 [3.5.2](#352-ai-页ai-通道--ai-接口--ocr-桥)。
 
 #### 3.5.1 校园网
 
@@ -161,6 +163,29 @@ VPN 标记 −22、落地国家与节点标称不符 −18、爬虫库 −15、�
 认不出的门户（各校自研系统）用「自定义」：填认证页地址，模板里写 `{user}` `{pass}` `{ip}` `{mac}` `{portal}`，程序把你的值替换进去直接发请求。要验证码的门户只提示、不硬刷，避免把账号刷锁定。
 
 配置存在 `settings.json`：`campus_enabled`、`campus_provider`、`campus_user`、`campus_pass`（DPAPI 封装）、`campus_portal`、`campus_template`、`campus_interval`、`campus_auto_open`。
+
+#### 3.5.2 AI 页：AI 通道 / AI 接口 / OCR 桥
+
+左栏「AI」是 1.0.1 新开的一级页面。以前这三块塞在「扩展」页最下面，出事的时候正好是最想看一眼的那三块，却要先滚到底。
+
+| 卡片 | 看什么 |
+|---|---|
+| **AI 通道** | AI 专用出口组现在挂哪个节点、出口 IP 落在哪个国家、时区是否对齐、要不要拉启动器 |
+| **AI 接口** | token（默认打码，点「复制」才显形）、权限级别（read / write / full）、40 个工具、接口地址 |
+| **OCR 桥** | `127.0.0.1:8791` 在不在听、模型名、已转张数、认字成功/失败、缓存命中；「重启桥」= 按端口结束 node 再拉起；右边开关控制托盘内的守护 |
+
+![AI 页](assets/screenshot-ai.png)
+
+OCR 桥为什么归 VPNTray 管：把图片交给模型之前，DSH 会先送到本机 8791 换成文字。那个端口后面是一个 node 进程（`ocr-router/server.mjs`），它没在听的时候，模型调用直接 `ECONNREFUSED`，界面上看起来就是「模型不可用」或者一直转圈 —— 用户的第一反应永远是去重连节点。托盘程序本来就常驻，所以顺手把它看住：
+
+- 探活走 `GET /health`（1 秒超时），**不用 TCP connect** —— 端口被别的程序占着时 connect 一样成功，那是最容易误判成「活着」的假象。
+- 只拉起目录里**确实有 `server.mjs`** 的地方（`settings.ocr_bridge_dir` 可指定，默认 `E:\Desktop\AI\wechat\ocr-router`），不猜命令。
+- 「重启桥」只杀**确实监听这个端口的 `node.exe`**；占用者是别的程序（比如你自己起的服务）时拒绝动手，并把进程名报出来。
+- 退出 VPNTray **不杀 node**：OCR 桥和托盘生命周期解耦，重启托盘不该打断正在跑的识别任务。所以「关掉开关」也只是停自检，不杀进程。
+- 这条链路与代理无关：`ocr-router` 模块把 `dashscope.aliyuncs.com` 等阿里云域名写死 `DIRECT`，**内核全挂的时候它照样能用**。
+
+相关设置：`ocr_bridge`（默认 true）、`ocr_bridge_dir`、`ocr_bridge_port`（8791）、`ocr_bridge_interval`（30 秒）。HTTP 端点：`/api/ocr/status`、`/api/ocr/restart`、`/api/ocr/config`；状态在 `/api/state` 的 `state.ocr`。
+
 ### 3.6 设置
 
 运行模式（规则 / 全局 / 直连）、开机自启、系统代理开关、日志级别、检查更新、
@@ -348,6 +373,11 @@ VPNTray/
 | `ai_api_level` | `full` | AI 权限上限 `read` / `write` / `full` |
 | `ai_api_token` | 自动生成 | AI 接口 token（32 位，重置会换新） |
 | `auto_update` / `update_repo` | `true` / `ayuanjc/VPNTray` | 更新检查 |
+| `ocr_bridge` | `true` | 托盘内守护 OCR 桥（端口没人听就拉起） |
+| `ocr_bridge_port` / `ocr_bridge_dir` | `8791` / 空 | 桥的端口与目录（空 = 自动找 `server.mjs`） |
+| `ocr_bridge_interval` | `30` | 自检间隔（秒，最小 10） |
+| `campus_enabled` / `campus_provider` | `false` / `auto` | 校园网守护与门户类型 |
+| `campus_interval` | `30` | 校园网探测间隔（15~600 秒） |
 
 > `steam_*` / `github_*` 等场景键在 2.5.9 起废弃，只在首次把老配置迁移成
 > `data/modules/*.json` 时读一次；之后一切以模块文件为准。
@@ -442,6 +472,19 @@ python -m pytest tests -q           # 单元测试
 
 ## 11. 更新日志
 
+### 1.0.1 — AI 相关功能独立成页 + OCR 桥进出厂
+
+**左栏多了「AI」**：AI 通道、AI 接口、OCR 桥搬到一起，成为一级页面。「扩展」页只剩断网急救、校园网、GitHub 链路、本机解析四件——都是「别的东西坏了」的时候才来的，不再和 AI 混在一起。
+
+**OCR 桥卡片（新）**：`127.0.0.1:8791` 活着没有、模型名、已转张数、认字成功/失败、缓存命中，一眼看完。「重启桥」按端口找到真正在监听的 `node.exe` 结束再拉起——占用者不是 node（你自己起的服务）时拒绝动手并报进程名。右边开关控制托盘内守护：开了端口没人听就自动拉起，掉线自动补；关了只停自检，**不杀正在跑的 node**。
+
+**`ocr-router` 变成出厂模块**：`OCR 桥 / 阿里云直连`，`kind: rule`，把 `dashscope.aliyuncs.com`、`aliyuncs.com`、`aliyun.com`、`aliyuncs.com.cn`、`aliyun-inc.com` 直连。换机器装完就有，不用手工建。
+
+**播种逻辑改成「缺失即补」**：以前只有 `.seeded` 一个门闩，播过种的老机器永远不会拿到新增的出厂模块。现在多一份 `.seeded-keys` 清单——清单里没有的 key 才补，用户自己删掉的（清单里有）不复活。
+
+**后端**：新增 `/api/ocr/status`、`/api/ocr/restart`、`/api/ocr/config`；`/api/state` 带 `state.ocr`；`ocrbridge` 新增 `kill(port)` / `restart(port)`（`netstat -ano` 找 LISTENING 的 PID，`tasklist` 确认是 node 才 `taskkill /F`）。
+
+测试 257 例（新增 OCR 桥 15 例：端口反查、拒绝误杀、kill→start 顺序、真实 node 才动手、status 补 dir/pid、三条路由注册）。
 ### 1.0.0 — 版本号重编 + 校园网自动登录
 
 **版本号从这里重编**：3.3.0 之后直接接 1.0.0。原因很直白 —— 一路上每次都是「再修一点」就加个次版本，数字越堆越高，跟成熟度已经没关系了。历史标签（v2.5.8 … v3.3.0）原样保留在 GitHub 上；从这一版起按新线走 1.x。检查更新遇到「远端标签比本机小」会多说一句原由，不会假装「已是最新」。

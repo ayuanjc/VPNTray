@@ -93,9 +93,20 @@ def health(port: int = DEFAULT_PORT) -> tuple[bool, str]:
 def status() -> dict[str, Any]:
     with _lock:
         out = dict(_state)
-    ok, why = health(int(out.get("port") or DEFAULT_PORT))
+    port = int(out.get("port") or DEFAULT_PORT)
+    ok, why = health(port)
     out["ok"] = ok
     out["reason"] = why or "正常"
+    # 端口已经有人服务时 _state.dir 还是空的（不是本进程拉起来的），
+    # 面板要显示「桥在哪」，这里补一个猜测值；pid 从端口反查，省得记句柄。
+    if ok:
+        if not out.get("dir"):
+            out["dir"] = str(_resolve_dir(None))
+        out["pid"] = _pid_on_port(port)
+        # health 返回的第二个值就是模型名（如 qwen3.5-ocr），面板直接显示它，
+        # 免得用户为了确认「是不是那个模型」去翻 stdout.log。
+        if why:
+            out["model"] = why
     out["checked_at"] = time.time()
     with _lock:
         _state.update({"ok": ok, "reason": out["reason"], "checked_at": out["checked_at"]})
@@ -221,6 +232,88 @@ def stop() -> None:
     with _lock:
         global _watch
         _watch = None
+
+
+def _pid_on_port(port: int) -> int:
+    """谁在 LISTEN 这个端口。只认 LISTENING 行，返回第一行的 PID（0=没有）。"""
+    try:
+        cp = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                            capture_output=True, timeout=10,
+                            creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
+    except Exception:  # noqa: BLE001
+        return 0
+    text = (cp.stdout or b"").decode("gbk", "replace")
+    want = ":%d" % int(port)
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        local, state, pid = parts[1], parts[3].upper(), parts[4]
+        if state != "LISTENING" or not local.endswith(want):
+            continue
+        try:
+            return int(pid)
+        except ValueError:
+            continue
+    return 0
+
+
+def _image_of(pid: int) -> str:
+    """进程映象名。拿不到就返回空串。"""
+    if pid <= 0:
+        return ""
+    try:
+        cp = subprocess.run(["tasklist", "/FI", "PID eq %d" % int(pid), "/FO", "CSV", "/NH"],
+                            capture_output=True, timeout=10,
+                            creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
+    except Exception:  # noqa: BLE001
+        return ""
+    text = (cp.stdout or b"").decode("gbk", "replace").strip()
+    if not text or text.startswith("信息") or "INFO:" in text.upper():
+        return ""
+    first = text.splitlines()[0]
+    name = first.split(",")[0].strip()
+    return str(name).strip(chr(34) + " ").lower()
+
+
+def kill(port: int = DEFAULT_PORT) -> tuple[bool, str]:
+    """按端口结束监听进程。只杀确实监听这个端口的 node.exe，不做通配。
+
+    为什么要挑进程名：8791 有可能被别的程序占着（用户自己起的服务），
+    按端口无脑 taskkill 会把别人的东西干掉。这里宁可失败也不误杀。
+    """
+    port = int(port or DEFAULT_PORT)
+    pid = _pid_on_port(port)
+    if not pid:
+        return False, "端口 %d 上没有监听进程" % port
+    if pid == os.getpid():
+        return False, "端口 %d 是 VPNTray 自己占的，不动" % port
+    name = _image_of(pid)
+    if name and name not in ("node.exe", "node"):
+        return False, "端口 %d 被 %s（pid %d）占着，不是 OCR 桥，不动它" % (port, name, pid)
+    try:
+        cp = subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                            capture_output=True, timeout=15,
+                            creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
+    except Exception as e:  # noqa: BLE001
+        return False, "结束进程失败：%s: %s" % (type(e).__name__, e)
+    if cp.returncode != 0:
+        tail = (cp.stderr or cp.stdout or b"").decode("gbk", "replace").strip()
+        return False, "taskkill 返回 %s：%s" % (cp.returncode, tail[:150])
+    log.info("OCR 桥已结束（pid %s，端口 %s）", pid, port)
+    return True, "已结束 pid %s" % pid
+
+
+def restart(*, dir: Any = None, port: int = DEFAULT_PORT) -> tuple[bool, str]:
+    """先按端口杀，再拉起。stop() 不杀 node，所以这里必须自己动手。"""
+    port = int(port or DEFAULT_PORT)
+    killed, why = kill(port)
+    if killed:
+        time.sleep(0.5)
+    ok, msg = start(dir=dir, port=port)
+    if ok:
+        return True, ("已重启（%s）" % why) if killed else "已拉起"
+    return False, ("重启失败：%s；%s" % (why, msg)) if killed else msg
 
 
 def ensure(*, dir: Any = None, port: int = DEFAULT_PORT) -> tuple[bool, str]:
