@@ -572,6 +572,8 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
             <button class="btn" data-act="dg-deep" title="多探几轮：DNS 分路、逐跳、TLS 都看">深度诊断</button>
             <button class="btn" data-act="dg-events">最近事件</button>
       <button class="btn" data-act="dg-export" title="把结论、证据、事件与详细视图打成一个 zip，拿去别的机器复盘">导出诊断包</button>
+            <button class="btn" data-act="dg-clock" title="证书报错时先看这里：本机时间与服务器差多少秒">对一下时间</button>
+            <button class="btn" data-act="dg-etw" title="抓 10 秒 DNS / TCPIP 事件（需要管理员）">抓 10 秒事件</button>
           </div>
           <div class="zlabel">只有一个网站不通？填主机名，看它的 DNS 分路和逐跳</div>
           <div class="cprow">
@@ -830,7 +832,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.2.0';
+var UI_VER = '1.2.1';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1920,7 +1922,7 @@ function renderSettings() {
 }
 
 /* ───── 诊断内核（yuans_nd）：结论 + 证据 + 动作 ───── */
-var DG = { report: null, events: null, detail: null, run: null, actions: [], busy: false };
+var DG = { report: null, events: null, detail: null, run: null, clock: null, etw: null, actions: [], busy: false };
 var DG_SEV = { critical: 'bad', high: 'bad', medium: 'warn', low: 'info', info: 'info' };
 var DG_VERDICT = { healthy: '正常', degraded: '能用，但有隐患', broken: '坏了', unknown: '证据不足' };
 var DG_FAIL = {
@@ -2014,6 +2016,41 @@ function renderDoctor() {
         + '<span class="t">刚才执行了 ' + esc(dgActTitle(run.act_id)) + '</span>'
         + '<span class="b">' + esc(run.ok ? '成功' : '失败') + '，撤销窗口到 ' + esc(run.undo_until) + '</span>'
         + '<button class="btn" data-act="dg-undo" data-r="' + esc(run.run_id) + '">撤销</button></div></div>');
+    }
+  }
+  if (DG.clock) {
+    var ck = DG.clock || {};
+    var sk = n(ck.skew_s, 0);
+    var bad2 = ck.ok === false;
+    var warn2 = !bad2 && n(ck.warn, 0);
+    var lv2 = (bad2 || warn2) ? 'warn' : 'ok';
+    var t2 = bad2 ? ('没取到服务器时间' + (ck.error ? '：' + ck.error : ''))
+      : (sk === 0 ? '本机时间与服务器一致' : (sk > 0 ? '本机比服务器慢 ' + sk + ' 秒' : '本机比服务器快 ' + (-sk) + ' 秒'));
+    var b2 = warn2 ? '偏差超过 5 分钟：证书类结论已按 0.6 折可信度，先把系统时间同步再查'
+      : (ck.server ? '参照 ' + ck.server : '');
+    rows.push('<div class="ndrow ' + lv2 + '"><div class="h"><span class="ndbadge ' + lv2 + '"></span>'
+      + '<span class="t">' + esc(t2) + '</span><span class="b">' + esc(b2) + '</span></div></div>');
+  }
+  if (DG.etw) {
+    var et = DG.etw || {};
+    if (et.ok === false) {
+      var ee = et.error || {};
+      rows.push('<div class="ndrow warn"><div class="h"><span class="ndbadge warn"></span>'
+        + '<span class="t">这个窗口抓不了事件</span><span class="b">' + esc(ee.msg || ee.code || '') + '</span></div></div>');
+      if (et.elevate && et.elevate.display) {
+        rows.push('<div class="ndrow info"><div class="h"><span class="ndbadge info"></span>'
+          + '<span class="t">要在管理员下抓</span><span class="b">' + esc(et.elevate.msg || '把下面这条贴进管理员 PowerShell') + '</span></div>'
+          + (et.elevate.display ? '<details><summary>命令</summary><pre>' + esc(et.elevate.display) + '</pre></details>' : '') + '</div>');
+      }
+    } else {
+      var prov = (et.by_provider || []).map(function (p) { return p.provider + ' ' + p.count; }).join(' · ');
+      var slow = (et.dns_slowest || []).map(function (f) { return f.name + ' ' + f.query_ms + 'ms'; }).join('\n');
+      var fails = (et.dns_failures || []).map(function (f) { return f.name + ' → ' + (f.status || ''); }).join('\n');
+      rows.push('<div class="ndrow info"><div class="h"><span class="ndbadge info"></span>'
+        + '<span class="t">抓了 ' + n(et.seconds, 10) + ' 秒事件：' + n(et.events, 0) + ' 条</span>'
+        + '<span class="b">DNS 查询 ' + n(et.dns_total, 0) + ' 条，其中失败 ' + n(et.dns_fail, 0) + ' 条 · ' + esc(prov) + '</span></div>'
+        + (slow ? '<details><summary>最慢的查询</summary><pre>' + esc(slow) + '</pre></details>' : '')
+        + (fails ? '<details><summary>失败的查询</summary><pre>' + esc(fails) + '</pre></details>' : '') + '</div>');
     }
   }
   if (DG.detail) {
@@ -2149,6 +2186,34 @@ async function dgEvents() {
   } finally { DG.busy = false; renderDoctor(); }
 }
 
+async function dgClock() {
+  if (DG.busy) return;
+  DG.busy = true;
+  patch('#dgNote', '正在问服务器现在几点（不经代理，直连公共探测地址）…');
+  try {
+    var r = await api('/api/doctor/clock', {}, { timeout: API_SLOW });
+    if (r && (r.ok === true || r.skew_s != null || r.ok === false)) { DG.clock = r; }
+    else toast(dgErr(r) || '取服务器时间失败', 'bad');
+  } finally { DG.busy = false; renderDoctor(); }
+}
+
+async function dgEtw() {
+  if (DG.busy) return;
+  DG.busy = true;
+  var b = document.querySelector('[data-act="dg-etw"]');
+  var old = b ? b.textContent : '';
+  if (b) { b.disabled = true; b.classList.add('busy'); b.textContent = '抓取中'; }
+  patch('#dgNote', '正在抓 10 秒 DNS / TCPIP 事件（要管理员；不是管理员会给你一条命令）…');
+  try {
+    var r = await api('/api/doctor/etw', { seconds: 10 }, { timeout: API_SLOW });
+    DG.etw = r || {};
+    if (!r || r.ok === false) toast(dgErr(r) || '抓事件失败', 'bad');
+  } finally {
+    DG.busy = false;
+    if (b) { b.disabled = false; b.classList.remove('busy'); b.textContent = old; }
+    renderDoctor();
+  }
+}
 async function dgFix(act, elevate) {
   if (!act) return;
   if (DG.busy) return;
@@ -2453,6 +2518,8 @@ document.addEventListener('click', function (e) {
   else if (a === 'dg-deep') dgCheck('deep');
   else if (a === 'dg-events') dgEvents();
   else if (a === 'dg-export') dgExport();
+  else if (a === 'dg-clock') dgClock();
+  else if (a === 'dg-etw') dgEtw();
   else if (a === 'dg-detail') dgDetail();
   else if (a === 'dg-paste') dgPaste();
   else if (a === 'dg-fix') dgFix(el.dataset.a, !!el.dataset.el);

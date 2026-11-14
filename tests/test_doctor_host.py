@@ -16,6 +16,7 @@ from vpntray import doctor
 
 class FakeSvc:
     last = None
+    etw_denied = True
 
     def __init__(self, data_dir=None, values=None):
         self.data_dir = data_dir
@@ -65,6 +66,16 @@ class FakeSvc:
     def undo(self, run_id, by="user"):
         return {"ok": True, "run_id": run_id, "by": by}
 
+    def clock(self):
+        return {"ok": True, "skew_s": 0, "warn": False, "server": "www.msftconnecttest.com"}
+
+    def etw(self, seconds=10.0, top=10):
+        if FakeSvc.etw_denied:
+            return {"ok": False, "error": {"code": "ERR-ACT-NEED-ADMIN", "msg": "抓 ETW 事件需要管理员"}}
+        return {"ok": True, "seconds": seconds, "events": 12, "dns_total": 7, "dns_fail": 0,
+                "by_provider": [{"provider": "Microsoft-Windows-DNS-Client", "count": 7}],
+                "dns_slowest": [], "dns_failures": []}
+
     def export(self, host="", port=443):
         return {"ok": True, "path": "X:/diag/nd-diag-1.zip", "size": 4096,
                 "files": ["README.txt", "manifest.json"], "host": host, "port": port}
@@ -94,6 +105,43 @@ class ExportTest(unittest.TestCase):
         out = doctor.export(types.SimpleNamespace(settings=S({}), restart_kernel=lambda: True), "")
         self.assertFalse(out["ok"])
         self.assertEqual(out["error"]["code"], "ERR-ND-MISSING")
+
+
+
+class ClockEtwTest(unittest.TestCase):
+    """1.6.0 的两个只读取证入口：时钟与 ETW。"""
+
+    def setUp(self):
+        _install_fake_nd()
+        doctor._SVC = None
+        FakeSvc.etw_denied = True
+        self.app = App()
+
+    def tearDown(self):
+        doctor._SVC = None
+        FakeSvc.etw_denied = True
+        for k in ("yuans_nd", "yuans_nd.service", "yuans_nd.elevate"):
+            sys.modules.pop(k, None)
+
+    def test_clock_passes_through(self):
+        out = doctor.clock(self.app)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["skew_s"], 0)
+
+    def test_etw_denied_attaches_admin_command(self):
+        out = doctor.etw(self.app, seconds=10)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "ERR-ACT-NEED-ADMIN")
+        # 宿主不自作主张提权，只给一条可复制的命令
+        self.assertIn("--elevated", out["elevate"]["display"])
+        self.assertIn("etw", out["elevate"]["display"])
+
+    def test_etw_ok_when_admin(self):
+        FakeSvc.etw_denied = False
+        out = doctor.etw(self.app, seconds=10)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["dns_total"], 7)
+        self.assertNotIn("elevate", out)
 
 
 class S(dict):
@@ -132,10 +180,16 @@ def _install_fake_nd():
         return {"available": True, "cmd": argv[0], "args": argv[1:],
                 "display": " ".join(argv), "note": "用户点按钮才弹 UAC", "act_id": act_id}
 
+    def build_cli(tail, data_dir=""):
+        argv = ["python.exe", "-m", "yuans_nd.api.cli", "--json"] + list(tail) + ["--elevated"]
+        return {"available": True, "cmd": argv[0], "args": argv[1:],
+                "display": " ".join(argv), "note": "url_open"}
+
     def run(hint):
         return {"ok": True, "launched": hint.get("act_id")}
 
     elev.build = build
+    elev.build_cli = build_cli
     elev.run = run
     sys.modules["yuans_nd"] = pkg
     sys.modules["yuans_nd.service"] = svc

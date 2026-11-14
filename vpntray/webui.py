@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.2.0"
+UI_VER = "1.2.1"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -799,6 +799,22 @@ class WebUI:
             out = doctor.export(app, host, port=port)
             return {**out, "doctor": _doctor_state(app)}
 
+
+        def doctor_clock(_body=None):
+            """本机时间与服务器差多少秒：证书报错先排除时钟。"""
+            out = doctor.clock(app)
+            return {**out, "doctor": _doctor_state(app)}
+
+        def doctor_etw(body):
+            """抓一段 DNS/TCPIP 事件。需要管理员：非管理员返回命令模板，不自行提权。"""
+            b = body or {}
+            try:
+                seconds = float(b.get("seconds") or 10.0)
+            except (TypeError, ValueError):
+                seconds = 10.0
+            seconds = max(2.0, min(60.0, seconds))
+            out = doctor.etw(app, seconds=seconds)
+            return {**out, "doctor": _doctor_state(app)}
         def doctor_undo(body):
             b = body or {}
             run_id = str(b.get("run_id") or "").strip()
@@ -840,6 +856,8 @@ class WebUI:
             "/api/doctor/fix": doctor_fix,
             "/api/doctor/export": doctor_export,
             "/api/doctor/undo": doctor_undo,
+            "/api/doctor/clock": doctor_clock,
+            "/api/doctor/etw": doctor_etw,
         }
 
     # ── 杂项：拓扑 / 内核 / 连接 / 更新 / 冲突清理 / 反馈 ──

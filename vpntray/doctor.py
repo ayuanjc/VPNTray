@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -173,6 +174,40 @@ def export(app: Any, host: str = "", port: int = 443) -> dict[str, Any]:
 
 def caps(app: Any) -> dict[str, Any]:
     return _guard(app, lambda s: s.caps())
+def clock(app: Any) -> dict[str, Any]:
+    """本机时间与服务器差多少秒（yuans_nd 1.6.0）：证书报错时先排除时钟。"""
+    return _guard(app, lambda s: s.clock())
+
+
+def etw(app: Any, seconds: float = 10.0) -> dict[str, Any]:
+    """按需抓一段 DNS/TCPIP 事件（yuans_nd 1.6.0）：需要管理员，非管理员只回命令模板。"""
+    out = _guard(app, lambda s: s.etw(seconds=seconds, top=10))
+    data = out.get('data') if isinstance(out.get('data'), dict) else out
+    if isinstance(data, dict) and data.get('ok') is False:
+        err = data.get('error') or {}
+        if err.get('code') == 'ERR-ACT-NEED-ADMIN':
+            out['elevate'] = etw_cmd(app, seconds)
+    return out
+
+
+def etw_cmd(app: Any, seconds: float = 10.0) -> dict[str, Any]:
+    """拼一条 nd etw 的提权命令：宿主不自己提权，只给用户可点的东西。"""
+    ok, err = available()
+    if not ok:
+        return {"available": False, "error": err}
+    try:
+        from yuans_nd import elevate as elev
+
+        tail = ["etw", "--seconds", str(round(float(seconds), 1)), "--top", "10"]
+        hint = dict(elev.build_cli(tail, data_dir=_data_dir(app)))
+        if getattr(sys, "frozen", False):
+            # 打包版没有独立 python：sys.executable 是 VPNTray.exe，-m 跑不起来
+            hint["available"] = False
+            hint["display"] = ""
+            hint["msg"] = "打包版没有独立 python：右键托盘退出，用管理员身份重开 VPNTray 后再点这个按钮"
+        return hint
+    except Exception as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def actions(app: Any) -> dict[str, Any]:
