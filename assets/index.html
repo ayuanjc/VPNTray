@@ -157,11 +157,16 @@ button,input,select,textarea{font:inherit;color:inherit}
 .good{color:var(--ok)} .warnc{color:var(--warn)} .badc{color:var(--bad)}
 .cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
 .cols.wide{grid-template-columns:minmax(0,1.25fr) minmax(0,1fr)}
-.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:12px;align-items:start}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:12px;align-items:stretch}
 .grid > .c3{grid-column:span 3}.grid > .c4{grid-column:span 4}.grid > .c5{grid-column:span 5}
 .grid > .c6{grid-column:span 6}.grid > .c7{grid-column:span 7}.grid > .c8{grid-column:span 8}
 .grid > .c12{grid-column:span 12}
 .grid > .card,.grid > .stack{min-width:0}
+/* 同一行的卡片一样高，说明行沉到底：否则短卡下面留一大块白，看着像没摆满 */
+.grid > .card{display:flex;flex-direction:column}
+.grid > .card > .note{margin-top:auto}
+/* 运行状态：整行时排两列，短行不再一列拖一屏 */
+@media(min-width:760px){#homeInfo{display:grid;grid-template-columns:1fr 1fr;column-gap:26px}}
 .probs-card{margin-bottom:12px}
 .probs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 .prob{display:grid;gap:6px;text-align:left;padding:14px 16px;border-radius:10px;border:1px solid var(--line);
@@ -538,7 +543,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
       </section>
 
       <div class="grid">
-      <section class="card c7">
+      <section class="card c12">
         <h2>快速操作</h2>
         <div class="acts">
           <button class="btn" id="btnTest">测速全部节点</button>
@@ -549,7 +554,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
         <div class="pbar" id="progHome" hidden><i></i><b>0%</b></div>
         <div class="note" id="homeNote"></div>
       </section>
-      <section class="card c5">
+      <section class="card c12">
         <h2>运行状态</h2>
         <div class="kv" id="homeInfo"></div>
       </section>
@@ -662,6 +667,22 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
         <div class="note" id="cpNote"></div>
       </section>
       <section class="card c6">
+        <h2>AI 接口<span class="hint">让本机的 AI 客户端直接操作这个程序</span></h2>
+        <div class="gwrap" id="apiPills"></div>
+        <div id="apiBody"></div>
+        <div class="acts" style="margin-top:12px">
+          <label class="sw" title="关闭后所有 /ai/v1 调用都返回 401"><input type="checkbox" id="apiOn"><i></i></label>
+          <select class="sel" id="apiLevel" title="AI 最多能做到哪一步">
+            <option value="read">只读</option>
+            <option value="write">可改配置</option>
+            <option value="full">完全控制</option>
+          </select>
+          <button class="btn" data-act="api-copy">复制 token</button>
+          <button class="btn" data-act="api-regen">重置 token</button>
+        </div>
+        <div class="note" id="apiNote"></div>
+      </section>
+      <section class="card c6">
         <h2>本机解析<span class="hint" id="dnsHint"></span></h2>
         <div class="gwrap" id="dnsPills"></div>
         <div class="acts" style="margin-top:12px">
@@ -669,6 +690,10 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
           <label class="sw" title="本地 DNS 兜底：127.0.0.1:53"><input type="checkbox" id="dnsOn"><i></i></label>
         </div>
         <div class="note" id="dnsNote"></div>
+      </section>
+      <section class="card c6">
+        <h2>AI 通道<span class="hint"><label class="sw" title="Claude Code / Codex 走独立出口"><input type="checkbox" id="aiOn"><i></i></label></span></h2>
+        <div id="aiBody"></div>
       </section>
       <section class="card c6">
         <h2>GitHub<span class="hint" id="ghHint"></span></h2>
@@ -687,26 +712,6 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
           <label class="sw" title="托盘内守护：端口没人听就拉起来"><input type="checkbox" id="ocrOn"><i></i></label>
         </div>
         <div class="note" id="ocrNote">图片先送到 127.0.0.1:8791 换成文字再转发给模型。它和代理无关：阿里云域名在规则里直连。</div>
-      </section>
-      <section class="card c6">
-        <h2>AI 通道<span class="hint"><label class="sw" title="Claude Code / Codex 走独立出口"><input type="checkbox" id="aiOn"><i></i></label></span></h2>
-        <div id="aiBody"></div>
-      </section>
-      <section class="card c6">
-        <h2>AI 接口<span class="hint">让本机的 AI 客户端直接操作这个程序</span></h2>
-        <div class="gwrap" id="apiPills"></div>
-        <div id="apiBody"></div>
-        <div class="acts" style="margin-top:12px">
-          <label class="sw" title="关闭后所有 /ai/v1 调用都返回 401"><input type="checkbox" id="apiOn"><i></i></label>
-          <select class="sel" id="apiLevel" title="AI 最多能做到哪一步">
-            <option value="read">只读</option>
-            <option value="write">可改配置</option>
-            <option value="full">完全控制</option>
-          </select>
-          <button class="btn" data-act="api-copy">复制 token</button>
-          <button class="btn" data-act="api-regen">重置 token</button>
-        </div>
-        <div class="note" id="apiNote"></div>
       </section>
       </div>
     </section>
@@ -727,6 +732,14 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
         <div class="togrow"><div class="k">故障自愈<em>节点不可用或断网时自动恢复</em></div><label class="sw"><input type="checkbox" id="healOn"><i></i></label></div>
       </section>
       <section class="card c6">
+        <h2>订阅列表<span class="hint" id="subCount"></span></h2>
+        <div class="rows" id="subs"></div>
+        <div class="addbar">
+          <input class="txt" id="subUrl" placeholder="粘贴订阅链接 https://…" autocomplete="off" spellcheck="false">
+          <button class="btn primary" id="subAdd">添加</button>
+        </div>
+      </section>
+      <section class="card c6">
         <h2>维护</h2>
         <div class="acts">
           <button class="btn" id="btnPurity">纯净度 · 当前节点</button>
@@ -740,15 +753,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
         <div class="pbar" id="progSpeed" hidden><i></i><b>0%</b></div>
         <div class="note" id="ngNote" hidden></div>
       </section>
-      <section class="card c7">
-        <h2>订阅列表<span class="hint" id="subCount"></span></h2>
-        <div class="rows" id="subs"></div>
-        <div class="addbar">
-          <input class="txt" id="subUrl" placeholder="粘贴订阅链接 https://…" autocomplete="off" spellcheck="false">
-          <button class="btn primary" id="subAdd">添加</button>
-        </div>
-      </section>
-      <section class="card c5">
+      <section class="card c6">
         <h2>流量概览<span class="hint" id="subHint"></span></h2>
         <div class="sumgrid">
           <div class="sumcell"><div class="k">当前订阅</div><div class="v" id="sumName">—</div></div>
