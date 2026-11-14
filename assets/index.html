@@ -102,6 +102,7 @@ button,input,select,textarea{font:inherit;color:inherit}
 .nav .lbl{white-space:nowrap}
 .nav .n{margin-left:auto;font-size:11px;color:var(--ink3);font-weight:400}
 .nav button.on .n{color:var(--ink2)}
+.nav .n.bad{color:var(--bad);font-weight:600}
 .side-foot{margin-top:auto;padding-top:12px;border-top:1px solid var(--line);display:grid;gap:8px}
 .theme{display:flex;align-items:center;gap:8px;height:30px;padding:0 10px;border:0;border-radius:8px;
   background:transparent;color:var(--ink2);font-size:12px;cursor:pointer;transition:background .12s,color .12s}
@@ -156,6 +157,23 @@ button,input,select,textarea{font:inherit;color:inherit}
 .good{color:var(--ok)} .warnc{color:var(--warn)} .badc{color:var(--bad)}
 .cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
 .cols.wide{grid-template-columns:minmax(0,1.25fr) minmax(0,1fr)}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:12px;align-items:start}
+.grid > .c3{grid-column:span 3}.grid > .c4{grid-column:span 4}.grid > .c5{grid-column:span 5}
+.grid > .c6{grid-column:span 6}.grid > .c7{grid-column:span 7}.grid > .c8{grid-column:span 8}
+.grid > .c12{grid-column:span 12}
+.grid > .card,.grid > .stack{min-width:0}
+.probs-card{margin-bottom:12px}
+.probs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.prob{display:grid;gap:6px;text-align:left;padding:14px 16px;border-radius:10px;border:1px solid var(--line);
+  background:var(--surface2);color:var(--ink);font:inherit;cursor:pointer;transition:border-color .14s,background .14s,transform .14s}
+.prob:hover{border-color:var(--acc);background:var(--surface3);transform:translateY(-1px)}
+.prob b{font-size:13px;font-weight:600}
+.prob span{font-size:12px;line-height:1.6;color:var(--ink2)}
+.prob i{font-style:normal;font-size:12px;font-weight:600;color:var(--acc)}
+@media (max-width:1080px){
+  .grid > [class*=c]{grid-column:span 12}
+  .probs{grid-template-columns:1fr}
+}
 .stack{display:grid;gap:12px}
 
 /* ───── 控件 ───── */
@@ -266,6 +284,9 @@ textarea{width:100%;min-height:64px;padding:9px 10px;border-radius:8px;border:1p
 .togrow .k{font-size:13px}
 .togrow .k em{display:block;font-style:normal;font-size:11.5px;color:var(--ink3);margin-top:2px}
 .acts{display:flex;flex-wrap:wrap;gap:8px}
+/* 卡片内的分区小标题：把一张大卡切成几个「你在问什么」 */
+.zlabel{margin:16px 0 -2px;font-size:11.5px;color:var(--ink3);letter-spacing:.02em}
+.zlabel:first-of-type{margin-top:12px}
 .note{margin-top:12px;font-size:11.5px;color:var(--ink2);line-height:1.7}
 .note.err{color:var(--bad)}
 .note .dim{color:var(--ink3)}
@@ -423,31 +444,23 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
     </div>
 
     <nav class="nav" id="nav">
-      <button data-view="home" class="on" title="概览">
+      <button data-view="home" class="on" title="概览：现在通不通">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 13h6V4H4zM14 20h6v-9h-6zM4 20h6v-4H4zM14 8h6V4h-6z"/></svg>
         <span class="lbl">概览</span>
       </button>
-      <button data-view="nodes" title="节点">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
-        <span class="lbl">节点</span><span class="n" id="navNodes"></span>
+      <button data-view="fix" title="修复：为什么不通">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h3.4l2.1-5.6 3.6 11.2 2.1-5.6H21"/></svg>
+        <span class="lbl">修复</span><span class="n" id="navFix"></span>
       </button>
-      <button data-view="scenes" title="场景加速">
+      <button data-view="speed" title="加速：出口与节点">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4.5 13.5H11l-1 8.5L19.5 10H13z"/></svg>
-        <span class="lbl">场景</span>
+        <span class="lbl">加速</span><span class="n" id="navNodes"></span>
       </button>
-      <button data-view="tools" title="扩展">
+      <button data-view="tools" title="工具：校园网 / GitHub / 解析 / OCR / AI">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6.5V3M15 6.5V3M6.5 6.5h11v5a5.5 5.5 0 01-11 0z"/><path d="M12 17v4"/></svg>
-        <span class="lbl">扩展</span>
+        <span class="lbl">工具</span>
       </button>
-      <button data-view="ai" title="AI">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.6L18.5 9.5 13.9 11.4 12 16l-1.9-4.6L5.5 9.5l4.6-1.9z"/><path d="M18 16.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9z"/></svg>
-        <span class="lbl">AI</span>
-      </button>
-      <button data-view="subs" title="订阅">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 14.5a4 4 0 005.7 0l2.8-2.8a4 4 0 10-5.7-5.7L11 7.3"/><path d="M14.5 9.5a4 4 0 00-5.7 0L6 12.3a4 4 0 105.7 5.7l1.3-1.3"/></svg>
-        <span class="lbl">订阅</span>
-      </button>
-      <button data-view="settings" title="设置">
+      <button data-view="settings" title="设置：订阅 / 维护 / 更新">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2.1"/><circle cx="10" cy="17" r="2.1"/></svg>
         <span class="lbl">设置</span>
       </button>
@@ -478,7 +491,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 
     <div class="banner" id="banner" hidden><span id="bannerText"></span></div>
 
-    <!-- 概览 -->
+    <!-- 概览：先给结论，再给出口 -->
     <section class="view on" id="view-home">
       <div class="hero">
         <div class="tile node">
@@ -503,28 +516,92 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
         </div>
       </div>
 
-      <div class="cols">
-        <section class="card">
-          <h2>快速操作</h2>
-          <div class="acts">
-            <button class="btn" id="btnTest">测速全部节点</button>
-            <button class="btn" id="btnBest">选最优节点</button>
-            <button class="btn" id="btnRestart">重启内核</button>
-            <button class="btn" id="btnCloseAll">断开全部连接</button>
-          </div>
-          <div class="pbar" id="progHome" hidden><i></i><b>0%</b></div>
-          <div class="note" id="homeNote"></div>
-        </section>
-        <section class="card">
-          <h2>运行状态</h2>
-          <div class="kv" id="homeInfo"></div>
-        </section>
+      <section class="card probs-card">
+        <h2>我遇到的问题<span class="hint">点一下，直接跳到能解决它的那一页</span></h2>
+        <div class="probs">
+          <button class="prob" data-act="go-offline">
+            <b>上不了网，什么都打不开</b>
+            <span>先跑一遍体检：内核在不在、系统代理指没指对、解析有没有被投毒</span>
+            <i>开始体检</i>
+          </button>
+          <button class="prob" data-act="go-site">
+            <b>只有某个网站 / 软件不通</b>
+            <span>填一个域名，看三台 DNS 各自的答案、逐跳和 TLS 到底断在哪一环</span>
+            <i>查这个网站</i>
+          </button>
+          <button class="prob" data-act="go-slow">
+            <b>能上，但慢、卡、老是掉</b>
+            <span>测一遍全部节点延迟挑最快的，或者给某个软件单独换出口</span>
+            <i>测速挑节点</i>
+          </button>
+        </div>
+      </section>
+
+      <div class="grid">
+      <section class="card c7">
+        <h2>快速操作</h2>
+        <div class="acts">
+          <button class="btn" id="btnTest">测速全部节点</button>
+          <button class="btn" id="btnBest">选最优节点</button>
+          <button class="btn" id="btnRestart">重启内核</button>
+          <button class="btn" id="btnCloseAll">断开全部连接</button>
+        </div>
+        <div class="pbar" id="progHome" hidden><i></i><b>0%</b></div>
+        <div class="note" id="homeNote"></div>
+      </section>
+      <section class="card c5">
+        <h2>运行状态</h2>
+        <div class="kv" id="homeInfo"></div>
+      </section>
       </div>
     </section>
 
-    <!-- 节点 -->
-    <section class="view" id="view-nodes">
+    <!-- 修复：结论在前，清单在后 -->
+    <section class="view" id="view-fix">
+      <div class="stack">
+        <section class="card">
+          <h2>诊断内核<span class="hint" id="dgHint">先出结论，再谈修：每条结论都挂着事件证据</span></h2>
+          <div class="gwrap" id="dgPills"><span class="gp">还没查过</span></div>
+          <div class="acts" style="margin-top:12px">
+            <button class="btn primary" data-act="dg-check">一键体检</button>
+            <button class="btn" data-act="dg-deep" title="多探几轮：DNS 分路、逐跳、TLS 都看">深度诊断</button>
+            <button class="btn" data-act="dg-events">最近事件</button>
+      <button class="btn" data-act="dg-export" title="把结论、证据、事件与详细视图打成一个 zip，拿去别的机器复盘">导出诊断包</button>
+          </div>
+          <div class="zlabel">只有一个网站不通？填主机名，看它的 DNS 分路和逐跳</div>
+          <div class="cprow">
+            <input class="txt" id="dgHost" placeholder="要查的主机名，例如 www.okx.com" spellcheck="false" autocomplete="off">
+            <button class="btn" data-act="dg-detail">DNS + 逐跳</button>
+          </div>
+          <div class="zlabel">或者贴一段报错原文，让结论对着它取证</div>
+          <div style="margin-top:10px">
+            <textarea class="txt" id="dgText" rows="2" placeholder="或者贴一段报错：Cannot connect to host www.okx.com:443 ssl:default [None]" spellcheck="false"></textarea>
+          </div>
+          <div class="acts" style="margin-top:10px">
+            <button class="btn" data-act="dg-paste">诊断这段话</button>
+            <span class="hint">诊断只读。要动手点结果里的按钮：改系统代理这类还会再问你一次，需要管理员的会给你一个「弹 UAC」的按钮。</span>
+          </div>
+          <div id="dgList" class="ndlist"></div>
+          <div class="note" id="dgNote"></div>
+        </section>
       <section class="card">
+        <h2>断网急救<span class="hint" id="ndHint">先体检，再照着红的那条修</span></h2>
+        <div class="gwrap" id="ndPills"></div>
+        <div class="acts" style="margin-top:12px">
+          <button class="btn" data-act="nd-run">一键体检</button>
+          <button class="btn" data-act="nd-repair" title="清 DNS 缓存 → 还原系统代理 → 拉起本地解析 → 重启内核">一键急救</button>
+          <button class="btn" data-act="nd-copy">复制报告</button>
+        </div>
+        <div id="ndList" class="ndlist"></div>
+        <div class="note" id="ndNote"></div>
+      </section>
+      </div>
+    </section>
+
+    <!-- 加速：出口两件事，一左一右 -->
+    <section class="view" id="view-speed">
+      <div class="grid">
+      <section class="card c12">
         <h2>节点<span class="hint" id="nodeHint"></span></h2>
         <div class="toolbar">
           <div class="search">
@@ -544,233 +621,169 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
         <div class="lbody" id="nlist"></div>
         <div class="lfoot" id="nfoot"></div>
       </section>
-    </section>
-
-    <!-- 场景 -->
-    <section class="view" id="view-scenes">
-      <div class="stack">
-        <section class="card">
-          <h2>场景 / 模块<span class="hint">每个场景一个独立出口，可自由增删</span></h2>
-          <div class="rows" id="scenes"></div>
-          <div class="acts" style="margin-top:12px">
-            <button class="btn" data-act="mod-new">新增模块</button>
-            <button class="btn" data-act="mod-import">导入</button>
-            <button class="btn" data-act="mod-export">导出</button>
-            <button class="btn" data-act="mod-reset">恢复内置</button>
-          </div>
-          <div class="note" id="modNote">模块就是 data/modules/*.json：一组域名 + 一个策略组。改完立即重建配置并热加载，不用重启程序。</div>
-        </section>
-
-      </div>
-    </section>
-
-    <!-- 扩展：搬家过来的小工具（GitHub 链路、本机 DNS、AI 通道、AI 接口） -->
-    <section class="view" id="view-tools">
-      <div class="stack">
-        <section class="card">
-          <h2>断网急救<span class="hint" id="ndHint">先体检，再照着红的那条修</span></h2>
-          <div class="gwrap" id="ndPills"></div>
-          <div class="acts" style="margin-top:12px">
-            <button class="btn" data-act="nd-run">一键体检</button>
-            <button class="btn" data-act="nd-repair" title="清 DNS 缓存 → 还原系统代理 → 拉起本地解析 → 重启内核">一键急救</button>
-            <button class="btn" data-act="nd-copy">复制报告</button>
-          </div>
-          <div id="ndList" class="ndlist"></div>
-          <div class="note" id="ndNote"></div>
-        </section>
-        <section class="card">
-          <h2>诊断内核<span class="hint" id="dgHint">先出结论，再谈修：每条结论都挂着事件证据</span></h2>
-          <div class="gwrap" id="dgPills"><span class="gp">还没查过</span></div>
-          <div class="acts" style="margin-top:12px">
-            <button class="btn" data-act="dg-check">一键体检</button>
-            <button class="btn" data-act="dg-deep" title="多探几轮：DNS 分路、逐跳、TLS 都看">深度诊断</button>
-            <button class="btn" data-act="dg-events">最近事件</button>
-      <button class="btn" data-act="dg-export" title="把结论、证据、事件与详细视图打成一个 zip，拿去别的机器复盘">导出诊断包</button>
-          </div>
-          <div class="cprow">
-            <input class="txt" id="dgHost" placeholder="要查的主机名，例如 www.okx.com" spellcheck="false" autocomplete="off">
-            <button class="btn" data-act="dg-detail">DNS + 逐跳</button>
-          </div>
-          <div style="margin-top:10px">
-            <textarea class="txt" id="dgText" rows="2" placeholder="或者贴一段报错：Cannot connect to host www.okx.com:443 ssl:default [None]" spellcheck="false"></textarea>
-          </div>
-          <div class="acts" style="margin-top:10px">
-            <button class="btn" data-act="dg-paste">诊断这段话</button>
-            <span class="hint">诊断只读。要动手点结果里的按钮：改系统代理这类还会再问你一次，需要管理员的会给你一个「弹 UAC」的按钮。</span>
-          </div>
-          <div id="dgList" class="ndlist"></div>
-          <div class="note" id="dgNote"></div>
-        </section>
-        <section class="card">
-          <h2>校园网<span class="hint" id="cpHint">掉线自动重登，不用每次手动开认证页</span></h2>
-          <div class="gwrap" id="cpPills"></div>
-          <div class="row2" style="margin-top:12px">
-            <select class="sel" id="cpProvider" title="认证方式"></select>
-            <button class="btn" data-act="cp-detect">认一下门户</button>
-            <button class="btn" data-act="cp-login">立即登录</button>
-            <label class="sw" title="掉线后自动用上面的账号重登"><input type="checkbox" id="cpOn"><i></i></label>
-          </div>
-          <div class="cprow">
-            <input class="txt" id="cpUser" placeholder="学号 / 账号" autocomplete="username" spellcheck="false">
-            <input class="txt" id="cpPass" type="password" placeholder="密码（留空 = 不改）" autocomplete="current-password">
-          </div>
-          <div class="cprow">
-            <input class="txt" id="cpPortal" placeholder="认证页地址（留空自动识别）" spellcheck="false">
-            <input class="txt" id="cpTemplate" placeholder="自定义登录模板（可选）" spellcheck="false">
-          </div>
-          <div class="acts" style="margin-top:10px">
-            <button class="btn" data-act="cp-save">保存</button>
-            <span class="hint">认不出门户时：在浏览器打开一次认证页，复制地址填到「认证页地址」；要验证码的门户只能手动登录一次。</span>
-          </div>
-          <div class="note" id="cpNote"></div>
-        </section>
-        <section class="card">
-          <h2>GitHub<span class="hint" id="ghHint"></span></h2>
-          <div class="gwrap" id="ghPills"></div>
-          <div class="acts" style="margin-top:12px">
-            <button class="btn" data-gh-check>自检五条链路</button>
-            <button class="btn" data-git-proxy>对齐 git 代理</button>
-          </div>
-          <div class="note" id="ghNote"></div>
-        </section>
-
-        <section class="card">
-          <h2>本机解析<span class="hint" id="dnsHint"></span></h2>
-          <div class="gwrap" id="dnsPills"></div>
-          <div class="acts" style="margin-top:12px">
-            <button class="btn" data-dns-probe>测一次解析</button>
-            <label class="sw" title="本地 DNS 兜底：127.0.0.1:53"><input type="checkbox" id="dnsOn"><i></i></label>
-          </div>
-          <div class="note" id="dnsNote"></div>
-        </section>
-
-      </div>
-    </section>
-
-
-    <!-- AI：通道出口 / 本机接口 / OCR 桥 -->
-    <section class="view" id="view-ai">
-      <div class="stack">
-        <section class="card">
-          <h2>AI 通道<span class="hint"><label class="sw" title="Claude Code / Codex 走独立出口"><input type="checkbox" id="aiOn"><i></i></label></span></h2>
-          <div id="aiBody"></div>
-        </section>
-
-        <section class="card">
-          <h2>AI 接口<span class="hint">让本机的 AI 客户端直接操作这个程序</span></h2>
-          <div class="gwrap" id="apiPills"></div>
-          <div id="apiBody"></div>
-          <div class="acts" style="margin-top:12px">
-            <label class="sw" title="关闭后所有 /ai/v1 调用都返回 401"><input type="checkbox" id="apiOn"><i></i></label>
-            <select class="sel" id="apiLevel" title="AI 最多能做到哪一步">
-              <option value="read">只读</option>
-              <option value="write">可改配置</option>
-              <option value="full">完全控制</option>
-            </select>
-            <button class="btn" data-act="api-copy">复制 token</button>
-            <button class="btn" data-act="api-regen">重置 token</button>
-          </div>
-          <div class="note" id="apiNote"></div>
-        </section>
-
-        <section class="card">
-          <h2>OCR 桥<span class="hint" id="ocrHint"></span></h2>
-          <div class="gwrap" id="ocrPills"></div>
-          <div class="acts" style="margin-top:12px">
-            <button class="btn" data-act="ocr-restart">重启桥</button>
-            <label class="sw" title="托盘内守护：端口没人听就拉起来"><input type="checkbox" id="ocrOn"><i></i></label>
-          </div>
-          <div class="note" id="ocrNote">图片先送到 127.0.0.1:8791 换成文字再转发给模型。它和代理无关：阿里云域名在规则里直连。</div>
-        </section>
-      </div>
-    </section>
-
-    <!-- 订阅 -->
-    <section class="view" id="view-subs">
-      <div class="stack">
-        <section class="card">
-          <h2>流量概览<span class="hint" id="subHint"></span></h2>
-          <div class="sumgrid">
-            <div class="sumcell"><div class="k">当前订阅</div><div class="v" id="sumName">—</div></div>
-            <div class="sumcell"><div class="k">剩余流量</div><div class="v num" id="sumLeft">—</div></div>
-            <div class="sumcell"><div class="k">节点</div><div class="v num" id="sumNodes">—</div></div>
-          </div>
-          <div class="acts">
-            <button class="btn" id="subRefresh">立即更新</button>
-            <select class="sel" id="subMode" title="多条订阅的生效方式">
-              <option value="single">单条生效</option>
-              <option value="merge">合并所有</option>
-            </select>
-          </div>
-          <div class="note" id="subNote"></div>
-        </section>
-
-        <section class="card">
-          <h2>订阅列表<span class="hint" id="subCount"></span></h2>
-          <div class="rows" id="subs"></div>
-          <div class="addbar">
-            <input class="txt" id="subUrl" placeholder="粘贴订阅链接 https://…" autocomplete="off" spellcheck="false">
-            <button class="btn primary" id="subAdd">添加</button>
-          </div>
-        </section>
-      </div>
-    </section>
-
-    <!-- 设置 -->
-    <section class="view" id="view-settings">
-      <div class="stack">
-        <div class="cols">
-          <section class="card">
-            <h2>运行</h2>
-            <div class="togrow"><div class="k">运行模式<em>规则分流 / 全局 / 直连</em></div>
-              <select class="sel" id="modeSel" style="width:110px">
-                <option value="rule">规则</option><option value="global">全局</option><option value="direct">直连</option>
-              </select>
-            </div>
-            <div class="togrow"><div class="k">开机自启<em>登录后自动在托盘运行</em></div><label class="sw"><input type="checkbox" id="autoStart"><i></i></label></div>
-            <div class="togrow"><div class="k">TUN 模式<em>接管全部流量，需要管理员</em></div><label class="sw"><input type="checkbox" id="tunOn"><i></i></label></div>
-            <div class="togrow"><div class="k">自动优选<em>定时挑延迟最低的节点</em></div><label class="sw"><input type="checkbox" id="autoBest"><i></i></label></div>
-            <div class="togrow"><div class="k">故障自愈<em>节点不可用或断网时自动恢复</em></div><label class="sw"><input type="checkbox" id="healOn"><i></i></label></div>
-          </section>
-
-          <section class="card">
-            <h2>维护</h2>
-            <div class="acts">
-              <button class="btn" id="btnPurity">纯净度 · 当前节点</button>
-              <button class="btn" id="btnPurityAll">纯净度 · 全部</button>
-              <button class="btn" id="btnSpeed">带宽测速</button>
-              <button class="btn" id="btnScan">扫描代理冲突</button>
-              <button class="btn" id="btnLog">刷新日志</button>
-              <button class="btn danger" id="btnQuit">退出程序</button>
-            </div>
-            <div class="pbar" id="progPurity" hidden><i></i><b>0%</b></div>
-            <div class="pbar" id="progSpeed" hidden><i></i><b>0%</b></div>
-            <div class="note" id="ngNote" hidden></div>
-          </section>
+      <section class="card c12">
+        <h2>场景 / 模块<span class="hint">每个场景一个独立出口，可自由增删</span></h2>
+        <div class="rows" id="scenes"></div>
+        <div class="acts" style="margin-top:12px">
+          <button class="btn" data-act="mod-new">新增模块</button>
+          <button class="btn" data-act="mod-import">导入</button>
+          <button class="btn" data-act="mod-export">导出</button>
+          <button class="btn" data-act="mod-reset">恢复内置</button>
         </div>
+        <div class="note" id="modNote">模块就是 data/modules/*.json：一组域名 + 一个策略组。改完立即重建配置并热加载，不用重启程序。</div>
+      </section>
+      </div>
+    </section>
 
-        <section class="card">
-          <h2>更新<span class="hint" id="updHint"></span></h2>
-          <div class="acts">
-            <button class="btn" id="btnUpdate">检查更新</button>
-          </div>
-          <div class="pbar" id="progUpd" hidden><i></i><b>0%</b></div>
-          <div class="note" id="upd"></div>
-        </section>
+    <!-- 工具：一件工具一张卡，两列排开 -->
+    <section class="view" id="view-tools">
+      <div class="grid">
+      <section class="card c6">
+        <h2>校园网<span class="hint" id="cpHint">掉线自动重登，不用每次手动开认证页</span></h2>
+        <div class="gwrap" id="cpPills"></div>
+        <div class="row2" style="margin-top:12px">
+          <select class="sel" id="cpProvider" title="认证方式"></select>
+          <button class="btn" data-act="cp-detect">认一下门户</button>
+          <button class="btn" data-act="cp-login">立即登录</button>
+          <label class="sw" title="掉线后自动用上面的账号重登"><input type="checkbox" id="cpOn"><i></i></label>
+        </div>
+        <div class="cprow">
+          <input class="txt" id="cpUser" placeholder="学号 / 账号" autocomplete="username" spellcheck="false">
+          <input class="txt" id="cpPass" type="password" placeholder="密码（留空 = 不改）" autocomplete="current-password">
+        </div>
+        <div class="cprow">
+          <input class="txt" id="cpPortal" placeholder="认证页地址（留空自动识别）" spellcheck="false">
+          <input class="txt" id="cpTemplate" placeholder="自定义登录模板（可选）" spellcheck="false">
+        </div>
+        <div class="acts" style="margin-top:10px">
+          <button class="btn" data-act="cp-save">保存</button>
+          <span class="hint">认不出门户时：在浏览器打开一次认证页，复制地址填到「认证页地址」；要验证码的门户只能手动登录一次。</span>
+        </div>
+        <div class="note" id="cpNote"></div>
+      </section>
+      <section class="card c6">
+        <h2>本机解析<span class="hint" id="dnsHint"></span></h2>
+        <div class="gwrap" id="dnsPills"></div>
+        <div class="acts" style="margin-top:12px">
+          <button class="btn" data-dns-probe>测一次解析</button>
+          <label class="sw" title="本地 DNS 兜底：127.0.0.1:53"><input type="checkbox" id="dnsOn"><i></i></label>
+        </div>
+        <div class="note" id="dnsNote"></div>
+      </section>
+      <section class="card c6">
+        <h2>GitHub<span class="hint" id="ghHint"></span></h2>
+        <div class="gwrap" id="ghPills"></div>
+        <div class="acts" style="margin-top:12px">
+          <button class="btn" data-gh-check>自检五条链路</button>
+          <button class="btn" data-git-proxy>对齐 git 代理</button>
+        </div>
+        <div class="note" id="ghNote"></div>
+      </section>
+      <section class="card c6">
+        <h2>OCR 桥<span class="hint" id="ocrHint"></span></h2>
+        <div class="gwrap" id="ocrPills"></div>
+        <div class="acts" style="margin-top:12px">
+          <button class="btn" data-act="ocr-restart">重启桥</button>
+          <label class="sw" title="托盘内守护：端口没人听就拉起来"><input type="checkbox" id="ocrOn"><i></i></label>
+        </div>
+        <div class="note" id="ocrNote">图片先送到 127.0.0.1:8791 换成文字再转发给模型。它和代理无关：阿里云域名在规则里直连。</div>
+      </section>
+      <section class="card c6">
+        <h2>AI 通道<span class="hint"><label class="sw" title="Claude Code / Codex 走独立出口"><input type="checkbox" id="aiOn"><i></i></label></span></h2>
+        <div id="aiBody"></div>
+      </section>
+      <section class="card c6">
+        <h2>AI 接口<span class="hint">让本机的 AI 客户端直接操作这个程序</span></h2>
+        <div class="gwrap" id="apiPills"></div>
+        <div id="apiBody"></div>
+        <div class="acts" style="margin-top:12px">
+          <label class="sw" title="关闭后所有 /ai/v1 调用都返回 401"><input type="checkbox" id="apiOn"><i></i></label>
+          <select class="sel" id="apiLevel" title="AI 最多能做到哪一步">
+            <option value="read">只读</option>
+            <option value="write">可改配置</option>
+            <option value="full">完全控制</option>
+          </select>
+          <button class="btn" data-act="api-copy">复制 token</button>
+          <button class="btn" data-act="api-regen">重置 token</button>
+        </div>
+        <div class="note" id="apiNote"></div>
+      </section>
+      </div>
+    </section>
 
-        <section class="card">
-          <h2>日志<span class="hint" id="logHint">最近 60 行</span></h2>
-          <pre class="logbox" id="logs">—</pre>
-        </section>
-
-        <section class="card">
-          <h2>反馈</h2>
-          <div style="display:grid;gap:8px">
-            <input class="txt" id="fbTitle" placeholder="标题（可留空）" autocomplete="off">
-            <textarea id="fbDetail" placeholder="遇到的问题、复现步骤；日志会自动附上"></textarea>
-            <div class="acts"><button class="btn" id="fbSend">发送反馈</button></div>
-          </div>
-        </section>
+    <!-- 设置：开关 / 订阅 / 更新 / 日志 -->
+    <section class="view" id="view-settings">
+      <div class="grid">
+      <section class="card c6">
+        <h2>运行</h2>
+        <div class="togrow"><div class="k">运行模式<em>规则分流 / 全局 / 直连</em></div>
+          <select class="sel" id="modeSel" style="width:110px">
+            <option value="rule">规则</option><option value="global">全局</option><option value="direct">直连</option>
+          </select>
+        </div>
+        <div class="togrow"><div class="k">开机自启<em>登录后自动在托盘运行</em></div><label class="sw"><input type="checkbox" id="autoStart"><i></i></label></div>
+        <div class="togrow"><div class="k">TUN 模式<em>接管全部流量，需要管理员</em></div><label class="sw"><input type="checkbox" id="tunOn"><i></i></label></div>
+        <div class="togrow"><div class="k">自动优选<em>定时挑延迟最低的节点</em></div><label class="sw"><input type="checkbox" id="autoBest"><i></i></label></div>
+        <div class="togrow"><div class="k">故障自愈<em>节点不可用或断网时自动恢复</em></div><label class="sw"><input type="checkbox" id="healOn"><i></i></label></div>
+      </section>
+      <section class="card c6">
+        <h2>维护</h2>
+        <div class="acts">
+          <button class="btn" id="btnPurity">纯净度 · 当前节点</button>
+          <button class="btn" id="btnPurityAll">纯净度 · 全部</button>
+          <button class="btn" id="btnSpeed">带宽测速</button>
+          <button class="btn" id="btnScan">扫描代理冲突</button>
+          <button class="btn" id="btnLog">刷新日志</button>
+          <button class="btn danger" id="btnQuit">退出程序</button>
+        </div>
+        <div class="pbar" id="progPurity" hidden><i></i><b>0%</b></div>
+        <div class="pbar" id="progSpeed" hidden><i></i><b>0%</b></div>
+        <div class="note" id="ngNote" hidden></div>
+      </section>
+      <section class="card c7">
+        <h2>订阅列表<span class="hint" id="subCount"></span></h2>
+        <div class="rows" id="subs"></div>
+        <div class="addbar">
+          <input class="txt" id="subUrl" placeholder="粘贴订阅链接 https://…" autocomplete="off" spellcheck="false">
+          <button class="btn primary" id="subAdd">添加</button>
+        </div>
+      </section>
+      <section class="card c5">
+        <h2>流量概览<span class="hint" id="subHint"></span></h2>
+        <div class="sumgrid">
+          <div class="sumcell"><div class="k">当前订阅</div><div class="v" id="sumName">—</div></div>
+          <div class="sumcell"><div class="k">剩余流量</div><div class="v num" id="sumLeft">—</div></div>
+          <div class="sumcell"><div class="k">节点</div><div class="v num" id="sumNodes">—</div></div>
+        </div>
+        <div class="acts">
+          <button class="btn" id="subRefresh">立即更新</button>
+          <select class="sel" id="subMode" title="多条订阅的生效方式">
+            <option value="single">单条生效</option>
+            <option value="merge">合并所有</option>
+          </select>
+        </div>
+        <div class="note" id="subNote"></div>
+      </section>
+      <section class="card c6">
+        <h2>更新<span class="hint" id="updHint"></span></h2>
+        <div class="acts">
+          <button class="btn" id="btnUpdate">检查更新</button>
+        </div>
+        <div class="pbar" id="progUpd" hidden><i></i><b>0%</b></div>
+        <div class="note" id="upd"></div>
+      </section>
+      <section class="card c6">
+        <h2>反馈</h2>
+        <div style="display:grid;gap:8px">
+          <input class="txt" id="fbTitle" placeholder="标题（可留空）" autocomplete="off">
+          <textarea id="fbDetail" placeholder="遇到的问题、复现步骤；日志会自动附上"></textarea>
+          <div class="acts"><button class="btn" id="fbSend">发送反馈</button></div>
+        </div>
+      </section>
+      <section class="card c12">
+        <h2>日志<span class="hint" id="logHint">最近 60 行</span></h2>
+        <pre class="logbox" id="logs">—</pre>
+      </section>
       </div>
     </section>
   </main>
@@ -812,7 +825,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.1.1';
+var UI_VER = '1.2.0';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1060,22 +1073,23 @@ function flushStale() {
 document.addEventListener('focusout', function () { setTimeout(flushStale, 0); });
 
 var TITLES = {
-  home: ['概览', '连接状态与实时流量'],
-  nodes: ['节点', '按延迟或地区挑一个出口'],
-  scenes: ['场景加速', '一组域名 + 一个出口，可自由增删'],
-  ai: ['AI', '通道出口 · 本机接口 · OCR 桥'],
-  tools: ['扩展', '断网急救 · 校园网 · GitHub 链路 · 本机解析'],
-  subs: ['订阅', '管理与更新订阅链接'],
-  settings: ['设置', '运行模式、维护与日志']
+  home: ['概览', '现在通不通，一眼看完'],
+  fix: ['修复', '不通的时候来这一页：先出结论，再动手'],
+  speed: ['加速', '出口与节点：慢就换，打不开就单独开个场景'],
+  tools: ['工具', '校园网 · GitHub · 本机解析 · OCR · AI 接口'],
+  settings: ['设置', '订阅、运行模式、更新与日志']
 };
+// 旧的深链接（书签里存着 nodes/scenes/ai/subs）落到新页面，别让人打开是空白
+var VIEW_ALIAS = { nodes: 'speed', scenes: 'speed', ai: 'tools', subs: 'settings' };
 
 function setView(v) {
+  v = VIEW_ALIAS[v] || v;
   if (!TITLES[v]) v = 'home';
   var prev = VIEW;
   VIEW = v;
   LS.set('vpn.view', v);
   var i;
-  var ORDER = ['home', 'nodes', 'scenes', 'ai', 'tools', 'subs', 'settings'];
+  var ORDER = ['home', 'fix', 'speed', 'tools', 'settings'];
   var dir = '';
   if (prev && ORDER.indexOf(v) > ORDER.indexOf(prev)) dir = 'right';
   else if (prev && ORDER.indexOf(v) < ORDER.indexOf(prev)) dir = 'left';
@@ -1934,6 +1948,14 @@ function dgFixBtn(act, elevate, label) {
 
 function renderDoctor() {
   var d = (S && S.doctor) || {};
+  // 侧栏「修复」上的数字：这次诊断抓到几条，重的那条用红字，让人不用点进来也知道有事
+  var nb = $('#navFix');
+  if (nb) {
+    var fs0 = (DG.report && DG.report.findings) || [];
+    var crit0 = fs0.filter(function (f) { return f.severity === 'critical' || f.severity === 'high'; }).length;
+    nb.textContent = fs0.length ? String(fs0.length) : '';
+    nb.className = 'n' + (crit0 ? ' bad' : '');
+  }
   var pills = [];
   if (d.available === false) {
     pills.push('<span class="gp bad">' + esc(dgErr({ error: { code: 'ERR-ND-MISSING', msg: d.error } }) || '诊断内核不可用') + '</span>');
@@ -2160,14 +2182,31 @@ async function dgUndo(runId) {
   } finally { DG.busy = false; renderDoctor(); }
 }
 
+/* 概览页的三个入口：不复制逻辑，直接跳到那一页再按对应的按钮 */
+function goProblem(kind) {
+  if (kind === 'offline') {
+    setView('fix');
+    var b = document.querySelector('[data-act="dg-check"]');
+    if (b) b.click();
+    else toast('诊断内核不可用，先看修复页的提示', 'bad');
+  } else if (kind === 'site') {
+    setView('fix');
+    var h = $('#dgHost');
+    if (h) { h.focus(); if (h.select) h.select(); }
+    toast('填一个域名，点「DNS + 逐跳」');
+  } else if (kind === 'slow') {
+    setView('speed');
+    var t = $('#btnTest2') || $('#btnTest');
+    if (t) t.click();
+  }
+}
+
 function renderView(v) {
   if (v === 'home') renderHome();
-  else if (v === 'nodes') { renderChips(); renderNodes(); }
-  else if (v === 'scenes') renderScenes();
-  else if (v === 'ai') { renderAI(); renderModulesApi(); renderOcr(); }
-  else if (v === 'tools') { renderNetDoc(); renderCampus(); renderDoctor(); renderGithub(); renderDns(); }
-  else if (v === 'subs') renderSubs();
-  else if (v === 'settings') renderSettings();
+  else if (v === 'fix') { renderDoctor(); renderNetDoc(); }
+  else if (v === 'speed') { renderChips(); renderNodes(); renderScenes(); }
+  else if (v === 'tools') { renderCampus(); renderDns(); renderGithub(); renderOcr(); renderAI(); renderModulesApi(); }
+  else if (v === 'settings') { renderSettings(); renderSubs(); }
 }
 function render() {
   if (!S) return;
@@ -2413,6 +2452,9 @@ document.addEventListener('click', function (e) {
   else if (a === 'dg-paste') dgPaste();
   else if (a === 'dg-fix') dgFix(el.dataset.a, !!el.dataset.el);
   else if (a === 'dg-undo') dgUndo(el.dataset.r);
+  else if (a === 'go-offline') goProblem('offline');
+  else if (a === 'go-site') goProblem('site');
+  else if (a === 'go-slow') goProblem('slow');
 });
 
 $('#modYes').addEventListener('click', function () { modSave(); });
@@ -2696,9 +2738,15 @@ $('#agreeOk').addEventListener('click', async function () {
 
 document.addEventListener('keydown', function (e) {
   var tag = document.activeElement ? document.activeElement.tagName : '';
+  // Alt+1..5 直达五页：键盘走完一遍不用摸鼠标
+  if (e.altKey && !e.ctrlKey && /^[1-5]$/.test(e.key)) {
+    e.preventDefault();
+    setView(['home', 'fix', 'speed', 'tools', 'settings'][Number(e.key) - 1]);
+    return;
+  }
   if (e.key === '/' && tag !== 'INPUT' && tag !== 'TEXTAREA') {
     e.preventDefault();
-    setView('nodes');
+    setView('speed');
     setTimeout(function () { $('#q').focus(); }, 30);
   }
 });

@@ -92,5 +92,38 @@ class FrontendStaticTest(unittest.TestCase):
         self.assertIn("data/settings.json", self.html)
 
 
+
+
+class FrontendIATest(unittest.TestCase):
+    """信息架构守卫：五页、问题入口、网格跨度。
+
+    界面重排最容易「改着改着又长回七页」「问题入口变成死按钮」，所以这几条留成静态断言。
+    """
+
+    def setUp(self) -> None:
+        self.html = INDEX.read_text(encoding="utf-8")
+
+    def test_five_views_only(self) -> None:
+        views = re.findall(r'data-view="([a-z]+)"', self.html)
+        self.assertEqual(views, ["home", "fix", "speed", "tools", "settings"])
+        for dead in ("view-nodes", "view-scenes", "view-ai", "view-subs"):
+            self.assertNotIn('id="' + dead + '"', self.html, "旧页面还留着：" + dead)
+
+    def test_problem_entries_wired(self) -> None:
+        for act in ("go-offline", "go-site", "go-slow"):
+            self.assertIn('data-act="' + act + '"', self.html)
+            self.assertIn("a === '" + act + "'", self.html)
+        self.assertIn("function goProblem(kind)", self.html)
+
+    def test_grid_spans_declared(self) -> None:
+        used = set(re.findall(r'class="card (c[0-9]+)"', self.html))
+        self.assertTrue(used, "没有卡片用网格跨度，说明还是单列堆叠")
+        for cls in sorted(used):
+            self.assertIn(".grid > ." + cls + "{grid-column:span", self.html, "缺网格规则：" + cls)
+
+    def test_legacy_view_links_aliased(self) -> None:
+        self.assertIn("var VIEW_ALIAS", self.html)
+        for old in ("nodes", "scenes", "ai", "subs"):
+            self.assertIn(old + ":", self.html)
 if __name__ == "__main__":
     unittest.main()
