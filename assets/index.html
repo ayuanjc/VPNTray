@@ -2037,7 +2037,7 @@ function renderDoctor() {
       var ee = et.error || {};
       rows.push('<div class="ndrow warn"><div class="h"><span class="ndbadge warn"></span>'
         + '<span class="t">这个窗口抓不了事件</span><span class="b">' + esc(ee.msg || ee.code || '') + '</span></div></div>');
-      if (et.elevate && et.elevate.display) {
+      if (et.elevate && (et.elevate.msg || et.elevate.display)) {
         rows.push('<div class="ndrow info"><div class="h"><span class="ndbadge info"></span>'
           + '<span class="t">要在管理员下抓</span><span class="b">' + esc(et.elevate.msg || '把下面这条贴进管理员 PowerShell') + '</span></div>'
           + (et.elevate.display ? '<details><summary>命令</summary><pre>' + esc(et.elevate.display) + '</pre></details>' : '') + '</div>');
