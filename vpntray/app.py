@@ -17,7 +17,7 @@ from typing import Any, Callable
 import requests
 
 from . import __version__ as _VERSION
-from . import autostart, campus, configgen, disguise, dnsguard, github_ops, hotspot, kernel as kernel_mod, modules as modules_mod, netguard, ocrbridge, okxguard, purity, subscription, sysproxy
+from . import autostart, campus, configgen, disguise, dnsguard, doctor, github_ops, hotspot, kernel as kernel_mod, modules as modules_mod, netguard, ocrbridge, okxguard, purity, subscription, sysproxy
 from .api import ApiError, MihomoAPI
 from .kernel import Kernel
 from .paths import CONFIG, DELAYS, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
@@ -1109,6 +1109,10 @@ class App:
             ocrbridge.stop()
         except Exception as e:  # noqa: BLE001
             log.warning("停止 OCR 桥自检失败: %s", e)
+        try:
+            doctor.stop()
+        except Exception as e:  # noqa: BLE001
+            log.warning("停止诊断内核失败: %s", e)
         for t in self._threads:
             t.join(timeout=2)
         self._threads.clear()

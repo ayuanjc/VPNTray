@@ -15,7 +15,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__ as _APP_VER
-from . import aiops, campus, disguise, dnsguard, okxguard
+from . import aiops, campus, disguise, dnsguard, doctor, okxguard
 from .paths import ROOT, asset
 from .purity import FLAG_CC
 
@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.0.1"
+UI_VER = "1.1.0"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -170,6 +170,18 @@ def _ocr_state(app) -> dict[str, Any]:
     return st
 
 
+def _doctor_state(app) -> dict[str, Any]:
+    """诊断内核的轻量状态。真正的快照由 /api/doctor/status 懒启动后再取。"""
+    try:
+        st = doctor.light(app)
+    except Exception as e:  # noqa: BLE001 诊断本身挂了也不能让面板白屏
+        st = {"enabled": True, "available": False, "version": "", "started": False,
+              "error": "%s: %s" % (type(e).__name__, e)}
+    if not st.get("enabled"):
+        st["error"] = st.get("error") or "诊断内核已在设置里关闭（settings.json 的 doctor）"
+    return st
+
+
 def build_state(app) -> dict[str, Any]:
     st = app.snapshot()
     proxies = st.get("proxies") or {}
@@ -289,6 +301,8 @@ def build_state(app) -> dict[str, Any]:
         "campus": app.campus_status(),
         # OCR 桥：端口在听吗、模型、已转张数。探活用 /health，不是 TCP connect。
         "ocr": _ocr_state(app),
+        # 诊断内核（yuans_nd）：轻量状态，打开诊断卡才真正启动采集
+        "doctor": _doctor_state(app),
         "update": st.get("update") or {},
         "update_repo": s.get("update_repo", ""),
         "purity_count": sum(1 for n in nodes if n.get("purity") is not None),
@@ -725,6 +739,63 @@ class WebUI:
                     pass
             return {"ok": True, **info, "campus": app.campus_status()}
 
+        # ── 诊断内核（yuans_nd 1.4）：全部走宿主进程内调用，不占额外端口 ──
+        def doctor_status(_body=None):
+            return {"ok": True, "doctor": doctor.status(app)}
+
+        def doctor_diagnose(body):
+            b = body or {}
+            mode = str(b.get("mode") or "quick").strip().lower()
+            if mode not in ("quick", "deep", "paste"):
+                return {"ok": False, "error": "mode 只能是 quick / deep / paste"}
+            out = doctor.diagnose(app, mode=mode, text=str(b.get("text") or ""))
+            return {"ok": bool(out.get("ok")), **out, "doctor": _doctor_state(app)}
+
+        def doctor_detail(body):
+            b = body or {}
+            host = str(b.get("host") or "").strip()
+            if not host:
+                return {"ok": False, "error": "要填主机名，例如 www.okx.com"}
+            try:
+                port = int(b.get("port") or 443)
+            except (TypeError, ValueError):
+                port = 443
+            out = doctor.detail(app, host, port=port)
+            return {"ok": bool(out.get("ok")), **out}
+
+        def doctor_events(body):
+            b = body or {}
+            try:
+                limit = max(1, min(500, int(b.get("limit") or 80)))
+            except (TypeError, ValueError):
+                limit = 80
+            out = doctor.events(app, limit=limit, kind=str(b.get("kind") or ""))
+            return {"ok": bool(out.get("ok")), **out}
+
+        def doctor_actions(_body=None):
+            return {"ok": True, **doctor.actions(app)}
+
+        def doctor_fix(body):
+            """执行一个动作。elevate=true 表示「弹 UAC 让用户自己点」。"""
+            b = body or {}
+            act_id = str(b.get("action") or "").strip()
+            if not act_id:
+                return {"ok": False, "error": "缺少 action"}
+            why = str(b.get("why") or "用户在诊断页点击")
+            if _flag(b.get("elevate", False), "elevate"):
+                out = doctor.elevate_run(app, act_id, why=why)
+            else:
+                out = doctor.fix(app, act_id, why=why, params=b.get("args") or {})
+            return {**out, "doctor": _doctor_state(app)}
+
+        def doctor_undo(body):
+            b = body or {}
+            run_id = str(b.get("run_id") or "").strip()
+            if not run_id:
+                return {"ok": False, "error": "缺少 run_id"}
+            out = doctor.undo(app, run_id)
+            return {**out, "doctor": _doctor_state(app)}
+
         return {
             "/api/ai/node": ai_node,
             "/api/ai/toggle": ai_toggle,
@@ -750,6 +821,13 @@ class WebUI:
             "/api/ocr/status": ocr_status,
             "/api/ocr/restart": ocr_restart,
             "/api/ocr/config": ocr_config,
+            "/api/doctor/status": doctor_status,
+            "/api/doctor/diagnose": doctor_diagnose,
+            "/api/doctor/detail": doctor_detail,
+            "/api/doctor/events": doctor_events,
+            "/api/doctor/actions": doctor_actions,
+            "/api/doctor/fix": doctor_fix,
+            "/api/doctor/undo": doctor_undo,
         }
 
     # ── 杂项：拓扑 / 内核 / 连接 / 更新 / 冲突清理 / 反馈 ──

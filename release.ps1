@@ -40,6 +40,8 @@ python -m PyInstaller --noconfirm --clean --onedir --windowed `
     --hidden-import clr_loader `
     --hidden-import pythonnet `
     --collect-data webview `
+    --paths (Join-Path $PSScriptRoot '..\network-doctor') `
+    --collect-submodules yuans_nd `
     --exclude-module tkinter `
     --exclude-module setuptools `
     --exclude-module pkg_resources `

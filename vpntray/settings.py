@@ -129,6 +129,11 @@ DEFAULTS: dict[str, Any] = {
     "update_repo": "ayuanjc/VPNTray",  # GitHub 仓库 owner/name，留空则关闭更新检查
     "update_interval_hours": 12,    # 后台复查间隔（小时）；0=只在启动时查一次
 
+    # ——— 诊断内核（yuans_nd）———
+    "doctor": True,                 # 扩展页的「诊断内核」卡：懒启动，没人看就不采集
+    "doctor_actions": True,         # 允许诊断页执行 safe 级动作（改系统代理等要再确认）
+    "doctor_targets": [],           # 额外主动探测的主机名，例如 ["www.okx.com"]
+
     # ——— 其它 ———
     "log_level": "warning",
     "notify": True,

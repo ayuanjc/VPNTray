@@ -579,6 +579,28 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
           <div class="note" id="ndNote"></div>
         </section>
         <section class="card">
+          <h2>诊断内核<span class="hint" id="dgHint">先出结论，再谈修：每条结论都挂着事件证据</span></h2>
+          <div class="gwrap" id="dgPills"><span class="gp">还没查过</span></div>
+          <div class="acts" style="margin-top:12px">
+            <button class="btn" data-act="dg-check">一键体检</button>
+            <button class="btn" data-act="dg-deep" title="多探几轮：DNS 分路、逐跳、TLS 都看">深度诊断</button>
+            <button class="btn" data-act="dg-events">最近事件</button>
+          </div>
+          <div class="cprow">
+            <input class="txt" id="dgHost" placeholder="要查的主机名，例如 www.okx.com" spellcheck="false" autocomplete="off">
+            <button class="btn" data-act="dg-detail">DNS + 逐跳</button>
+          </div>
+          <div style="margin-top:10px">
+            <textarea class="txt" id="dgText" rows="2" placeholder="或者贴一段报错：Cannot connect to host www.okx.com:443 ssl:default [None]" spellcheck="false"></textarea>
+          </div>
+          <div class="acts" style="margin-top:10px">
+            <button class="btn" data-act="dg-paste">诊断这段话</button>
+            <span class="hint">诊断只读。要动手点结果里的按钮：改系统代理这类还会再问你一次，需要管理员的会给你一个「弹 UAC」的按钮。</span>
+          </div>
+          <div id="dgList" class="ndlist"></div>
+          <div class="note" id="dgNote"></div>
+        </section>
+        <section class="card">
           <h2>校园网<span class="hint" id="cpHint">掉线自动重登，不用每次手动开认证页</span></h2>
           <div class="gwrap" id="cpPills"></div>
           <div class="row2" style="margin-top:12px">
@@ -789,7 +811,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.0.1';
+var UI_VER = '1.1.0';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1877,12 +1899,251 @@ function renderSettings() {
     + (S.data_dir_fallback && S.data_dir ? ' · 设置存放在 ' + S.data_dir : '');
 }
 
+/* ───── 诊断内核（yuans_nd）：结论 + 证据 + 动作 ───── */
+var DG = { report: null, events: null, detail: null, run: null, actions: [], busy: false };
+var DG_SEV = { critical: 'bad', high: 'bad', medium: 'warn', low: 'info', info: 'info' };
+var DG_VERDICT = { healthy: '正常', degraded: '能用，但有隐患', broken: '坏了', unknown: '证据不足' };
+var DG_FAIL = {
+  'ERR-ACT-NEED-ADMIN': '这个动作要管理员权限',
+  'ERR-ACT-NO-SNAPSHOT': '取不到执行前快照，已拒绝执行',
+  'ERR-ACT-BUSY': '另一个动作正在跑，稍等',
+  'ERR-ACT-PRECOND': '前置条件不满足',
+  'ERR-ACT-ROLLBACK': '执行失败，回滚也失败了',
+  'ERR-ND-MISSING': '这台机器上没装诊断内核（yuans_nd）'
+};
+
+function dgErr(r) {
+  var e = (r && r.error) || null;
+  if (!e) return (r && r.msg) || '';
+  if (typeof e === 'string') return e;
+  var t = DG_FAIL[e.code] || e.msg || e.code || '';
+  return (DG_FAIL[e.code] && e.msg && DG_FAIL[e.code] !== e.msg) ? t + '：' + e.msg : t;
+}
+
+function dgActTitle(id) {
+  for (var i = 0; i < DG.actions.length; i++) if (DG.actions[i].id === id) return DG.actions[i].title || id;
+  return '修';
+}
+
+function dgFixBtn(act, elevate, label) {
+  if (!act) return '';
+  return '<button class="btn" data-act="dg-fix" data-a="' + esc(act) + '"'
+    + (elevate ? ' data-el="1"' : '') + '>' + esc(label || dgActTitle(act)) + '</button>';
+}
+
+function renderDoctor() {
+  var d = (S && S.doctor) || {};
+  var pills = [];
+  if (d.available === false) {
+    pills.push('<span class="gp bad">' + esc(dgErr({ error: { code: 'ERR-ND-MISSING', msg: d.error } }) || '诊断内核不可用') + '</span>');
+  } else {
+    pills.push('<span class="gp ok">yuans_nd ' + esc(d.version || '') + '</span>');
+    pills.push('<span class="gp ' + (d.started ? 'ok' : '') + '">' + (d.started ? '正在采集' : '未启动') + '</span>');
+  }
+  var rep = DG.report;
+  if (rep) {
+    var v = DG_SEV[rep.verdict] ? (rep.verdict === 'healthy' ? 'ok' : (rep.verdict === 'broken' ? 'bad' : '')) : '';
+    pills.push('<span class="gp ' + v + '">' + esc(DG_VERDICT[rep.verdict] || rep.verdict) + '</span>');
+    pills.push('<span class="gp">置信度 ' + Math.round(n(rep.confidence, 0) * 100) + '%</span>');
+    var cov = rep.coverage || {};
+    pills.push('<span class="gp">事件 ' + n(cov.events, 0) + ' 条 / ' + n(cov.window_s, 60) + 's</span>');
+    if (rep.repeats && n(rep.repeats.count, 1) > 1) {
+      pills.push('<span class="gp">第 ' + n(rep.repeats.count, 1) + ' 次复发</span>');
+    }
+  }
+  patch('#dgPills', pills.join(''));
+
+  var rows = [];
+  if (rep) {
+    var fs = rep.findings || [];
+    if (!fs.length) {
+      rows.push('<div class="ndrow ' + (rep.verdict === 'healthy' ? 'ok' : 'info') + '"><div class="h">'
+        + '<span class="ndbadge ' + (rep.verdict === 'healthy' ? 'ok' : 'info') + '"></span>'
+        + '<span class="t">' + esc(rep.headline || DG_VERDICT[rep.verdict] || '') + '</span>'
+        + '<span class="b">' + esc((rep.errors || []).length ? '采集有报错，见下方说明' : '') + '</span></div></div>');
+    }
+    fs.forEach(function (f) {
+      var lv = DG_SEV[f.severity] || 'info';
+      var ev = (f.evidence || []).map(function (e) {
+        return '· ' + (e.label ? e.label + '：' : '') + (e.value || '') + (e.ref ? '（' + e.ref + '）' : '');
+      }).join('\n');
+      var det = ev ? '<details><summary>证据 ' + (f.evidence || []).length + ' 条</summary><pre>' + esc(ev) + '</pre></details>' : '';
+      rows.push('<div class="ndrow ' + lv + '"><div class="h">'
+        + '<span class="ndbadge ' + lv + '"></span>'
+        + '<span class="t">' + esc(f.title || f.code) + '</span>'
+        + '<span class="b">' + esc(f.why || '') + '</span>'
+        + dgFixBtn(f.fix) + '</div>' + det + '</div>');
+    });
+    if (DG.needAdmin) {
+      rows.push('<div class="ndrow warn"><div class="h"><span class="ndbadge warn"></span>'
+        + '<span class="t">' + esc(dgActTitle(DG.needAdmin)) + ' 需要管理员</span>'
+        + '<span class="b">点右边会弹系统 UAC，你在弹窗里点「是」才会执行</span>'
+        + dgFixBtn(DG.needAdmin, true, '以管理员执行（弹 UAC）') + '</div></div>');
+    }
+    var run = DG.run;
+    if (run && run.undo_until) {
+      rows.push('<div class="ndrow info"><div class="h"><span class="ndbadge info"></span>'
+        + '<span class="t">刚才执行了 ' + esc(dgActTitle(run.act_id)) + '</span>'
+        + '<span class="b">' + esc(run.ok ? '成功' : '失败') + '，撤销窗口到 ' + esc(run.undo_until) + '</span>'
+        + '<button class="btn" data-act="dg-undo" data-r="' + esc(run.run_id) + '">撤销</button></div></div>');
+    }
+  }
+  if (DG.detail) {
+    var dt = DG.detail;
+    var dns = (dt.dns || []).map(function (x) {
+      var body = '无 A 记录';
+      if (!x.ok) {
+        body = x.err || '查询失败';
+      } else {
+        body = (x.ips || []).join(', ') || '无 A 记录';
+        if (x.cnames && x.cnames.length) body += '（CNAME ' + x.cnames.join(' → ') + '）';
+        if (x.poison) body += ' ⚠ 黑洞地址';
+      }
+      return '· ' + (x.server || '?') + '：' + body + (x.ms != null ? ' · ' + x.ms + 'ms' : '');
+    }).join('\n');
+    var hops = ((dt.trace || {}).hops || []).map(function (h) {
+      return n(h.hop, 0) + '. ' + (h.ip || '*') + (h.ms != null ? ' · ' + h.ms + 'ms' : '') + (h.note ? ' · ' + h.note : '');
+    }).join('\n');
+    var tcp = dt.tcp || {};
+    rows.push('<div class="ndrow info"><div class="h"><span class="ndbadge info"></span>'
+      + '<span class="t">' + esc(dt.host || '') + ':' + n(dt.port, 443) + '</span>'
+      + '<span class="b">' + (tcp.ok ? 'TCP 连得上' + (tcp.ms != null ? ' · ' + tcp.ms + 'ms' : '') : 'TCP 连不上') + '</span></div>'
+      + '<details><summary>DNS 分路</summary><pre>' + esc(dns || '没取到') + '</pre></details>'
+      + '<details><summary>逐跳</summary><pre>' + esc(hops || '没取到') + '</pre></details></div>');
+  }
+  if (DG.events) {
+    var evs = DG.events || [];
+    var kinds = {};
+    evs.forEach(function (e) { kinds[e.kind] = (kinds[e.kind] || 0) + 1; });
+    var sum = Object.keys(kinds).map(function (k) { return k + ' ' + kinds[k]; }).join(' · ');
+    var lines = evs.map(function (e) {
+      return e.ts + '  ' + e.kind + '  ' + (e.host || '') + (e.port ? ':' + e.port : '')
+        + (e.node ? '  via ' + e.node : '') + (e.error ? '  ' + e.error : '');
+    }).join('\n');
+    rows.push('<div class="ndrow info"><div class="h"><span class="ndbadge info"></span>'
+      + '<span class="t">最近事件 ' + evs.length + ' 条</span><span class="b">' + esc(sum) + '</span></div>'
+      + '<details><summary>原始事件</summary><pre>' + esc(lines) + '</pre></details></div>');
+  }
+  patch('#dgList', rows.join(''));
+
+  var note = [];
+  if (d.available === false) note.push('诊断内核是独立库（yuans_nd）：装上它，或者把 PYTHONPATH 指到它的仓库根目录，这一卡就能用。');
+  else if (rep) {
+    note.push('结论来自 ' + n((rep.coverage || {}).events, 0) + ' 条事件；coverage 不完整时结论只会是「证据不足」，不会猜。');
+    if ((rep.errors || []).length) note.push('采集报错：' + (rep.errors || []).map(function (e) { return e.code + (e.msg ? ' ' + e.msg : ''); }).join('；'));
+  } else if (d.error) note.push(dgErr({ error: { code: '', msg: d.error } }));
+  else note.push('第一次点「一键体检」时才开始采集（每 2 秒一轮，只读内核 /connections 与系统 DNS）。');
+  patch('#dgNote', esc(note.filter(Boolean).join(' · ')));
+}
+
+async function dgLoadActions() {
+  if (DG.actions.length) return;
+  var r = await api('/api/doctor/actions', {});
+  if (r && r.data) DG.actions = r.data;
+}
+
+async function dgCheck(mode) {
+  if (DG.busy) return;
+  DG.busy = true;
+  var sel = mode === 'deep' ? '[data-act="dg-deep"]' : '[data-act="dg-check"]';
+  var b = document.querySelector(sel);
+  var old = b ? b.textContent : '';
+  if (b) { b.disabled = true; b.classList.add('busy'); b.textContent = mode === 'deep' ? '深挖中' : '体检中'; }
+  patch('#dgNote', mode === 'deep' ? '正在深挖：多轮采集 + DNS 分路 + 证据链 …' : '正在体检 …');
+  try {
+    await dgLoadActions();
+    var r = await api('/api/doctor/diagnose', { mode: mode || 'quick' }, { timeout: API_SLOW });
+    if (r && r.doctor) { S.doctor = r.doctor; }
+    if (r && r.report) { DG.report = r.report; DG.detail = null; DG.events = null; }
+    else toast(dgErr(r) || '诊断失败', 'bad');
+  } finally {
+    DG.busy = false;
+    if (b) { b.disabled = false; b.classList.remove('busy'); b.textContent = old; }
+    renderDoctor();
+  }
+}
+
+async function dgPaste() {
+  var t = $('#dgText');
+  var text = t ? t.value.trim() : '';
+  if (!text) { toast('先贴一段报错或域名', 'bad'); return; }
+  if (DG.busy) return;
+  DG.busy = true;
+  try {
+    var r = await api('/api/doctor/diagnose', { mode: 'paste', text: text }, { timeout: API_SLOW });
+    if (r && r.report) { DG.report = r.report; DG.detail = null; DG.events = null; }
+    else toast(dgErr(r) || '诊断失败', 'bad');
+  } finally { DG.busy = false; renderDoctor(); }
+}
+
+async function dgDetail() {
+  var h = $('#dgHost');
+  var host = h ? h.value.trim() : '';
+  if (!host) { toast('先填主机名', 'bad'); return; }
+  if (DG.busy) return;
+  DG.busy = true;
+  patch('#dgNote', '正在查 ' + host + '：DNS 分路 + 逐跳 …');
+  try {
+    var r = await api('/api/doctor/detail', { host: host }, { timeout: API_SLOW });
+    if (r && r.ok && r.host) { DG.detail = r; DG.events = null; }
+    else toast(dgErr(r) || '查询失败', 'bad');
+  } finally { DG.busy = false; renderDoctor(); }
+}
+
+async function dgEvents() {
+  if (DG.busy) return;
+  DG.busy = true;
+  try {
+    var r = await api('/api/doctor/events', { limit: 60 }, { timeout: API_SLOW });
+    if (r && r.events) { DG.events = r.events; }
+    else toast(dgErr(r) || '取事件失败', 'bad');
+  } finally { DG.busy = false; renderDoctor(); }
+}
+
+async function dgFix(act, elevate) {
+  if (!act) return;
+  if (DG.busy) return;
+  DG.busy = true;
+  try {
+    var body = { action: act, why: '用户在诊断页点击' };
+    if (elevate) body.elevate = true;
+    var r = await api('/api/doctor/fix', body, { timeout: API_SLOW });
+    if (r && r.run) {
+      DG.run = r.run;
+      toast((r.run.ok ? '已执行：' : '执行失败：') + dgActTitle(act), r.run.ok ? 'good' : 'bad');
+    } else if (r && r.elevate && r.result && !r.result.ok) {
+      toast(r.result.cancelled ? '你在 UAC 里点了取消' : (r.result.error || '提权失败'), 'bad');
+    } else if (r && r.elevate && r.elevate.display) {
+      toast('已交给提权窗口执行，稍后刷新看结果', 'good');
+    } else {
+      var e = (r && r.error) || {};
+      var hint = e.elevate && e.elevate.available
+        ? '（点「以管理员执行」会弹 UAC：' + e.elevate.display + '）' : '';
+      toast(dgErr(r) + hint, 'bad');
+      if (e.code === 'ERR-ACT-NEED-ADMIN' && e.elevate && e.elevate.available) {
+        DG.needAdmin = act;
+      }
+    }
+    if (r && r.doctor) S.doctor = r.doctor;
+  } finally { DG.busy = false; renderDoctor(); }
+}
+
+async function dgUndo(runId) {
+  if (!runId || DG.busy) return;
+  DG.busy = true;
+  try {
+    var r = await api('/api/doctor/undo', { run_id: runId }, { timeout: API_SLOW });
+    if (r && r.ok) { DG.run = null; toast('已撤销', 'good'); }
+    else toast(dgErr(r) || '撤销失败', 'bad');
+  } finally { DG.busy = false; renderDoctor(); }
+}
+
 function renderView(v) {
   if (v === 'home') renderHome();
   else if (v === 'nodes') { renderChips(); renderNodes(); }
   else if (v === 'scenes') renderScenes();
   else if (v === 'ai') { renderAI(); renderModulesApi(); renderOcr(); }
-  else if (v === 'tools') { renderNetDoc(); renderCampus(); renderGithub(); renderDns(); }
+  else if (v === 'tools') { renderNetDoc(); renderCampus(); renderDoctor(); renderGithub(); renderDns(); }
   else if (v === 'subs') renderSubs();
   else if (v === 'settings') renderSettings();
 }
@@ -2122,6 +2383,13 @@ document.addEventListener('click', function (e) {
   else if (a === 'cp-detect') cpDetect();
   else if (a === 'cp-login') cpLogin();
   else if (a === 'ocr-restart') ocrRestart();
+  else if (a === 'dg-check') dgCheck('quick');
+  else if (a === 'dg-deep') dgCheck('deep');
+  else if (a === 'dg-events') dgEvents();
+  else if (a === 'dg-detail') dgDetail();
+  else if (a === 'dg-paste') dgPaste();
+  else if (a === 'dg-fix') dgFix(el.dataset.a, !!el.dataset.el);
+  else if (a === 'dg-undo') dgUndo(el.dataset.r);
 });
 
 $('#modYes').addEventListener('click', function () { modSave(); });
