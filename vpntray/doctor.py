@@ -67,6 +67,16 @@ def _data_dir(app: Any) -> str:
     return str(base / "doctor")
 
 
+def _config_path() -> Optional[str]:
+    """生成的 config.yaml 路径；找不到就给空（nd 会退回 198.18.0.0/15）。"""
+    try:
+        from . import paths
+        path = Path(paths.CONFIG)
+    except Exception:          # 打包版路径模块异常不影响诊断
+        return None
+    return str(path) if path.is_file() else None
+
+
 def _values(app: Any) -> dict[str, Any]:
     st = app.settings
     secret = str(st.get("secret") or "").strip()
@@ -81,6 +91,8 @@ def _values(app: Any) -> dict[str, Any]:
         "probe_targets": [str(x).strip() for x in (st.get("doctor_targets") or []) if str(x).strip()][:8],
         "action_enabled": bool(st.get("doctor_actions", True)),
         "allow_dangerous_actions": False,
+        # fake-ip 池的真实网段只在生成的 config.yaml 里（mihomo 的 /configs 不含 DNS 段）
+        "kernel_config_path": str(_config_path()),
         # 宿主进程内调用，别再开一个 HTTP 端口
         "api_enabled": False,
         "log_level": "warning",
