@@ -179,6 +179,11 @@ def clock(app: Any) -> dict[str, Any]:
     return _guard(app, lambda s: s.clock())
 
 
+def net(app: Any) -> dict[str, Any]:
+    """当前出口与网卡（yuans_nd 1.8.0）：走哪张网卡、v4/v6 是否都有地址。"""
+    return _guard(app, lambda s: s.net())
+
+
 def etw(app: Any, seconds: float = 10.0) -> dict[str, Any]:
     """按需抓一段 DNS/TCPIP 事件（yuans_nd 1.6.0）：需要管理员，非管理员只回命令模板。"""
     out = _guard(app, lambda s: s.etw(seconds=seconds, top=10))

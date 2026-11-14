@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.2.2"
+UI_VER = "1.2.3"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -805,6 +805,12 @@ class WebUI:
             out = doctor.clock(app)
             return {**out, "doctor": _doctor_state(app)}
 
+        def doctor_net(_body=None):
+            """当前出口：走哪张网卡、v4/v6 源地址。只读探测，不需要管理员。"""
+            out = doctor.net(app)
+            return {**out, "doctor": _doctor_state(app)}
+
+
         def doctor_etw(body):
             """抓一段 DNS/TCPIP 事件。需要管理员：非管理员返回命令模板，不自行提权。"""
             b = body or {}
@@ -858,6 +864,7 @@ class WebUI:
             "/api/doctor/undo": doctor_undo,
             "/api/doctor/clock": doctor_clock,
             "/api/doctor/etw": doctor_etw,
+            "/api/doctor/net": doctor_net,
         }
 
     # ── 杂项：拓扑 / 内核 / 连接 / 更新 / 冲突清理 / 反馈 ──

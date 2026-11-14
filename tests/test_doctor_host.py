@@ -76,6 +76,10 @@ class FakeSvc:
                 "by_provider": [{"provider": "Microsoft-Windows-DNS-Client", "count": 7}],
                 "dns_slowest": [], "dns_failures": []}
 
+    def net(self):
+        return {"ok": True, "net": {"v4": {"ok": True, "src": "172.50.86.61", "iface": "WLAN", "ifindex": 18},
+                "v6": {"ok": False, "src": ""}, "adapters": 45, "multi": False}}
+
     def export(self, host="", port=443):
         return {"ok": True, "path": "X:/diag/nd-diag-1.zip", "size": 4096,
                 "files": ["README.txt", "manifest.json"], "host": host, "port": port}
@@ -127,6 +131,11 @@ class ClockEtwTest(unittest.TestCase):
         out = doctor.clock(self.app)
         self.assertTrue(out["ok"])
         self.assertEqual(out["skew_s"], 0)
+
+    def test_net_passes_through(self):
+        out = doctor.net(self.app)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["net"]["v4"]["src"], "172.50.86.61")
 
     def test_etw_denied_attaches_admin_command(self):
         out = doctor.etw(self.app, seconds=10)

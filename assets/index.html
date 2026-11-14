@@ -574,6 +574,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
       <button class="btn" data-act="dg-export" title="把结论、证据、事件与详细视图打成一个 zip，拿去别的机器复盘">导出诊断包</button>
             <button class="btn" data-act="dg-clock" title="证书报错时先看这里：本机时间与服务器差多少秒">对一下时间</button>
             <button class="btn" data-act="dg-etw" title="抓 10 秒 DNS / TCPIP 事件（需要管理员）">抓 10 秒事件</button>
+            <button class="btn" data-act="dg-net" title="看现在走哪张网卡、v4/v6 有没有地址（多网卡、只剩 IPv6 时先看这里）">看出口</button>
           </div>
           <div class="zlabel">只有一个网站不通？填主机名，看它的 DNS 分路和逐跳</div>
           <div class="cprow">
@@ -832,7 +833,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.2.2';
+var UI_VER = '1.2.3';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1922,7 +1923,7 @@ function renderSettings() {
 }
 
 /* ───── 诊断内核（yuans_nd）：结论 + 证据 + 动作 ───── */
-var DG = { report: null, events: null, detail: null, run: null, clock: null, etw: null, actions: [], busy: false };
+var DG = { report: null, events: null, detail: null, run: null, clock: null, etw: null, net: null, actions: [], busy: false };
 var DG_SEV = { critical: 'bad', high: 'bad', medium: 'warn', low: 'info', info: 'info' };
 var DG_VERDICT = { healthy: '正常', degraded: '能用，但有隐患', broken: '坏了', unknown: '证据不足' };
 var DG_FAIL = {
@@ -1984,6 +1985,20 @@ function renderDoctor() {
   patch('#dgPills', pills.join(''));
 
   var rows = [];
+  // 出口：走哪张网卡、v4/v6 有没有地址。多网卡与「只剩 IPv6」这两种情况下，
+  // 后面的 DNS / 连接结论都要按这个前提读（yuans_nd 1.8.0 的 report.net）
+  var nt = (rep && rep.net) || DG.net;
+  if (nt && !nt.error) {
+    var n4 = nt.v4 || {};
+    var n6 = nt.v6 || {};
+    var head = (n4.iface || '未知网卡') + (n4.src ? ' · ' + n4.src : ' · 没有 v4 地址');
+    var tail = (n6.ok ? 'v6 ' + (n6.src || '') : 'v6 缺失')
+      + (n(nt.adapters, 0) ? ' · 网卡 ' + n(nt.adapters, 0) + ' 个' : '')
+      + (nt.multi ? ' · v4/v6 走不同网卡' : '');
+    var lv0 = n4.ok ? 'info' : 'warn';
+    rows.push('<div class="ndrow ' + lv0 + '"><div class="h"><span class="ndbadge ' + lv0 + '"></span>'
+      + '<span class="t">出口 </span><span class="b">' + esc(head + ' · ' + tail) + '</span></div></div>');
+  }
   if (rep) {
     var fs = rep.findings || [];
     if (!fs.length) {
@@ -2184,6 +2199,22 @@ async function dgEvents() {
     var r = await api('/api/doctor/events', { limit: 60 }, { timeout: API_SLOW });
     if (r && r.events) { DG.events = r.events; }
     else toast(dgErr(r) || '取事件失败', 'bad');
+  } finally { DG.busy = false; renderDoctor(); }
+}
+
+async function dgNet() {
+  if (DG.busy) return;
+  DG.busy = true;
+  patch('#dgNote', '正在看现在走哪张网卡、v4/v6 有没有地址…');
+  try {
+    var r = await api('/api/doctor/net', {}, { timeout: API_SLOW });
+    if (r && r.net) {
+      DG.net = r.net;
+      var v4 = r.net.v4 || {};
+      toast(v4.ok ? ('出口在 ' + (v4.iface || '?') + ' · ' + (v4.src || '')) : '这台机器现在没有 IPv4 出口', v4.ok ? 'good' : 'bad');
+    } else {
+      toast(dgErr(r) || '取出口信息失败', 'bad');
+    }
   } finally { DG.busy = false; renderDoctor(); }
 }
 
@@ -2522,6 +2553,7 @@ document.addEventListener('click', function (e) {
   else if (a === 'dg-export') dgExport();
   else if (a === 'dg-clock') dgClock();
   else if (a === 'dg-etw') dgEtw();
+  else if (a === 'dg-net') dgNet();
   else if (a === 'dg-detail') dgDetail();
   else if (a === 'dg-paste') dgPaste();
   else if (a === 'dg-fix') dgFix(el.dataset.a, !!el.dataset.el);
