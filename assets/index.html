@@ -585,6 +585,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
             <button class="btn" data-act="dg-check">一键体检</button>
             <button class="btn" data-act="dg-deep" title="多探几轮：DNS 分路、逐跳、TLS 都看">深度诊断</button>
             <button class="btn" data-act="dg-events">最近事件</button>
+      <button class="btn" data-act="dg-export" title="把结论、证据、事件与详细视图打成一个 zip，拿去别的机器复盘">导出诊断包</button>
           </div>
           <div class="cprow">
             <input class="txt" id="dgHost" placeholder="要查的主机名，例如 www.okx.com" spellcheck="false" autocomplete="off">
@@ -811,7 +812,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.1.0';
+var UI_VER = '1.1.1';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -2042,6 +2043,27 @@ async function dgLoadActions() {
   if (r && r.data) DG.actions = r.data;
 }
 
+async function dgExport() {
+  if (DG.busy) return;
+  DG.busy = true;
+  var host = ($('#dgHost').value || '').trim();
+  var note = $('#dgNote');
+  if (note) note.textContent = '正在打包诊断包（结论 + 证据 + 事件 + 详细视图）…';
+  try {
+    var r = await api('/api/doctor/export', { host: host }, { timeout: API_SLOW });
+    if (!r || r.ok === false) {
+      if (note) note.textContent = '导出失败：' + dgErr(r);
+      toast('导出失败：' + dgErr(r), 'bad');
+      return;
+    }
+    var kb = Math.round((r.size || 0) / 102.4) / 10;
+    var n = (r.files || []).length;
+    var line = '诊断包已生成：' + (r.path || '') + '（' + kb + ' KB，' + n + ' 个文件）';
+    if (note) note.textContent = line;
+    toast('诊断包已生成', 'good');
+  } finally { DG.busy = false; }
+}
+
 async function dgCheck(mode) {
   if (DG.busy) return;
   DG.busy = true;
@@ -2386,6 +2408,7 @@ document.addEventListener('click', function (e) {
   else if (a === 'dg-check') dgCheck('quick');
   else if (a === 'dg-deep') dgCheck('deep');
   else if (a === 'dg-events') dgEvents();
+  else if (a === 'dg-export') dgExport();
   else if (a === 'dg-detail') dgDetail();
   else if (a === 'dg-paste') dgPaste();
   else if (a === 'dg-fix') dgFix(el.dataset.a, !!el.dataset.el);

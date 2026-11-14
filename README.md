@@ -473,6 +473,19 @@ python -m pytest tests -q           # 单元测试
 
 ## 11. 更新日志
 
+### 1.1.1 — 诊断卡多了「导出诊断包」：把现场带走
+
+**内嵌的诊断内核升到 `yuans_nd 1.5.0`**。诊断卡上新增一个按钮：**导出诊断包**。
+
+点一下会在 `data/doctor/exports/` 里生成 `nd-diag-<日期>-<时间>.zip`，解开是七件东西：`README.txt`（先看它）、`report.json`（结论与每条证据）、`detail.json`（指定域名的三路 DNS + 逐跳 + TCP）、`caps.json`（本机能力：是否管理员、ESTATS/DnsQueryEx/WFP/NRPT、系统 build）、`wfp.json`（WFP 过滤器聚合，需要管理员才有）、`events.jsonl`（最近 500 条事件流水）、`manifest.json`（逐文件 sha256）。
+
+- **自动脱敏**：任何键名里带 token / secret / password / auth / cookie / subscribe / url 的字段，写盘前一律替换成 `<redacted>`；内核算密钥不会进包（真机导出后全文检索 secret，结果为 False）。
+- **硬上限 5 MB、事件留最后 500 条**，超了直接报 `ERR-STORE-FULL` 而不是悄悄截断；打个包通常只有几 KB。
+- **为什么要它**：诊断结论在用户机器上，用户说不清、你也看不到。把这几 KB 的包发给别人（或另一台机器打开），结论、证据、遍历路径全都在，不用远程连过去。
+
+**后端**：`doctor.export()` 走诊断内核的 `service.export()`；新增路由 `POST /api/doctor/export`（`{host?, port?}`，带了 host 就把详细视图一起打进去）。前端按钮在诊断卡「最近事件」右边，结果直接显示在卡片下方的说明行。
+
+**顺带**：诊断内核里 1.4.2 的 WFP 聚合（`nd wfp`，需要管理员）与 1.4.1 的降噪、时间窗、健康置信度 0.85 都随这次一起进包。测试 286 例。
 ### 1.1.0 — 内嵌诊断内核：从「哪个不通」到「为什么不通」
 
 **「扩展」页多了一张诊断卡**：以前断网急救只告诉你哪项检查没过，现在能说清原因、给出证据、点一下就修。

@@ -15,7 +15,7 @@ from vpntray import doctor, webui
 
 ROUTES = ("/api/doctor/status", "/api/doctor/diagnose", "/api/doctor/detail",
           "/api/doctor/events", "/api/doctor/actions", "/api/doctor/fix",
-          "/api/doctor/undo")
+          "/api/doctor/undo", "/api/doctor/export")
 
 
 class S(dict):
@@ -78,6 +78,10 @@ def _install_fake_nd():
         def undo(self, run_id, by="user"):
             return {"ok": True, "run_id": run_id}
 
+        def export(self, host="", port=443):
+            return {"ok": True, "path": "X:/diag/nd-diag-1.zip", "size": 4096,
+                    "files": ["README.txt"], "host": host, "port": port}
+
     svc.Service = Fake
     sys.modules["yuans_nd"] = pkg
     sys.modules["yuans_nd.service"] = svc
@@ -104,6 +108,13 @@ class RouteTest(unittest.TestCase):
         out = self.routes["/api/doctor/status"]({})
         self.assertTrue(out["ok"])
         self.assertEqual(out["doctor"]["host_version"], "9.9.9")
+
+    def test_export_returns_path(self):
+        out = self.routes["/api/doctor/export"]({"host": "www.okx.com"})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["path"], "X:/diag/nd-diag-1.zip")
+        self.assertEqual(out["host"], "www.okx.com")
+        self.assertIn("doctor", out)
 
     def test_diagnose_rejects_unknown_mode(self):
         out = self.routes["/api/doctor/diagnose"]({"mode": "weird"})

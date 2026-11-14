@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.1.0"
+UI_VER = "1.1.1"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -788,6 +788,17 @@ class WebUI:
                 out = doctor.fix(app, act_id, why=why, params=b.get("args") or {})
             return {**out, "doctor": _doctor_state(app)}
 
+        def doctor_export(body):
+            """把结论 + 证据 + 详细视图 + 事件打成一个 zip，交给用户拿去复盘。"""
+            b = body or {}
+            host = str(b.get("host") or "").strip()
+            try:
+                port = int(b.get("port") or 443)
+            except (TypeError, ValueError):
+                port = 443
+            out = doctor.export(app, host, port=port)
+            return {**out, "doctor": _doctor_state(app)}
+
         def doctor_undo(body):
             b = body or {}
             run_id = str(b.get("run_id") or "").strip()
@@ -827,6 +838,7 @@ class WebUI:
             "/api/doctor/events": doctor_events,
             "/api/doctor/actions": doctor_actions,
             "/api/doctor/fix": doctor_fix,
+            "/api/doctor/export": doctor_export,
             "/api/doctor/undo": doctor_undo,
         }
 

@@ -166,6 +166,11 @@ def events(app: Any, limit: int = 80, kind: str = "") -> dict[str, Any]:
     return _guard(app, lambda s: s.events(limit=limit, kind=kind))
 
 
+def export(app: Any, host: str = "", port: int = 443) -> dict[str, Any]:
+    """导出一个可移植诊断包（yuans_nd 1.5.0 起）：host 非空就把详细视图也打进去。"""
+    return _guard(app, lambda s: s.export(host=host, port=port))
+
+
 def caps(app: Any) -> dict[str, Any]:
     return _guard(app, lambda s: s.caps())
 

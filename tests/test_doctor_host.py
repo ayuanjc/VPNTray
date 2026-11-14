@@ -65,6 +65,36 @@ class FakeSvc:
     def undo(self, run_id, by="user"):
         return {"ok": True, "run_id": run_id, "by": by}
 
+    def export(self, host="", port=443):
+        return {"ok": True, "path": "X:/diag/nd-diag-1.zip", "size": 4096,
+                "files": ["README.txt", "manifest.json"], "host": host, "port": port}
+
+
+class ExportTest(unittest.TestCase):
+    def setUp(self):
+        _install_fake_nd()
+        doctor._SVC = None
+
+    def tearDown(self):
+        doctor._SVC = None
+        sys.modules.pop("yuans_nd", None)
+        sys.modules.pop("yuans_nd.service", None)
+
+    def test_export_passes_host_and_port(self):
+        app = types.SimpleNamespace(settings=S({}), restart_kernel=lambda: True)
+        out = doctor.export(app, "www.okx.com", port=8443)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["path"], "X:/diag/nd-diag-1.zip")
+        self.assertEqual(out["host"], "www.okx.com")
+        self.assertEqual(out["port"], 8443)
+
+    def test_export_without_nd_reports_missing(self):
+        doctor._SVC = None
+        sys.modules.pop("yuans_nd", None)
+        out = doctor.export(types.SimpleNamespace(settings=S({}), restart_kernel=lambda: True), "")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "ERR-ND-MISSING")
+
 
 class S(dict):
     def save(self):
