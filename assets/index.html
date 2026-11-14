@@ -576,6 +576,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
             <button class="btn" data-act="dg-etw" title="抓 10 秒 DNS / TCPIP 事件（需要管理员）">抓 10 秒事件</button>
             <button class="btn" data-act="dg-net" title="看现在走哪张网卡、v4/v6 有没有地址（多网卡、只剩 IPv6 时先看这里）">看出口</button>
             <button class="btn" data-act="dg-conn" title="连不上时先分清：对方拒绝（端口没起）还是包被中间丢掉（出网被断）">丢包还是拒绝</button>
+            <button class="btn" data-act="dg-hosts" title="hosts 里被写死到黑洞地址的域名：DNS 全绿但连接必然失败">查 hosts</button>
           </div>
           <div class="zlabel">只有一个网站不通？填主机名，看它的 DNS 分路和逐跳</div>
           <div class="cprow">
@@ -834,7 +835,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.2.5';
+var UI_VER = '1.2.6';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1924,7 +1925,7 @@ function renderSettings() {
 }
 
 /* ───── 诊断内核（yuans_nd）：结论 + 证据 + 动作 ───── */
-var DG = { report: null, events: null, detail: null, run: null, clock: null, etw: null, net: null, conn: null, actions: [], busy: false };
+var DG = { report: null, events: null, detail: null, run: null, clock: null, etw: null, net: null, conn: null, hosts: null, actions: [], busy: false };
 var DG_SEV = { critical: 'bad', high: 'bad', medium: 'warn', low: 'info', info: 'info' };
 var DG_VERDICT = { healthy: '正常', degraded: '能用，但有隐患', broken: '坏了', unknown: '证据不足' };
 var DG_FAIL = {
@@ -2032,6 +2033,24 @@ function renderDoctor() {
         + '<span class="t">刚才执行了 ' + esc(dgActTitle(run.act_id)) + '</span>'
         + '<span class="b">' + esc(run.ok ? '成功' : '失败') + '，撤销窗口到 ' + esc(run.undo_until) + '</span>'
         + '<button class="btn" data-act="dg-undo" data-r="' + esc(run.run_id) + '">撤销</button></div></div>');
+    }
+  }
+  if (DG.hosts) {
+    var hs = DG.hosts || {};
+    if (hs.ok === false) {
+      rows.push('<div class="ndrow warn"><div class="h"><span class="ndbadge warn"></span>'
+        + '<span class="t">读不到 hosts</span><span class="b">' + esc((hs.error && (hs.error.msg || hs.error.code)) || hs.error || '') + '</span></div></div>');
+    } else {
+      var bl = n(hs.blocks_total, 0);
+      var tr = (hs.trade || []);
+      var lv3 = tr.length ? 'bad' : (bl ? 'warn' : 'ok');
+      var t3 = bl ? ('hosts 里 ' + bl + ' 条黑洞映射') : 'hosts 没有黑洞映射';
+      var b3 = tr.length ? ('交易域名被拦：' + tr.slice(0, 3).join('、') + ' —— 这些域名 DNS 完全不参与')
+        : (bl ? '如果是自己拦广告/挡授权校验，属于预期；不记得了就点「修复」里的 hosts 动作处理' : (hs.path || ''));
+      var list3 = (hs.blocks || []).slice(0, 12).map(function (x) { return (x.names || []).join(', ') + ' → ' + x.ip; }).join('\n');
+      rows.push('<div class="ndrow ' + lv3 + '"><div class="h"><span class="ndbadge ' + lv3 + '"></span>'
+        + '<span class="t">' + esc(t3) + '</span><span class="b">' + esc(b3) + '</span></div>'
+        + (list3 ? '<details><summary>被屏蔽的条目</summary><pre>' + esc(list3) + '</pre></details>' : '') + '</div>');
     }
   }
   if (DG.clock) {
@@ -2228,6 +2247,21 @@ async function dgNet() {
     } else {
       toast(dgErr(r) || '取出口信息失败', 'bad');
     }
+  } finally { DG.busy = false; renderDoctor(); }
+}
+
+async function dgHosts() {
+  if (DG.busy) return;
+  DG.busy = true;
+  patch("#dgNote", "正在读 hosts（只读，不会改你的文件）…");
+  try {
+    var r = await api("/api/doctor/hosts", {}, { timeout: API_SLOW });
+    if (r && (r.ok === true || r.ok === false)) {
+      DG.hosts = r;
+      var bl = (r.blocks_total || 0);
+      toast(r.ok === false ? "读不到 hosts 文件" : (bl ? ("hosts 里 " + bl + " 条黑洞映射") : "hosts 很干净"),
+        r.ok === false ? "warn" : (bl ? "warn" : "good"));
+    } else { toast(dgErr(r) || "读 hosts 失败", "bad"); }
   } finally { DG.busy = false; renderDoctor(); }
 }
 
@@ -2586,6 +2620,7 @@ document.addEventListener('click', function (e) {
   else if (a === 'dg-etw') dgEtw();
   else if (a === 'dg-net') dgNet();
   else if (a === 'dg-conn') dgConn();
+  else if (a === 'dg-hosts') dgHosts();
   else if (a === 'dg-detail') dgDetail();
   else if (a === 'dg-paste') dgPaste();
   else if (a === 'dg-fix') dgFix(el.dataset.a, !!el.dataset.el);

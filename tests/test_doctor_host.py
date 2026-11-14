@@ -80,6 +80,11 @@ class FakeSvc:
         return {"ok": True, "net": {"v4": {"ok": True, "src": "172.50.86.61", "iface": "WLAN", "ifindex": 18},
                 "v6": {"ok": False, "src": ""}, "adapters": 45, "multi": False}}
 
+    def hosts(self):
+        return {"ok": True, "path": "C:/Windows/System32/drivers/etc/hosts",
+                "entries_total": 12, "blocks_total": 11, "trade": [],
+                "blocks": [{"ip": "0.0.0.0", "names": ["internetdownloadmanager.com"]}]}
+
     def conn(self, host, ports=None, timeout=5.0):
         return {"ok": True, "host": host, "ports": list(ports or [443]), "timeout": timeout,
                 "verdict": "blackhole", "hint": "SYN 无应答", "results": [], "summary": {"timeout": 2}}
@@ -140,6 +145,19 @@ class ClockEtwTest(unittest.TestCase):
         out = doctor.net(self.app)
         self.assertTrue(out["ok"])
         self.assertEqual(out["net"]["v4"]["src"], "172.50.86.61")
+
+    def test_hosts_passes_through(self):
+        out = doctor.hosts(self.app)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["blocks_total"], 11)
+
+    def test_hosts_without_nd_is_missing(self):
+        sys.modules.pop("yuans_nd", None)
+        sys.modules.pop("yuans_nd.service", None)
+        doctor._SVC = None
+        out = doctor.hosts(self.app)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "ERR-ND-MISSING")
 
     def test_conn_passes_host_ports_timeout(self):
         out = doctor.conn(self.app, "www.okx.com", ports=[443, 22], timeout=3.0)

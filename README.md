@@ -473,6 +473,30 @@ python -m pytest tests -q           # 单元测试
 
 ## 11. 更新日志
 
+### 1.2.6 — hosts 也会让你「打不开」
+
+诊断卡加第五个按钮：**查 hosts**（`POST /api/doctor/hosts`，内核 `yuans_nd` 1.13.0 的 `nd hosts`）。
+
+为什么单开一个按钮：`hosts` 是 DNS 之外的另一条解析路径。破解软件的授权屏蔽、广告拦截工具、某些加速器，都会把域名写死到 `0.0.0.0` / `127.0.0.1`。这时所有 DNS 探针都显示「解析正常」，但连接必然失败 —— 只看 DNS 永远解释不了这类现象。
+
+界面上会列出黑洞映射（最多 12 条，可展开看全部）与两种分级：
+
+| 情况 | 结论级别 | 说明 |
+| --- | --- | --- |
+| 交易域名（okx / binance）被拦 | high，带修复按钮 | 交易软件会静默连不上，必须解释 |
+| 其它域名被拦 | info | 自己拦广告是常态，报成故障就是噪音 |
+| 没有黑洞映射 | ok 一行 | `hosts` 很干净，问题在别处 |
+| 读不到文件 | warn 一行 | 权限或路径问题，不影响其它诊断项 |
+
+只读：按钮不会改 `hosts`，要改走「一键体检」结论里的修复动作（`ACT-FIX-HOSTS`，带快照与撤销）。
+
+**后端**：`vpntray/doctor.py` 加 `hosts(app)`；`vpntray/webui.py` 加 `doctor_hosts` 与路由 `/api/doctor/hosts`（诊断路由 13 条）。
+
+**前端**：按钮 `data-act=dg-hosts`、`DG.hosts`、`dgHosts()`、`renderDoctor` 里按 trade / blocks 上色渲染结论行与条目详情。
+
+**测试**：`tests/test_doctor_host.py` 加透传与缺库两例；`tests/test_webui_doctor.py` 加路由一例。全量 305 例绿。
+
+顺带修掉一个真问题：`webui.py` 里 `doctor_net` 的 `def` 行缩进在上一版被改成 4 空格，与同块其它 `def`（8 空格）不一致，`import` 直接 `IndentationError`；已恢复并复跑全量。
 ### 1.2.5 — 「连不上」到底是丢包还是被拒绝
 
 诊断卡加第四个按钮：**丢包还是拒绝**（`POST /api/doctor/conn`，`yuans_nd` 1.12.0 的 `nd conn`）。

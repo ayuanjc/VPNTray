@@ -191,6 +191,11 @@ def clock(app: Any) -> dict[str, Any]:
     return _guard(app, lambda s: s.clock())
 
 
+def hosts(app: Any) -> dict[str, Any]:
+    """hosts 核对（yuans_nd 1.13.0）：哪些域名被写死到黑洞地址。只读。"""
+    return _guard(app, lambda s: s.hosts())
+
+
 def net(app: Any) -> dict[str, Any]:
     """当前出口与网卡（yuans_nd 1.8.0）：走哪张网卡、v4/v6 是否都有地址。"""
     return _guard(app, lambda s: s.net())
