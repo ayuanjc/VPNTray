@@ -575,6 +575,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
             <button class="btn" data-act="dg-clock" title="证书报错时先看这里：本机时间与服务器差多少秒">对一下时间</button>
             <button class="btn" data-act="dg-etw" title="抓 10 秒 DNS / TCPIP 事件（需要管理员）">抓 10 秒事件</button>
             <button class="btn" data-act="dg-net" title="看现在走哪张网卡、v4/v6 有没有地址（多网卡、只剩 IPv6 时先看这里）">看出口</button>
+            <button class="btn" data-act="dg-conn" title="连不上时先分清：对方拒绝（端口没起）还是包被中间丢掉（出网被断）">丢包还是拒绝</button>
           </div>
           <div class="zlabel">只有一个网站不通？填主机名，看它的 DNS 分路和逐跳</div>
           <div class="cprow">
@@ -833,7 +834,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.2.4';
+var UI_VER = '1.2.5';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1923,7 +1924,7 @@ function renderSettings() {
 }
 
 /* ───── 诊断内核（yuans_nd）：结论 + 证据 + 动作 ───── */
-var DG = { report: null, events: null, detail: null, run: null, clock: null, etw: null, net: null, actions: [], busy: false };
+var DG = { report: null, events: null, detail: null, run: null, clock: null, etw: null, net: null, conn: null, actions: [], busy: false };
 var DG_SEV = { critical: 'bad', high: 'bad', medium: 'warn', low: 'info', info: 'info' };
 var DG_VERDICT = { healthy: '正常', degraded: '能用，但有隐患', broken: '坏了', unknown: '证据不足' };
 var DG_FAIL = {
@@ -2092,6 +2093,18 @@ function renderDoctor() {
       + '<details><summary>DNS 分路</summary><pre>' + esc(dns || '没取到') + '</pre></details>'
       + '<details><summary>逐跳</summary><pre>' + esc(hops || '没取到') + '</pre></details></div>');
   }
+  if (DG.conn) {
+    var cn = DG.conn || {};
+    var vd = cn.verdict || "";
+    var lvC = vd === "open" ? "ok" : (vd === "refused" ? "warn" : (vd === "dns" ? "info" : "bad"));
+    var det = (cn.results || []).map(function (x) {
+      return (x.ip || "?") + ":" + n(x.port, 0) + "  " + (x.state || "") + (x.ms != null ? "  " + x.ms + "ms" : "") + (x.err ? "  " + x.err : "");
+    }).join("\n");
+    rows.push("<div class=\"ndrow " + lvC + "\"><div class=\"h\"><span class=\"ndbadge " + lvC + "\"></span>"
+      + "<span class=\"t\">" + esc((cn.host || "") + " 握手") + "</span>"
+      + "<span class=\"b\">" + esc(cn.ok === false ? (dgErr(cn) || "探测失败") : (cn.hint || vd)) + "</span></div>"
+      + (det ? "<details><summary>每个端口的结果</summary><pre>" + esc(det) + "</pre></details>" : "") + "</div>");
+  }
   if (DG.events) {
     var evs = DG.events || [];
     var kinds = {};
@@ -2214,6 +2227,24 @@ async function dgNet() {
       toast(v4.ok ? ('出口在 ' + (v4.iface || '?') + ' · ' + (v4.src || '')) : '这台机器现在没有 IPv4 出口', v4.ok ? 'good' : 'bad');
     } else {
       toast(dgErr(r) || '取出口信息失败', 'bad');
+    }
+  } finally { DG.busy = false; renderDoctor(); }
+}
+
+async function dgConn() {
+  if (DG.busy) return;
+  var host = (document.getElementById("dgHost").value || "").trim();
+  if (!host) { toast("先在上面填一个连不上的域名，例如 www.okx.com", "warn"); document.getElementById("dgHost").focus(); return; }
+  DG.busy = true;
+  patch("#dgNote", "正在和 " + host + " 握手（默认试 443 与 22 两个端口，每个最多 5 秒）…");
+  try {
+    var r = await api("/api/doctor/conn", { host: host, ports: "443,22", timeout: 5 }, { timeout: API_SLOW });
+    if (r && (r.results || r.error)) {
+      DG.conn = r;
+      var v = r.verdict;
+      toast(r.ok ? (r.hint || v) : (dgErr(r) || "握手探测失败"), r.ok ? (v === "open" ? "good" : "warn") : "bad");
+    } else {
+      toast(dgErr(r) || "握手探测失败", "bad");
     }
   } finally { DG.busy = false; renderDoctor(); }
 }
@@ -2554,6 +2585,7 @@ document.addEventListener('click', function (e) {
   else if (a === 'dg-clock') dgClock();
   else if (a === 'dg-etw') dgEtw();
   else if (a === 'dg-net') dgNet();
+  else if (a === 'dg-conn') dgConn();
   else if (a === 'dg-detail') dgDetail();
   else if (a === 'dg-paste') dgPaste();
   else if (a === 'dg-fix') dgFix(el.dataset.a, !!el.dataset.el);

@@ -196,6 +196,12 @@ def net(app: Any) -> dict[str, Any]:
     return _guard(app, lambda s: s.net())
 
 
+def conn(app: Any, host: str, ports: Optional[list] = None,
+         timeout: float = 5.0) -> dict[str, Any]:
+    """TCP 握手探测（yuans_nd 1.12.0）：分清「对方回了 RST」与「包被中间丢掉」。"""
+    return _guard(app, lambda s: s.conn(str(host or ""), ports=ports, timeout=float(timeout or 5.0)))
+
+
 def etw(app: Any, seconds: float = 10.0) -> dict[str, Any]:
     """按需抓一段 DNS/TCPIP 事件（yuans_nd 1.6.0）：需要管理员，非管理员只回命令模板。"""
     out = _guard(app, lambda s: s.etw(seconds=seconds, top=10))

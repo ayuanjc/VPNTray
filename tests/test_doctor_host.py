@@ -80,6 +80,10 @@ class FakeSvc:
         return {"ok": True, "net": {"v4": {"ok": True, "src": "172.50.86.61", "iface": "WLAN", "ifindex": 18},
                 "v6": {"ok": False, "src": ""}, "adapters": 45, "multi": False}}
 
+    def conn(self, host, ports=None, timeout=5.0):
+        return {"ok": True, "host": host, "ports": list(ports or [443]), "timeout": timeout,
+                "verdict": "blackhole", "hint": "SYN 无应答", "results": [], "summary": {"timeout": 2}}
+
     def export(self, host="", port=443):
         return {"ok": True, "path": "X:/diag/nd-diag-1.zip", "size": 4096,
                 "files": ["README.txt", "manifest.json"], "host": host, "port": port}
@@ -136,6 +140,20 @@ class ClockEtwTest(unittest.TestCase):
         out = doctor.net(self.app)
         self.assertTrue(out["ok"])
         self.assertEqual(out["net"]["v4"]["src"], "172.50.86.61")
+
+    def test_conn_passes_host_ports_timeout(self):
+        out = doctor.conn(self.app, "www.okx.com", ports=[443, 22], timeout=3.0)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["ports"], [443, 22])
+        self.assertEqual(out["verdict"], "blackhole")
+
+    def test_conn_without_nd_is_missing(self):
+        sys.modules.pop("yuans_nd", None)
+        sys.modules.pop("yuans_nd.service", None)
+        doctor._SVC = None
+        out = doctor.conn(self.app, "www.okx.com")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "ERR-ND-MISSING")
 
     def test_etw_denied_attaches_admin_command(self):
         out = doctor.etw(self.app, seconds=10)

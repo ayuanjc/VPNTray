@@ -16,7 +16,7 @@ from vpntray import doctor, webui
 ROUTES = ("/api/doctor/status", "/api/doctor/diagnose", "/api/doctor/detail",
           "/api/doctor/events", "/api/doctor/actions", "/api/doctor/fix",
           "/api/doctor/undo", "/api/doctor/export",
-          "/api/doctor/clock", "/api/doctor/etw", "/api/doctor/net")
+          "/api/doctor/clock", "/api/doctor/etw", "/api/doctor/net", "/api/doctor/conn")
 
 
 class S(dict):
@@ -89,6 +89,10 @@ def _install_fake_nd():
             return {"ok": True, "net": {"v4": {"ok": True, "src": "192.168.1.5", "iface": "WLAN"},
                     "v6": {"ok": True, "src": "fe80::1"}, "adapters": 3, "multi": True}}
 
+        def conn(self, host, ports=None, timeout=5.0):
+            return {"ok": True, "host": host, "ports": list(ports or [443]),
+                    "verdict": "refused", "hint": "对方回了 RST", "results": [], "detail_host": host}
+
         def export(self, host="", port=443):
             return {"ok": True, "path": "X:/diag/nd-diag-1.zip", "size": 4096,
                     "files": ["README.txt"], "host": host, "port": port}
@@ -139,6 +143,22 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(out["net"]["v4"]["iface"], "WLAN")
         self.assertTrue(out["net"]["multi"])
         self.assertIn("doctor", out)
+
+    def test_conn_route_requires_host(self):
+        out = self.routes["/api/doctor/conn"]({})
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "ERR-ND-BAD-ARG")
+        self.assertIn("doctor", out)
+
+    def test_conn_route_parses_ports_and_clamps_timeout(self):
+        out = self.routes["/api/doctor/conn"]({"host": "www.okx.com", "ports": "443, 22,xx", "timeout": 99})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["ports"], [443, 22])
+        self.assertEqual(out["verdict"], "refused")
+
+    def test_conn_route_accepts_port_list(self):
+        out = self.routes["/api/doctor/conn"]({"host": "a.example", "ports": [443, 22]})
+        self.assertEqual(out["ports"], [443, 22])
 
     def test_etw_route_clamps_seconds(self):
         out = self.routes["/api/doctor/etw"]({"seconds": 999})

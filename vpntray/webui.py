@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.2.4"
+UI_VER = "1.2.5"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -811,6 +811,28 @@ class WebUI:
             return {**out, "doctor": _doctor_state(app)}
 
 
+        def doctor_conn(body):
+            """握手探测：丢包 / 拒绝 / 端口没起。body: host 必填，ports 逗号分隔，timeout 秒。"""
+            b = body or {}
+            host = str(b.get("host") or "").strip()
+            if not host:
+                return {"ok": False, "error": {"code": "ERR-ND-BAD-ARG",
+                                                "msg": "要填主机名，例如 www.okx.com"},
+                        "doctor": _doctor_state(app)}
+            raw = b.get("ports")
+            if isinstance(raw, (list, tuple)):
+                ports = [int(x) for x in raw if str(x).strip().isdigit()] or None
+            else:
+                ports = [int(x) for x in str(raw or "").split(",") if x.strip().isdigit()] or None
+            try:
+                secs = float(b.get("timeout") or 5.0)
+            except (TypeError, ValueError):
+                secs = 5.0
+            secs = min(15.0, max(1.0, secs))
+            out = doctor.conn(app, host, ports=ports, timeout=secs)
+            return {**out, "doctor": _doctor_state(app)}
+
+
         def doctor_etw(body):
             """抓一段 DNS/TCPIP 事件。需要管理员：非管理员返回命令模板，不自行提权。"""
             b = body or {}
@@ -865,6 +887,7 @@ class WebUI:
             "/api/doctor/clock": doctor_clock,
             "/api/doctor/etw": doctor_etw,
             "/api/doctor/net": doctor_net,
+            "/api/doctor/conn": doctor_conn,
         }
 
     # ── 杂项：拓扑 / 内核 / 连接 / 更新 / 冲突清理 / 反馈 ──
