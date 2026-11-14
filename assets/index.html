@@ -832,7 +832,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.2.1';
+var UI_VER = '1.2.2';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -2048,7 +2048,8 @@ function renderDoctor() {
       var fails = (et.dns_failures || []).map(function (f) { return f.name + ' → ' + (f.status || ''); }).join('\n');
       rows.push('<div class="ndrow info"><div class="h"><span class="ndbadge info"></span>'
         + '<span class="t">抓了 ' + n(et.seconds, 10) + ' 秒事件：' + n(et.events, 0) + ' 条</span>'
-        + '<span class="b">DNS 查询 ' + n(et.dns_total, 0) + ' 条，其中失败 ' + n(et.dns_fail, 0) + ' 条 · ' + esc(prov) + '</span></div>'
+        + '<span class="b">DNS 查询 ' + n(et.dns_total, 0) + ' 条，其中失败 ' + n(et.dns_fail, 0) + ' 条 · ' + esc(prov)
+        + (et.ingested ? ' · 已并入证据链 ' + n(et.ingested, 0) + ' 条' : '') + '</span></div>'
         + (slow ? '<details><summary>最慢的查询</summary><pre>' + esc(slow) + '</pre></details>' : '')
         + (fails ? '<details><summary>失败的查询</summary><pre>' + esc(fails) + '</pre></details>' : '') + '</div>');
     }
@@ -2208,6 +2209,7 @@ async function dgEtw() {
     var r = await api('/api/doctor/etw', { seconds: 10 }, { timeout: API_SLOW });
     DG.etw = r || {};
     if (!r || r.ok === false) toast(dgErr(r) || '抓事件失败', 'bad');
+    else if (r.ingested) toast('已把 ' + r.ingested + ' 条失败并进证据链，再点一键体检看结论', 'ok');
   } finally {
     DG.busy = false;
     if (b) { b.disabled = false; b.classList.remove('busy'); b.textContent = old; }
