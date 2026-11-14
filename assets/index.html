@@ -585,10 +585,10 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
           <div class="note" id="dgNote"></div>
         </section>
       <section class="card">
-        <h2>断网急救<span class="hint" id="ndHint">先体检，再照着红的那条修</span></h2>
+        <h2>断网急救<span class="hint" id="ndHint">13 项逐项检查：网卡 / 网关 / 解析 / 代理端口 / 内核</span></h2>
         <div class="gwrap" id="ndPills"></div>
         <div class="acts" style="margin-top:12px">
-          <button class="btn" data-act="nd-run">一键体检</button>
+          <button class="btn" data-act="nd-run" title="重新跑 13 项逐项检查（比上面的诊断内核更细，但只报通不通，不给原因）">重新逐项检查</button>
           <button class="btn" data-act="nd-repair" title="清 DNS 缓存 → 还原系统代理 → 拉起本地解析 → 重启内核">一键急救</button>
           <button class="btn" data-act="nd-copy">复制报告</button>
         </div>
@@ -598,7 +598,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
       </div>
     </section>
 
-    <!-- 加速：出口两件事，一左一右 -->
+    <!-- 加速：先看节点列表（整行），再看场景模块（整行） -->
     <section class="view" id="view-speed">
       <div class="grid">
       <section class="card c12">
