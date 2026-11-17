@@ -80,6 +80,11 @@ class FakeSvc:
         return {"ok": True, "net": {"v4": {"ok": True, "src": "172.50.86.61", "iface": "WLAN", "ifindex": 18},
                 "v6": {"ok": False, "src": ""}, "adapters": 45, "multi": False}}
 
+    def egress(self):
+        FakeSvc.egress_calls = getattr(FakeSvc, "egress_calls", 0) + 1
+        return {"ok": True, "egress": {"ok": True, "ip": "13.196.204.4", "country": "JP",
+                "asn": "AS16509", "via": "mixed-port:7891", "bad_region": False}}
+
     def hosts(self):
         return {"ok": True, "path": "C:/Windows/System32/drivers/etc/hosts",
                 "entries_total": 12, "blocks_total": 11, "trade": [],
@@ -145,6 +150,12 @@ class ClockEtwTest(unittest.TestCase):
         out = doctor.net(self.app)
         self.assertTrue(out["ok"])
         self.assertEqual(out["net"]["v4"]["src"], "172.50.86.61")
+
+    def test_egress_passes_through(self):
+        out = doctor.egress(self.app)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["egress"]["country"], "JP")
+        self.assertEqual(out["egress"]["via"], "mixed-port:7891")
 
     def test_hosts_passes_through(self):
         out = doctor.hosts(self.app)

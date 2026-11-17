@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.2.8"
+UI_VER = "1.2.9"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -816,6 +816,12 @@ class WebUI:
             return {**out, "doctor": _doctor_state(app)}
 
 
+        def doctor_egress(_body=None):
+            """对外身份：公网 IP、国家码、ASN、从哪出去。只读探测，不需要管理员。"""
+            out = doctor.egress(app)
+            return {**out, "doctor": _doctor_state(app)}
+
+
         def doctor_conn(body):
             """握手探测：丢包 / 拒绝 / 端口没起。body: host 必填，ports 逗号分隔，timeout 秒。"""
             b = body or {}
@@ -892,6 +898,7 @@ class WebUI:
             "/api/doctor/clock": doctor_clock,
             "/api/doctor/etw": doctor_etw,
             "/api/doctor/net": doctor_net,
+            "/api/doctor/egress": doctor_egress,
             "/api/doctor/hosts": doctor_hosts,
             "/api/doctor/conn": doctor_conn,
         }

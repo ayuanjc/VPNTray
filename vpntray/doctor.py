@@ -201,6 +201,11 @@ def net(app: Any) -> dict[str, Any]:
     return _guard(app, lambda s: s.net())
 
 
+def egress(app: Any) -> dict[str, Any]:
+    """公网出口身份（yuans_nd 1.15.0）：外面把本机当哪个国家，GOOGLE 系会不会拒绝。"""
+    return _guard(app, lambda s: s.egress())
+
+
 def conn(app: Any, host: str, ports: Optional[list] = None,
          timeout: float = 5.0) -> dict[str, Any]:
     """TCP 握手探测（yuans_nd 1.12.0）：分清「对方回了 RST」与「包被中间丢掉」。"""

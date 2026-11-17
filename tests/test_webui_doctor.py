@@ -16,7 +16,8 @@ from vpntray import doctor, webui
 ROUTES = ("/api/doctor/status", "/api/doctor/diagnose", "/api/doctor/detail",
           "/api/doctor/events", "/api/doctor/actions", "/api/doctor/fix",
           "/api/doctor/undo", "/api/doctor/export",
-          "/api/doctor/clock", "/api/doctor/etw", "/api/doctor/net", "/api/doctor/conn", "/api/doctor/hosts")
+          "/api/doctor/clock", "/api/doctor/etw", "/api/doctor/net",
+    "/api/doctor/egress", "/api/doctor/conn", "/api/doctor/hosts")
 
 
 class S(dict):
@@ -89,6 +90,10 @@ def _install_fake_nd():
             return {"ok": True, "net": {"v4": {"ok": True, "src": "192.168.1.5", "iface": "WLAN"},
                     "v6": {"ok": True, "src": "fe80::1"}, "adapters": 3, "multi": True}}
 
+        def egress(self):
+            return {"ok": True, "egress": {"ok": True, "ip": "1.2.3.4", "country": "CN",
+                    "asn": "AS4134", "via": "mixed-port:7891", "bad_region": True}}
+
         def hosts(self):
             return {"ok": True, "blocks_total": 3, "trade": ["www.okx.com"], "blocks": []}
 
@@ -145,6 +150,13 @@ class RouteTest(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["net"]["v4"]["iface"], "WLAN")
         self.assertTrue(out["net"]["multi"])
+        self.assertIn("doctor", out)
+
+    def test_egress_route(self):
+        out = self.routes["/api/doctor/egress"]({})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["egress"]["country"], "CN")
+        self.assertTrue(out["egress"]["bad_region"])
         self.assertIn("doctor", out)
 
     def test_hosts_route_returns_blocks(self):

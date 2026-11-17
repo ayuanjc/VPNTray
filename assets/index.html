@@ -575,6 +575,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
             <button class="btn" data-act="dg-clock" title="证书报错时先看这里：本机时间与服务器差多少秒">对一下时间</button>
             <button class="btn" data-act="dg-etw" title="抓 10 秒 DNS / TCPIP 事件（需要管理员）">抓 10 秒事件</button>
             <button class="btn" data-act="dg-net" title="看现在走哪张网卡、v4/v6 有没有地址（多网卡、只剩 IPv6 时先看这里）">看出口</button>
+            <button class="btn" data-act="dg-egress" title="看外面把本机当哪个国家（Google / Gemini / Antigravity 打不开时先看这里）">看对外身份</button>
             <button class="btn" data-act="dg-conn" title="连不上时先分清：对方拒绝（端口没起）还是包被中间丢掉（出网被断）">丢包还是拒绝</button>
             <button class="btn" data-act="dg-hosts" title="hosts 里被写死到黑洞地址的域名：DNS 全绿但连接必然失败">查 hosts</button>
           </div>
@@ -835,7 +836,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.2.8';
+var UI_VER = '1.2.9';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1925,7 +1926,7 @@ function renderSettings() {
 }
 
 /* ───── 诊断内核（yuans_nd）：结论 + 证据 + 动作 ───── */
-var DG = { report: null, events: null, detail: null, run: null, clock: null, etw: null, net: null, conn: null, hosts: null, actions: [], busy: false };
+var DG = { report: null, events: null, detail: null, run: null, clock: null, etw: null, net: null, egress: null, conn: null, hosts: null, actions: [], busy: false };
 var DG_SEV = { critical: 'bad', high: 'bad', medium: 'warn', low: 'info', info: 'info' };
 var DG_VERDICT = { healthy: '正常', degraded: '能用，但有隐患', broken: '坏了', unknown: '证据不足' };
 var DG_FAIL = {
@@ -2000,6 +2001,21 @@ function renderDoctor() {
     var lv0 = n4.ok ? 'info' : 'warn';
     rows.push('<div class="ndrow ' + lv0 + '"><div class="h"><span class="ndbadge ' + lv0 + '"></span>'
       + '<span class="t">出口 </span><span class="b">' + esc(head + ' · ' + tail) + '</span></div></div>');
+  }
+  // 对外身份：公网 IP、国家码、从哪条链路出去。地区被判 CN/HK 时 Google 系会直接拒绝，
+  // 这条比「走哪张网卡」更接近「为什么登录不上」（yuans_nd 1.15.0 的 report.egress）
+  var eg = (rep && rep.egress) || DG.egress;
+  if (eg && eg.ok) {
+    var badE = !!eg.bad_region;
+    var lvE = badE ? 'warn' : 'info';
+    var txtE = (eg.ip || '?') + ' · ' + (eg.country || '??')
+      + (eg.asn ? ' ' + eg.asn : '')
+      + (eg.via ? ' · 走 ' + eg.via : '');
+    rows.push('<div class="ndrow ' + lvE + '"><div class="h"><span class="ndbadge ' + lvE + '"></span>'
+      + '<span class="t">对外身份 </span><span class="b">' + esc(txtE) + '</span></div>'
+      + (badE ? '<div class="note">外面把本机判在 ' + esc(eg.country)
+          + '：Google、Gemini、Antigravity 这类服务会直接拒绝或降级，换个日本 / 新加坡 / 美国的节点再试。</div>' : '')
+      + '</div>');
   }
   if (rep) {
     var fs = rep.findings || [];
@@ -2246,6 +2262,27 @@ async function dgNet() {
       toast(v4.ok ? ('出口在 ' + (v4.iface || '?') + ' · ' + (v4.src || '')) : '这台机器现在没有 IPv4 出口', v4.ok ? 'good' : 'bad');
     } else {
       toast(dgErr(r) || '取出口信息失败', 'bad');
+    }
+  } finally { DG.busy = false; renderDoctor(); }
+}
+
+async function dgEgress() {
+  if (DG.busy) return;
+  DG.busy = true;
+  patch('#dgNote', '正在问外面：这台机器现在是什么身份…');
+  try {
+    var r = await api('/api/doctor/egress', {}, { timeout: API_SLOW });
+    if (r && r.egress) {
+      DG.egress = r.egress;
+      if (r.egress.ok) {
+        toast('对外身份 ' + (r.egress.ip || '?') + ' · ' + (r.egress.country || '??')
+          + (r.egress.bad_region ? '（地区受限，Google 系会拒绝）' : ''),
+          r.egress.bad_region ? 'bad' : 'good');
+      } else {
+        toast(r.egress.error || '没问到对外身份', 'bad');
+      }
+    } else {
+      toast(dgErr(r) || '取对外身份失败', 'bad');
     }
   } finally { DG.busy = false; renderDoctor(); }
 }
@@ -2619,6 +2656,7 @@ document.addEventListener('click', function (e) {
   else if (a === 'dg-clock') dgClock();
   else if (a === 'dg-etw') dgEtw();
   else if (a === 'dg-net') dgNet();
+  else if (a === 'dg-egress') dgEgress();
   else if (a === 'dg-conn') dgConn();
   else if (a === 'dg-hosts') dgHosts();
   else if (a === 'dg-detail') dgDetail();
