@@ -473,6 +473,37 @@ python -m pytest tests -q           # 单元测试
 
 ## 11. 更新日志
 
+### 1.2.9 — 诊断卡多一行「对外身份」：打不开的是「你被判在哪」 |
+
+Google、Gemini、Antigravity 这类服务，失败往往不是「网络不通」，而是外面把你判在中国大陆或香港：
+同一台机器、同一个账号，换个干净节点就可能过，换回去又不行。以前的诊断卡只能告诉你「出口是 WLAN 172.34.x.x」，
+看不到外面把你当哪个国家。这版把这件事做成一个按钮。
+
+**诊断卡新增「看对外身份」**（`data-act="dg-egress"`）
+
+| 按钮 | 回答什么 | 数据从哪来 |
+| --- | --- | --- |
+| 看对外身份 | 公网 IP、国家码、ASN、从哪条链路出去 | yuans_nd 1.15.0 的 `egress`（三个源交叉核对） |
+
+探测顺序是 Cloudflare `cdn-cgi/trace` → ipinfo → ipify，任何一个成功就出结论；国家码优先取 ipinfo，
+其次 Cloudflare 的 `loc`。「走哪条链路出去」这一项是必须的：Python 的默认 opener 会吃 `HTTP_PROXY` / `HTTPS_PROXY`
+环境变量，不标出来就会把「环境变量里的代理」误当成「直连」，真机上差点因此误判 TUN 还在生效。
+
+看到国家码是 **CN 或 HK** 时，卡片会用黄色标出来并补一句「Google、Gemini、Antigravity 这类服务会直接拒绝或降级，
+换个日本 / 新加坡 / 美国的节点再试」；诊断内核那边同时会出一条第 22 条规则 `EGRESS_REGION_BAD`（medium，
+fix = `ACT-SWITCH-NODE`），也就是「换节点」这个动作会被直接推荐出来。
+
+**后端与接口**
+
+- `vpntray/doctor.py` 加 `egress(app)`，透传 `yuans_nd` 的 `Service.egress()`。
+- `vpntray/webui.py` 加 `POST /api/doctor/egress`（现在 11 条 `/api/doctor/*`），返回 `{ok, egress, doctor}`。
+- 出口身份有 180 秒缓存：quick 体检不会被 6 秒超时拖住，deep 体检与按钮点击才真正去问。
+
+**测试**
+
+- `tests/test_doctor_host.py` 加 `FakeSvc.egress` 与 `test_egress_passes_through`；
+- `tests/test_webui_doctor.py` 的 `ROUTES` 加 `/api/doctor/egress` 与 `test_egress_route`；
+- 全量 **317 例**通过（上一版 315），前端 `node --check` 语法门禁仍在测试里。
 ### 1.2.8 — 加了「Google 反重力」场景；TUN 开着不再误报「系统代理没打开」
 
 **出厂场景从 11 个变 12 个**，新的是 Google 全家桶，按你说的做成了独立场景：
