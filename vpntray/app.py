@@ -268,6 +268,9 @@ class App:
             except Exception as e:  # noqa: BLE001
                 log.warning("本地 DNS 兜底启动失败: %s", e)
         self._set(phase="准备配置", busy="启动中")
+        # 一定要在 prepare_config 之前：它负责把 settings 写进 config.yaml，
+        # 晚一步内核就已经按 tun.enable=true 起过了
+        self._drop_tun_without_admin()
         ok = self.prepare_config(initial=True)
         if not ok:
             # 「还没填订阅」是首次使用的正常起点，不是故障：
@@ -2888,6 +2891,26 @@ class App:
             return {"ok": False, "error": str(e)}
 
     # ——— TUN 模式 ———
+
+    def _drop_tun_without_admin(self) -> bool:
+        """普通权限却记着 TUN=on 时先把它关掉，返回是否改过。
+
+        为什么必须在启动内核之前做：内核读到 tun.enable=true 却建不出 wintun 网卡
+        （普通权限没有创建适配器的能力）会直接退出，结果是整台机器断网。最常见的
+        触发场景是「上次用管理员开着 TUN，这次开机自启是普通权限」，用户只会看到
+        「内核启动失败」，很难想到是 TUN 造成的（2026-11-17 真机确认）。
+        """
+        if not self.settings.get("tun") or netguard.is_admin():
+            return False
+        log.warning("TUN 需要管理员权限：本次以普通权限启动，已自动关闭 TUN"
+                    "（下次用「以管理员身份运行」重开即可继续用 TUN）")
+        self.settings["tun"] = False
+        try:
+            self.settings.save()
+        except Exception:  # noqa: BLE001
+            log.warning("写回 tun=false 失败", exc_info=True)
+        self._set(tun=False, tun_on=False, tun_reason="需要管理员权限，已自动关闭")
+        return True
 
     def set_tun(self, on: bool) -> dict[str, Any]:
         """TUN 是内核层的虚拟网卡，改完必须重启内核才生效。

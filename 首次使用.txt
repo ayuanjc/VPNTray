@@ -869,3 +869,28 @@ TUN 和「系统代理」不是一回事。系统代理只对认代理设置的�
   - 开了 TUN 之后，由 mihomo 的规则决定谁能直连谁能走节点。国内站点按 GeoIP/cn 直连，一般不受影响；
     如果某个国内网站反而变慢，先关 TUN 对比一下，再看它落到了哪条规则。
 
+四十二、Google 反重力：一个场景盖住五个域（1.2.8）
+
+  你要的「谷歌反重力」不是单个网站。Antigravity 这个编辑器一口气要用五个域：
+  官网与下载（antigravity.google）、Google 账号登录（google.com）、
+  Gemini 网页（gemini.google.com）、AI Studio 后端（aistudio.google.com /
+  alkalimakersuite-pa.clients6.google.com）、模型 API（generativelanguage.googleapis.com）。
+  少盖一个的表现是「能登录、一用就转圈」，比全都不通更难查 —— 所以做成一个场景。
+
+  怎么用：左边「加速」页 → Google 反重力 → 右边选节点；不想挑就留「Google 自动」，
+  它每 180 秒按 https://gemini.google.com/robots.txt 的探测结果自己找活节点
+  （和 GitHub 场景同一套自动子组）。
+
+  默认偏好地区是 日本 / 美国 / 新加坡 / 台湾 / 香港，顺序有讲究：Google 登录风控对
+  「短时间换国家」很敏感，日本和美国最不容易被要求二次验证，香港台湾延迟低但偶尔弹验证码。
+  建议：登录 Google 账号时固定在一个地区，别每次换节点再登录。
+
+  同时修了一个 TUN 下的误报：以前开着 TUN 点「一键体检」，结论会写「系统代理没打开」。
+  这是错的 —— TUN 模式下系统代理本来就该关着（两个同时开，流量进了 TUN 又被指回本地端口，
+  软件开 TUN 时自己就会把系统代理关掉）。现在诊断先看出口：网卡名是 Meta/wintun 之类，
+  或者本机地址落在 198.18.x.x（内核 fake-ip 段），就认定 TUN 在导流，不再报这条。
+
+  想确认场景有没有进配置：http://127.0.0.1:7892/api/state 里 groups 应该能看到
+  「Google 反重力」与「Google 自动」两项。
+
+

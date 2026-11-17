@@ -473,6 +473,26 @@ python -m pytest tests -q           # 单元测试
 
 ## 11. 更新日志
 
+### 1.2.8 — 加了「Google 反重力」场景；TUN 开着不再误报「系统代理没打开」
+
+**出厂场景从 11 个变 12 个**，新的是 Google 全家桶，按你说的做成了独立场景：
+
+| 名字 | 盖住的域 | 默认偏好地区 |
+| --- | --- | --- |
+| Google 反重力 | `antigravity.google`、`gemini.google.com`、`aistudio.google.com`、`ai.google.dev`、`generativelanguage.googleapis.com`、`cloudaicompanion.googleapis.com`（IDE 补全）、`google.com`、`googleapis.com`、`gstatic.com`、`googleusercontent.com`、`gvt1.com`/`gvt2.com`（客户端更新） | 日本 / 美国 / 新加坡 / 台湾 / 香港 |
+
+为什么把 Google 放一堆里而不是只写 Antigravity：这个编辑器一口气要五个域——官网下载、账号登录（`google.com` 与 `accounts.google.com`）、Gemini 网页、AI Studio 后端、模型 API。少盖一个就表现为「能登录、一用就转圈」，比全都不通更难查。所以它和 GitHub 场景一样带**自动子组**（叫「Google 自动」，每 180 秒按探测结果挑活节点），节点池里死节点多的时候不用手动换。
+
+**顺手修掉了一个 TUN 下的误报**（诊断内核 1.14.0 带到包里）：TUN 开着时，「一键体检」会报 `系统代理没打开`（medium）。这是错的：TUN 模式下系统代理**本来就应该关着**——两个同时开会让流量进 TUN 又被指回本地端口，软件自己开 TUN 时就会把系统代理关掉。现在采集先看出口：网卡名带 `meta/wintun/tun/tap/wg`，或 v4 源地址落在 `198.18.0.0/15`（内核 fake-ip 段），就认定 TUN 在导流，此时不产 `SYSPROXY_OFF`，只记 `probes.tun=1`。只看出口不看配置——内核配了 TUN 却压根没建出网卡时出口仍是物理网卡，那时该报的照报。
+
+后端改动：`vpntray/modules.py` 的 `_LAUNCHERS` 追加 google 一项（`_launcher_builtins()` 自动展开成同形状场景）；自动子组名改成「标题第一段 + 自动」（原来只 replace「加速」，遇到「Google 反重力」会拼出「Google 反重力 自动」）。`yuans_nd/collect/net.py` 新增 `looks_tun()` 与 `TUN_IFACE_HINTS`/`TUN_SRC_NETS`，`collect/sys.py` 的 `collect()` 加 `tun_on` 参数，`service._tick_once` 先算出口再采集。
+
+测试：315 例（新增 google 场景 1 例、诊断内核 TUN 降噪 6 例）。
+
+```
+# 想让反重力走日本：场景页 → Google 反重力 → 选节点（或留「Google 自动」）
+# 只想验证是否盖住：系统代理开着时 http://127.0.0.1:7892/api/state 里看 groups
+```
 ### 1.2.7 — TUN 真的能开了：补上 wintun.dll，修两个「假装成功」
 
 1.2.6 及以前点「TUN」会返回成功、状态也显示已开，但内核 `/configs` 里 `tun.enable` 一直是 false，

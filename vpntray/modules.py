@@ -651,6 +651,32 @@ _LAUNCHERS: tuple[tuple, ...] = (
         ],
         ["DOMAIN-KEYWORD,playstation"],
     ),
+    (
+        "google", "Google 反重力", "🌀", 200, "Antigravity 编辑器 / Gemini / AI Studio / Google 登录",
+        "https://gemini.google.com/robots.txt",
+        ["日本", "美国", "新加坡", "台湾", "香港"],
+        [
+            "antigravity.google",                      # Antigravity 官网与下载
+            "gemini.google.com",                       # Gemini 网页
+            "gemini.google",                           # 短域与 App 深链
+            "aistudio.google.com",                     # AI Studio
+            "ai.google.dev",                           # Gemini API 文档
+            "ai.google",                               # 实验室页面
+            "generativelanguage.googleapis.com",       # 模型 API（流式）
+            "cloudaicompanion.googleapis.com",         # IDE 里的 Gemini 补全
+            "alkalimakersuite-pa.clients6.google.com",  # AI Studio 后端
+            "makersuite.google.com",
+            "clients6.google.com",                     # 各前端共用的批处理端点
+            "googleapis.com",
+            "googleusercontent.com",                   # 头像 / 附件 / 上传
+            "gstatic.com",                             # 静态资源
+            "google.com",                              # 搜索、账号、Drive、Docs
+            "withgoogle.com",
+            "gvt1.com",                                # 客户端更新下载
+            "gvt2.com",
+        ],
+        ["DOMAIN-KEYWORD,googleapis", "DOMAIN-SUFFIX,gvt1.com", "DOMAIN-SUFFIX,gvt2.com"],
+    ),
 )
 
 
@@ -671,7 +697,9 @@ def _launcher_builtins() -> list[dict[str, Any]]:
             "group": {
                 "type": "select",
                 "auto": True,
-                "auto_title": title.replace("加速", "自动"),
+                # 取标题第一段 + 自动：出厂标题里有的不带「加速」（如「Google 反重力」），
+                # 直接 replace 会拼出「Google 反重力 自动」这种又长又别扭的子组名。
+                "auto_title": f"{title.split()[0]} 自动",
                 "probe": probe,
                 "interval": 180,
                 "timeout": 3000,

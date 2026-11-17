@@ -135,5 +135,35 @@ class SetTunTest(unittest.TestCase):
         self.assertEqual(calls["restart"], 0)
 
 
+class DropTunWithoutAdminTest(unittest.TestCase):
+    """普通权限启动时必须自己关掉 TUN，否则内核起不来、整机断网。"""
+
+    def _fake(self, tun=True):
+        st = _settings(tun=tun)
+        state = {}
+        fake = types.SimpleNamespace(settings=st, _set=lambda **kw: state.update(kw))
+        return fake, state
+
+    def test_non_admin_drops_tun(self):
+        fake, state = self._fake()
+        with mock.patch.object(app_mod.netguard, "is_admin", return_value=False):
+            self.assertTrue(app_mod.App._drop_tun_without_admin(fake))
+        self.assertFalse(fake.settings["tun"])
+        self.assertFalse(state.get("tun"))
+        self.assertIn("管理员", state.get("tun_reason") or "")
+
+    def test_admin_keeps_tun(self):
+        fake, state = self._fake()
+        with mock.patch.object(app_mod.netguard, "is_admin", return_value=True):
+            self.assertFalse(app_mod.App._drop_tun_without_admin(fake))
+        self.assertTrue(fake.settings["tun"])
+        self.assertEqual(state, {})
+
+    def test_tun_off_is_noop(self):
+        fake, state = self._fake(tun=False)
+        with mock.patch.object(app_mod.netguard, "is_admin", return_value=False):
+            self.assertFalse(app_mod.App._drop_tun_without_admin(fake))
+        self.assertEqual(state, {})
+
 if __name__ == "__main__":
     unittest.main()

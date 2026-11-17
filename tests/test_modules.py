@@ -202,6 +202,7 @@ def test_builtins_seed_once():
         # 出厂必须带齐：两个老场景 + Xbox + 八家启动器
         assert {"steam", "github", "xbox", "epic", "battlenet", "ea",
                 "ubisoft", "gog", "riot", "rockstar", "playstation",
+                "google",
                 "ocr-router"} <= keys
         # OCR 路由是「只插规则不建组」的样板：目标必须是直连，否则阿里云
         # 那几步会被绕到境外节点，识别一次卡十几秒。
@@ -220,6 +221,20 @@ def test_builtins_seed_once():
         assert modules.load("steam") is None
         assert modules.reset_builtins() >= 1             # 手动恢复才有
         assert modules.load("steam") is not None
+
+
+def test_google_antigravity_scene():
+    """反重力场景：域名要盖住 Antigravity 官网、Gemini 网页与模型 API。"""
+    g = modules.load("google") or {m["key"]: m for m in modules.builtins()}["google"]
+    assert g["kind"] == "scene"
+    assert g["group"]["auto"] is True
+    assert g["group"]["probe"].startswith("https://gemini.google.com")
+    if g["group"].get("auto_title"):
+        assert g["group"]["auto_title"] == "Google 自动"
+    for d in ("antigravity.google", "generativelanguage.googleapis.com",
+              "aistudio.google.com", "google.com", "gstatic.com"):
+        assert d in g["match"]["domains"], d
+    assert not modules.validate(g)
 
 
 # ───────── 翻译成 mihomo 配置 ─────────
