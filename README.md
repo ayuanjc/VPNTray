@@ -33,11 +33,11 @@
 | 系统代理 | 接管 Windows 系统代理到 `127.0.0.1:7891`，退出时精确还原你原来的设置 |
 | 选节点 | 先测延迟，再用两次真实 HTTPS 请求验证，只选真的能上网的那个 |
 | 健康看护 | 每 45 秒探当前节点，连续失败自动换；每 20 秒检查系统代理有没有被别人改走 |
-| 场景模块 | 「一组域名 + 一个出口」写成 `data/modules/*.json`，面板里可增删改，改完热重载 |
+| 场景模块 | 「一组域名 + 一个出口」写成 `data/modules/*.json`，面板里可增删改，改完热重载；生成时按「一个域只归一个组」仲裁，9 个游戏模块已合并成「游戏加速」 |
 | 断网急救 | 13 项逐项体检 + 13 个就地修复动作 + 可复制的纯文本报告 |
 | 交易通道监控 | 出口 IP / OKX REST 延迟 / 行情 WS / 交易域名是否被投毒，异常直接弹托盘通知 |
 | 校园网自动登录 | 自动认门户（Dr.COM / 深澜 / ePortal / 通用表单 / 自定义），掉线自动重登，登完把系统代理接回来 |
-| AI 页 | 独立一级界面：AI 通道 + AI 接口 + OCR 桥，一眼看到「AI 这条路通不通」 |
+| AI 页 | 独立一级界面：AI 编程工具（Claude Code / Codex / Gemini CLI / CCR 到底有没有走代理） + AI 通道（出口 / 节点 / 时区）+ AI 接口（token / 权限） |
 | AI 接口 | `/ai/v1` 双端点，40 个工具，三级权限，让 AI 直接读状态、改配置、跑动作 |
 | OCR 桥 | 托盘内守护 `127.0.0.1:8791`：端口没人听就拉起，掉线自动补；阿里云 AI 端点规则直连 |
 | 诊断内核 | 内嵌 Yuan's Network Doctor：看完读事件、归因到原因（带事件证据链）、一键修复与撤销；系统 DNS 被投毒这类事直接点名，不再靠 ping 猜 |
@@ -472,6 +472,96 @@ python -m pytest tests -q           # 单元测试
 ---
 
 ## 11. 更新日志
+
+### 1.3.0 — 三个模块 + 独立 AI 页：先说清「谁管哪个域」
+
+这一版不是堆功能，是把模块之间的逻辑收拾干净：一个域到底归谁、谁先谁后、
+自动到底是排队还是测速。这些事以前散在代码里，用户只能靠试。
+
+**1) 规则仲裁：一个域只归一个组**
+
+生成配置时先「占坑」再写规则，同一个 `DOMAIN-SUFFIX` 被第二个模块声明时会跳过并记日志，
+不再靠顺序掩盖重复。生成的顺序固定为九级：
+
+| 优先级 | 规则 | 说明 |
+|---|---|---|
+| 1 | 内网 / 回环直连 | `LAN_RULES` |
+| 2 | 模块的排除表 → `DIRECT` | 模块自己声明「这些子域我不管」 |
+| 3 | AI 会话域 →「AI 稳定」组 | 只在 `ai_enabled` 打开时生成 |
+| 4 | Google 模块域 | 已剔除 AI 占用的域 |
+| 5 | 游戏模块域 | 一个「游戏加速」组 |
+| 6 | Steam / GitHub 等其它模块 | 按 order |
+| 7 | 国内补充规则 | 订阅里给的直连项 |
+| 8 | 订阅规则 | 订阅自带的全部规则 |
+| 9 | `GEOSITE,cn` / `GEOIP,CN` / `MATCH` | 兜底 |
+
+四条硬约束：
+
+- **一个域只属于一个组**：重复的第二个声明被丢弃，`app.log` 里能看到是谁抢的。
+- **「AI 稳定」组的成员只能是节点名**，不许嵌套别的组 —— 组套组时界面上选中的出口不是真正的出口。
+- **「自动」= `url-test` + `tolerance: 50`**：以前是 `fallback`，按名单顺序取第一个能通的，
+  成员按地区排序，于是界面上写「自动」实际是排队，从不测谁最快。
+- **全局模式会显式报警**：`mode=global` 时 mihomo 根本不看规则，所有模块组都在但一个包都不进；
+  场景卡顶部会直说这件事，并给一个「切回规则模式」按钮。
+
+**2) 九个游戏模块合成一个「游戏加速」**
+
+Xbox / Epic / Battle.net / EA / Ubisoft / GOG / Riot / Rockstar / PlayStation 之前各是一个模块：
+9 个 select 组 + 9 个自动子组堆在面板里，域名还两两重叠（`login.live.com`、EAC 反作弊既属 Epic 也属 Apex），
+后建的那一组永远是死组 —— 切了没反应，还找不到原因。
+
+现在启动时自动合并成一个模块（`order` 取最小值再减一，保证先占域），旧文件保留但写成
+`enabled: false` + `merged_into: "games"`：想拆回某个平台，改 `enabled` 就行，不会丢配置。
+
+**3) Google 模块收敛**
+
+- 去掉 `DOMAIN-KEYWORD,googleapis`：它把 `services.googleapis.cn` 这类国内服务一起抢到日本节点。
+- 去掉 `googleapis.com` 宽域，改成精确域（`notebooklm.google.com` 等）。
+- 加排除表：`dl.google.com`、`dl.l.google.com`、`mtalk.google.com`、`cache.pack.google.com`、
+  `safebrowsing-cache.google.com`、`ssl-google-analytics.l.google.com` 强制 `DIRECT`
+  —— 这些是订阅本来就要直连的，之前被 `DOMAIN-SUFFIX,google.com` 抢走，那些 DIRECT 行成了死规则。
+- 探针保留 `https://gemini.google.com/robots.txt`：`generate_204` 只说明 Google 边缘可达，
+  有些节点 Google 通、Gemini 照样按地区拒绝。
+
+**4) 独立 AI 页（第 4 个一级界面）**
+
+`AI` 从工具页里独立出来，一页三张卡：AI 编程工具 / AI 通道 / AI 接口。
+AI 通道与 AI 接口的界面没变，只是搬了位置；OCR 桥留在工具页（它与代理无关）。
+
+**5) AI 编程工具：真正让 Claude Code / Codex 走代理**
+
+模块分流只决定「内核把包送去哪」，管不到「程序有没有把包发给内核」。这些 CLI 不读 Windows 系统代理，
+只认 `HTTPS_PROXY` —— TUN 关着、又没设变量的时侯，它们的流量是直连出去的，走哪个节点都与它无关。
+（本轮线上就有一例：OCR 桥 502，根因是它拉起的 node 继承了带代理的环境变量，反而把阿里云 TLS 打断了。）
+
+AI 页因此做三件事：
+
+| 按钮 | 做什么 | 边界 |
+|---|---|---|
+| 测一条链路 | 每个已装的 CLI 各发一次 CONNECT + TLS，报「经代理通 / 直连通」 | 只读，不改任何设置 |
+| 让它们走本机代理 | 把 `HTTPS_PROXY`/`HTTP_PROXY`（大小写四键）指到 `127.0.0.1:7891`，`NO_PROXY` 追加本地与 `.local` | 只写 `HKCU\Environment`，改前备份到 `data/aienv-backup.json` |
+| 还原环境变量 | 按备份还原（没有备份时只删指向本机代理的键） | 不碰系统级变量、不写 PATH |
+
+认得四个 CLI：Claude Code（`claude`）、Codex（`codex`）、Gemini CLI（`gemini`）、
+Claude Code Router（`ccr`），另加 Antigravity。只查 PATH，不启动它们。
+
+环境变量只对新开的终端生效：已经在跑的 Claude Code / Codex 要重开窗口。
+
+**6) 顺手修的**
+
+- `merge_games` 的幂等性靠 `normalize()` 保留 `merged_into` 字段 —— 少了它每次启动都会重复合并。
+- AI 页从 `VIEW_ALIAS` 里摘掉 `ai` 别名（否则点 AI 会跳到工具页）。
+
+**7) 老机器不用手动改内置模块**
+
+`data/modules/*.json` 是首次运行物化出来的，改了定义只有新装的机器吃得到。1.3.0 给内置模块加了
+`builtin_rev`：启动时如果磁盘上的版本更低（目前只有 Google 这一条），就按当前定义刷新「规则内容」——
+`enabled` / `order` / `pinned` / 节点选择全部保留，已合并进别的模块的直接跳过。
+
+真机上是这么撞出来的：`google.json` 还是旧的，`DOMAIN-KEYWORD,googleapis` 一直躺在生成的配置里，
+界面上无论如何看不出异常。
+
+测试 339 例（新增 9 例规则仲裁 + 6 例游戏合并 + 3 例内置模块刷新），前端 `node --check` 门禁仍在。
 
 ### 1.2.9 — 诊断卡多一行「对外身份」：打不开的是「你被判在哪」 |
 

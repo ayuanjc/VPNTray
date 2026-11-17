@@ -88,6 +88,19 @@ class App:
         # 场景/规则模块是数据文件：首次运行把内置的 Steam / GitHub 物化到
         # data/modules/，之后用户删改都由文件说了算（不再写回）。
         modules_mod.ensure_builtins(self.settings)
+        # 老机器上的内置模块是旧定义物化出来的：1.3.0 收掉了 Google 的
+        # googleapis.com 宽域与 DOMAIN-KEYWORD，不刷新那份 json 新规则就不生效。
+        # 只刷规则内容，用户的开关与节点选择不动。
+        try:
+            modules_mod.refresh_builtins()
+        except Exception:  # noqa: BLE001
+            log.warning("刷新内置模块规则失败（不影响启动）", exc_info=True)
+        # 1.3.0：9 个游戏启动器模块合并成一个「游戏加速」。旧 json 保留但停用，
+        # 幂等；用户想拆回去改 enabled 即可（merged_into 只是标记）。
+        try:
+            modules_mod.merge_games()
+        except Exception:  # noqa: BLE001
+            log.warning("合并游戏模块失败（不影响启动）", exc_info=True)
         # 旧版的 steam_* / github_* 只是模块首次物化时的取值来源：模块文件已经在
         # 磁盘上了，这些键再留着会让「我改了设置怎么不生效」变成常驻疑问。
         try:

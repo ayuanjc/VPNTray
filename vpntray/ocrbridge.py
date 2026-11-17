@@ -41,6 +41,15 @@ PROBE_TIMEOUT = 1.0
 START_WAIT = 8.0
 INTERVAL_MIN = 10
 CREATE_NO_WINDOW = 0x08000000
+# 代理环境变量：从带代理的终端（或 TUN 时代的启动器）继承下来时，OCR 桥的上游会
+# 被送去国外节点。Node 24 的 fetch 认 NODE_USE_ENV_PROXY + HTTPS_PROXY，实测
+# 直连 dashscope 133ms 通过，经本机 7891 却在 TLS 握手阶段被断（2026-11-17 现场：
+# "Client network socket disconnected before secure TLS connection was established"，
+# 即 DSH 侧看到的 502 ocr_bridge_upstream）。OCR 桥只访问国内 API 与本地端口，
+# 所以拉起来时把这些变量摘掉，并把上游域名兜进 NO_PROXY。
+PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy",
+              "all_proxy", "NODE_USE_ENV_PROXY")
+BYPASS_HOSTS = ("aliyuncs.com", "dashscope.aliyuncs.com")
 
 _lock = threading.RLock()
 _state: dict[str, Any] = {
@@ -150,9 +159,36 @@ def start(*, dir: Any = None, port: int = DEFAULT_PORT) -> tuple[bool, str]:
         log.warning("OCR 桥未启动：%s", msg)
         return False, msg
 
+def child_env(base: Any = None) -> dict[str, str]:
+    """给 node 子进程的环境：摘掉代理变量，NO_PROXY 里补上上游域名。
+
+    不动其它变量（PATH、OCR_ROUTER_HOME、用户自定义的都照传）；不抛异常，
+    取不到环境就返回空 dict 由 Popen 用默认值。
+    """
+    try:
+        env = dict(os.environ if base is None else base)
+    except Exception:  # noqa: BLE001
+        return {}
+    for k in PROXY_VARS:
+        env.pop(k, None)
+    keep = [x.strip() for x in str(env.get("NO_PROXY") or env.get("no_proxy") or "").split(",") if x.strip()]
+    for h in BYPASS_HOSTS:
+        if h not in keep:
+            keep.append(h)
+    if keep:
+        env["NO_PROXY"] = ",".join(keep)
+        env.pop("no_proxy", None)
+    return env
+
+
+def _spawn_env() -> dict[str, str]:
+    """Popen 用：找不到就退回 None（继承当前进程环境）。"""
+    env = child_env()
+    return env or None  # type: ignore[return-value]
     try:
         proc = subprocess.Popen(
             [node, str(server)],
+            env=_spawn_env(),
             cwd=str(d),
             stdin=subprocess.DEVNULL,
             stdout=logf,

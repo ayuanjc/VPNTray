@@ -103,11 +103,25 @@ class FrontendIATest(unittest.TestCase):
     def setUp(self) -> None:
         self.html = INDEX.read_text(encoding="utf-8")
 
-    def test_five_views_only(self) -> None:
+    def test_six_views_only(self) -> None:
+        # 1.3.0：AI 单独成页（第 4 位）。旧 nodes/scenes/subs 仍然只能靠别名跳转。
         views = re.findall(r'data-view="([a-z]+)"', self.html)
-        self.assertEqual(views, ["home", "fix", "speed", "tools", "settings"])
-        for dead in ("view-nodes", "view-scenes", "view-ai", "view-subs"):
+        self.assertEqual(views, ["home", "fix", "speed", "ai", "tools", "settings"])
+        for dead in ("view-nodes", "view-scenes", "view-subs"):
             self.assertNotIn('id="' + dead + '"', self.html, "旧页面还留着：" + dead)
+
+    def test_ai_page_wired(self) -> None:
+        self.assertIn('id="view-ai"', self.html)
+        self.assertIn('id="aeBody"', self.html)
+        self.assertIn('id="aePills"', self.html)
+        for act in ("ae-probe", "ae-apply", "ae-clear"):
+            self.assertIn('data-act="' + act + '"', self.html)
+            self.assertIn("a === '" + act + "'", self.html)
+        self.assertIn("function renderAIPage()", self.html)
+        for route in ("/api/aienv/status", "/api/aienv/probe", "/api/aienv/apply", "/api/aienv/clear"):
+            self.assertIn(route, self.html)
+        # 旧别名里不能再有 ai，否则 AI 页永远打不开
+        self.assertNotIn("ai: 'tools'", self.html)
 
     def test_problem_entries_wired(self) -> None:
         for act in ("go-offline", "go-site", "go-slow"):
@@ -123,7 +137,7 @@ class FrontendIATest(unittest.TestCase):
 
     def test_legacy_view_links_aliased(self) -> None:
         self.assertIn("var VIEW_ALIAS", self.html)
-        for old in ("nodes", "scenes", "ai", "subs"):
+        for old in ("nodes", "scenes", "subs"):
             self.assertIn(old + ":", self.html)
 if __name__ == "__main__":
     unittest.main()

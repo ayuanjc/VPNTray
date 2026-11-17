@@ -15,7 +15,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__ as _APP_VER
-from . import aiops, campus, disguise, dnsguard, doctor, okxguard
+from . import aienv, aiops, campus, disguise, dnsguard, doctor, okxguard
 from .paths import ROOT, asset
 from .purity import FLAG_CC
 
@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.2.9"
+UI_VER = "1.3.0"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -688,6 +688,24 @@ class WebUI:
             self._bg(app.check_purity, [node], 0)
             return {"ok": True, "queued": node}
 
+        def _mixed_port():
+            return int(app.settings.get("mixed_port") or 7891)
+
+        def aienv_status(_body):
+            """AI 编程工具的现状：装了什么、环境变量指向哪。不联网。"""
+            return aienv.status(_mixed_port(), probe=False)
+
+        def aienv_probe(_body):
+            """点一下才联网：每个已装工具各发一次 CONNECT + TLS，不动任何配置。"""
+            return aienv.status(_mixed_port(), probe=True)
+
+        def aienv_apply(_body):
+            """把 HTTPS_PROXY 指到本机 mixed 端口（先备份原值，可一键还原）。"""
+            return aienv.apply(_mixed_port())
+
+        def aienv_clear(_body):
+            return aienv.clear()
+
         def campus_save(body):
             return app.campus_save(body or {})
 
@@ -875,6 +893,10 @@ class WebUI:
             "/api/ai/launcher": ai_launcher,
             "/api/ai/probe": ai_probe,
             "/api/ai/api": ai_api,
+            "/api/aienv/status": aienv_status,
+            "/api/aienv/probe": aienv_probe,
+            "/api/aienv/apply": aienv_apply,
+            "/api/aienv/clear": aienv_clear,
             "/api/module/get": module_get,
             "/api/module/save": module_save,
             "/api/module/delete": module_delete,

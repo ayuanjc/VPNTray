@@ -461,7 +461,11 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4.5 13.5H11l-1 8.5L19.5 10H13z"/></svg>
         <span class="lbl">加速</span><span class="n" id="navNodes"></span>
       </button>
-      <button data-view="tools" title="工具：校园网 / GitHub / 解析 / OCR / AI">
+      <button data-view="ai" title="AI：编程工具的代理与出口">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/><circle cx="12" cy="12" r="3.6"/></svg>
+        <span class="lbl">AI</span><span class="n" id="navAi"></span>
+      </button>
+      <button data-view="tools" title="工具：校园网 / GitHub / 解析 / OCR">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6.5V3M15 6.5V3M6.5 6.5h11v5a5.5 5.5 0 01-11 0z"/><path d="M12 17v4"/></svg>
         <span class="lbl">工具</span>
       </button>
@@ -634,6 +638,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
       </section>
       <section class="card c12">
         <h2>场景 / 模块<span class="hint">每个场景一个独立出口，可自由增删</span></h2>
+        <div id="modWarn"></div>
         <div class="rows" id="scenes"></div>
         <div class="acts" style="margin-top:12px">
           <button class="btn" data-act="mod-new">新增模块</button>
@@ -673,22 +678,6 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
         <div class="note" id="cpNote"></div>
       </section>
       <section class="card c6">
-        <h2>AI 接口<span class="hint">让本机的 AI 客户端直接操作这个程序</span></h2>
-        <div class="gwrap" id="apiPills"></div>
-        <div id="apiBody"></div>
-        <div class="acts" style="margin-top:12px">
-          <label class="sw" title="关闭后所有 /ai/v1 调用都返回 401"><input type="checkbox" id="apiOn"><i></i></label>
-          <select class="sel" id="apiLevel" title="AI 最多能做到哪一步">
-            <option value="read">只读</option>
-            <option value="write">可改配置</option>
-            <option value="full">完全控制</option>
-          </select>
-          <button class="btn" data-act="api-copy">复制 token</button>
-          <button class="btn" data-act="api-regen">重置 token</button>
-        </div>
-        <div class="note" id="apiNote"></div>
-      </section>
-      <section class="card c6">
         <h2>本机解析<span class="hint" id="dnsHint"></span></h2>
         <div class="gwrap" id="dnsPills"></div>
         <div class="acts" style="margin-top:12px">
@@ -696,10 +685,6 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
           <label class="sw" title="本地 DNS 兜底：127.0.0.1:53"><input type="checkbox" id="dnsOn"><i></i></label>
         </div>
         <div class="note" id="dnsNote"></div>
-      </section>
-      <section class="card c6">
-        <h2>AI 通道<span class="hint"><label class="sw" title="Claude Code / Codex 走独立出口"><input type="checkbox" id="aiOn"><i></i></label></span></h2>
-        <div id="aiBody"></div>
       </section>
       <section class="card c6">
         <h2>GitHub<span class="hint" id="ghHint"></span></h2>
@@ -723,6 +708,41 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
     </section>
 
     <!-- 设置：开关 / 订阅 / 更新 / 日志 -->
+    <section class="view" id="view-ai">
+      <div class="grid">
+        <section class="card c12">
+          <h2>AI 编程工具<span class="hint">Claude Code / Codex / Gemini CLI 的流量到底有没有走代理</span></h2>
+          <div class="gwrap" id="aePills"></div>
+          <div id="aeBody"></div>
+          <div class="acts" style="margin-top:12px">
+            <button class="btn" data-act="ae-probe">测一条链路</button>
+            <button class="btn primary" data-act="ae-apply">让它们走本机代理</button>
+            <button class="btn" data-act="ae-clear">还原环境变量</button>
+          </div>
+          <div class="note" id="aeNote"></div>
+        </section>
+        <section class="card c6">
+          <h2>AI 通道<span class="hint"><label class="sw" title="Claude Code / Codex 走独立出口"><input type="checkbox" id="aiOn"><i></i></label></span></h2>
+          <div id="aiBody"></div>
+        </section>
+        <section class="card c6">
+          <h2>AI 接口<span class="hint">让本机的 AI 客户端直接操作这个程序</span></h2>
+          <div class="gwrap" id="apiPills"></div>
+          <div id="apiBody"></div>
+          <div class="acts" style="margin-top:12px">
+            <label class="sw" title="关闭后所有 /ai/v1 调用都返回 401"><input type="checkbox" id="apiOn"><i></i></label>
+            <select class="sel" id="apiLevel" title="AI 最多能做到哪一步">
+              <option value="read">只读</option>
+              <option value="write">可改配置</option>
+              <option value="full">完全控制</option>
+            </select>
+            <button class="btn" data-act="api-copy">复制 token</button>
+            <button class="btn" data-act="api-regen">重置 token</button>
+          </div>
+          <div class="note" id="apiNote"></div>
+        </section>
+      </div>
+    </section>
     <section class="view" id="view-settings">
       <div class="grid">
       <section class="card c6">
@@ -836,7 +856,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.2.9';
+var UI_VER = '1.3.0';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -1087,11 +1107,13 @@ var TITLES = {
   home: ['概览', '现在通不通，一眼看完'],
   fix: ['修复', '不通的时候来这一页：先出结论，再动手'],
   speed: ['加速', '出口与节点：慢就换，打不开就单独开个场景'],
-  tools: ['工具', '校园网 · GitHub · 本机解析 · OCR · AI 接口'],
+  ai: ['AI', 'AI 编程工具：流量有没有走代理、出口在哪个国家'],
+  tools: ['工具', '校园网 · GitHub · 本机解析 · OCR'],
   settings: ['设置', '订阅、运行模式、更新与日志']
 };
 // 旧的深链接（书签里存着 nodes/scenes/ai/subs）落到新页面，别让人打开是空白
-var VIEW_ALIAS = { nodes: 'speed', scenes: 'speed', ai: 'tools', subs: 'settings' };
+// ai 在 1.3.0 已经是真页面，不能再当旧别名指向 tools（否则点 AI 会跳到工具页）
+var VIEW_ALIAS = { nodes: 'speed', scenes: 'speed', subs: 'settings' };
 
 function setView(v) {
   v = VIEW_ALIAS[v] || v;
@@ -1100,7 +1122,7 @@ function setView(v) {
   VIEW = v;
   LS.set('vpn.view', v);
   var i;
-  var ORDER = ['home', 'fix', 'speed', 'tools', 'settings'];
+  var ORDER = ['home', 'fix', 'speed', 'ai', 'tools', 'settings'];
   var dir = '';
   if (prev && ORDER.indexOf(v) > ORDER.indexOf(prev)) dir = 'right';
   else if (prev && ORDER.indexOf(v) < ORDER.indexOf(prev)) dir = 'left';
@@ -1370,6 +1392,15 @@ function renderScenes() {
       + '</div>';
   }).join('');
   patch('#scenes', h || '<div class="empty">还没有模块，点下面的「新增模块」加一个</div>', '#scenes select');
+  // 全局模式下 mihomo 不看规则：所有模块组都在，但一个包都不进 —— 不显式说出来，
+  // 用户会以为「模块坏了」。这里给一句实话 + 一键切回规则模式。
+  var warn = '';
+  if (S && S.mode === 'global') {
+    warn = '<div class="note" style="color:#e6c88a;display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+      + '<span>现在是全局模式：所有流量走同一个出口，下面的模块（含 Google / 游戏 / AI）都不会生效。</span>'
+      + '<button class="btn sm" data-act="mode-rule">切回规则模式</button></div>';
+  }
+  patch('#modWarn', warn);
 }
 
 /* ───── 模块编辑：直接改 JSON，保存即热加载 ───── */
@@ -1822,6 +1853,105 @@ async function ocrRestart() {
     OCR_BUSY = false;
   }
 }
+/* ───── AI 页：编程工具的代理与出口（1.3.0） ───── */
+var AE = { data: null, busy: false };
+
+function renderAIPage() {
+  renderAienv();
+  renderAI();
+  renderModulesApi();
+}
+
+function renderAienv() {
+  var d = AE.data;
+  var gp = [];
+  if (!d) {
+    gp.push('<span class="gp">还没查过</span>');
+  } else {
+    gp.push('<span class="pill ' + (d.applied ? 'on' : 'busy') + '"><i></i>' + (d.applied ? '已指向本机代理' : '没设代理') + '</span>');
+    var found = (d.tools || []).filter(function (t) { return t.found; });
+    gp.push('<span class="gp">' + (found.length ? found.length + ' 个 CLI 已安装' : 'PATH 里没有 AI CLI') + '</span>');
+    if (d.mixed_port) gp.push('<span class="gp">本机端口 ' + n(d.mixed_port) + '</span>');
+  }
+  patch('#aePills', gp.join(''));
+
+  var h = '';
+  if (!d) {
+    h = '<div class="note dim">点上面的按钮看现状：只查 PATH 与环境变量，不联网也不改设置。</div>';
+  } else {
+    var cur = (d.env && (d.env.HTTPS_PROXY || d.env.https_proxy)) || '';
+    h += '<div class="kv">';
+    h += '<div class="l"><span class="k">当前代理</span><span class="v' + (d.applied ? '' : ' dim') + '">' + esc(cur || '未设置') + '</span></div>';
+    h += '<div class="l"><span class="k">目标值</span><span class="v dim">' + esc(d.want || '') + '</span></div>';
+    h += '</div>';
+    (d.tools || []).forEach(function (t) {
+      var lv = 'skip';
+      var st = '没装';
+      if (t.found) {
+        if (!t.via_proxy) { lv = 'info'; st = '已安装，未测'; }
+        else if (t.via_proxy.ok) { lv = 'ok'; st = '经代理通 ' + n(t.via_proxy.ms) + ' ms'; }
+        else { lv = 'bad'; st = '经代理不通'; }
+      }
+      h += '<div class="ndrow ' + lv + '"><div class="h"><span class="ndbadge ' + lv + '"></span>';
+      h += '<b>' + esc(t.title) + '</b><span class="dim" style="margin-left:10px">' + esc(t.path || 'PATH 里没有') + '</span>';
+      h += '<span class="' + (lv === 'bad' ? 'bad' : lv === 'ok' ? 'ok' : 'dim') + '" style="margin-left:auto">' + esc(st) + '</span></div>';
+      if (t.found && t.via_proxy && !t.via_proxy.ok && t.via_proxy.error) {
+        h += '<div class="why">' + esc(String(t.via_proxy.error).slice(0, 160)) + '</div>';
+      }
+      if (t.found && t.via_proxy && t.direct) {
+        if (t.direct.ok && !t.via_proxy.ok) {
+          h += '<div class="why">直连能通、经代理不通：节点或规则挡住了这条链路（去「加速」换个节点再测）。</div>';
+        } else if (!t.direct.ok && !t.via_proxy.ok) {
+          h += '<div class="why">直连和经代理都不通：先确认内核在跑（「修复」页一键体检），这不是分流问题。</div>';
+        } else if (!t.direct.ok && t.via_proxy.ok) {
+          h += '<div class="why">直连被墙、经代理通 —— 这正是需要代理的那种情况。</div>';
+        }
+      }
+      h += '</div>';
+    });
+  }
+  patch('#aeBody', h);
+  var note = $('#aeNote');
+  if (note) note.innerHTML = d && d.note ? '<span class="dim">' + esc(d.note) + '</span>' : '';
+}
+
+async function aeLoad(probe) {
+  if (AE.busy) return;
+  AE.busy = true;
+  try {
+    var r = await api(probe ? '/api/aienv/probe' : '/api/aienv/status', {}, { timeout: API_SLOW });
+    if (r && r.ok !== false) AE.data = r;
+    else toast((r && r.error) || '读取 AI 环境失败', 'bad');
+    renderAienv();
+  } finally {
+    AE.busy = false;
+  }
+}
+
+async function aeApply() {
+  if (AE.busy) return;
+  AE.busy = true;
+  try {
+    var r = await api('/api/aienv/apply', {}, { timeout: API_SLOW });
+    if (r && r.ok) { toast(r.note || '已指向本机代理', 'good'); await aeLoad(false); }
+    else toast((r && r.error) || '设置失败', 'bad');
+  } finally {
+    AE.busy = false;
+  }
+}
+
+async function aeClear() {
+  if (AE.busy) return;
+  AE.busy = true;
+  try {
+    var r = await api('/api/aienv/clear', {}, { timeout: API_SLOW });
+    if (r && r.ok) { toast(r.note || '已还原', 'good'); await aeLoad(false); }
+    else toast((r && r.error) || '还原失败', 'bad');
+  } finally {
+    AE.busy = false;
+  }
+}
+
 function renderAI() {
   var a = (S && S.ai) || {};
   var on = !!a.enabled;
@@ -2410,7 +2540,8 @@ function renderView(v) {
   if (v === 'home') renderHome();
   else if (v === 'fix') { renderDoctor(); renderNetDoc(); }
   else if (v === 'speed') { renderChips(); renderNodes(); renderScenes(); }
-  else if (v === 'tools') { renderCampus(); renderDns(); renderGithub(); renderOcr(); renderAI(); renderModulesApi(); }
+  else if (v === 'ai') renderAIPage();
+  else if (v === 'tools') { renderCampus(); renderDns(); renderGithub(); renderOcr(); }
   else if (v === 'settings') { renderSettings(); renderSubs(); }
 }
 function render() {
@@ -2657,6 +2788,15 @@ document.addEventListener('click', function (e) {
   else if (a === 'dg-etw') dgEtw();
   else if (a === 'dg-net') dgNet();
   else if (a === 'dg-egress') dgEgress();
+  else if (a === 'mode-rule') {
+    api('/api/mode', { mode: 'rule' }, { timeout: API_SLOW }).then(function (r) {
+      if (r && r.ok) { toast('已切回规则模式，模块开始生效', 'good'); refresh(); }
+      else toast((r && r.error) || '切换失败', 'bad');
+    });
+  }
+  else if (a === 'ae-probe') aeLoad(true);
+  else if (a === 'ae-apply') aeApply();
+  else if (a === 'ae-clear') aeClear();
   else if (a === 'dg-conn') dgConn();
   else if (a === 'dg-hosts') dgHosts();
   else if (a === 'dg-detail') dgDetail();

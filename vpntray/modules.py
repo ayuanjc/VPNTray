@@ -45,6 +45,7 @@ SCHEMA = 1
 MAX_MODULES = 64
 MAX_DOMAINS = 400
 MAX_RULES = 200
+MAX_EXCLUDE = 40
 
 KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
 DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9_-]*[a-z0-9])?)+$")
@@ -181,9 +182,17 @@ def normalize(raw: Any) -> dict[str, Any]:
             "domains": _uniq(_domain, m.get("domains"), MAX_DOMAINS),
             "rules": _uniq(lambda x: _s(x, 300), m.get("rules"), MAX_RULES),
             "cidrs": _uniq(lambda x: _s(x, 64), m.get("cidrs"), MAX_RULES),
+            # 模块宣告「这些子域我不管」：生成配置时会在本模块规则前插 DIRECT。
+            "exclude": _uniq(_domain, m.get("exclude"), MAX_EXCLUDE),
         },
         "prefer_regions": _uniq(lambda x: _s(x, 16), r.get("prefer_regions"), 12),
         "pinned": _s(r.get("pinned"), 120),
+        # 1.3.0：被合并进别的模块时留下指向（如 "games"）。不保留这一项，
+        # 每次启动都会把旧模块再合并一遍 —— 幂等性就靠它。
+        "merged_into": _s(r.get("merged_into"), 32).lower(),
+        # 内置模块定义的版本（1.3.0）：比 BUILTIN_REV 低的老 json 会在启动时
+        # 按当前 _LAUNCHERS 刷新「规则内容」，用户自己的开关与节点选择保留。
+        "builtin_rev": _int(r.get("builtin_rev"), 1, 0, 99999),
     }
 
 
@@ -227,6 +236,10 @@ def validate(mod: dict[str, Any], reserved: Iterable[str] | None = None) -> list
     for d in m.get("domains") or []:
         if not DOMAIN_RE.match(d):
             errs.append(f"域名不合法：{d}（写后缀即可，不用 *. 前缀）")
+            break
+    for d in m.get("exclude") or []:
+        if not DOMAIN_RE.match(d):
+            errs.append(f"排除域名不合法：{d}")
             break
     for c in m.get("cidrs") or []:
         try:
@@ -652,7 +665,9 @@ _LAUNCHERS: tuple[tuple, ...] = (
         ["DOMAIN-KEYWORD,playstation"],
     ),
     (
-        "google", "Google 反重力", "🌀", 200, "Antigravity 编辑器 / Gemini / AI Studio / Google 登录",
+        "google", "Google 反重力", "🌀", 200, "Google 账号 / Antigravity / Gemini / AI Studio / Play / 更新",
+        # 探针用 Gemini 而不是 generate_204：模块的目的是「这个节点能不能用 Gemini」，
+        # 204 只能说明 Google 边缘可达，有些节点 Google 通、Gemini 直接地区拦截。
         "https://gemini.google.com/robots.txt",
         ["日本", "美国", "新加坡", "台湾", "香港"],
         [
@@ -666,8 +681,8 @@ _LAUNCHERS: tuple[tuple, ...] = (
             "cloudaicompanion.googleapis.com",         # IDE 里的 Gemini 补全
             "alkalimakersuite-pa.clients6.google.com",  # AI Studio 后端
             "makersuite.google.com",
+            "notebooklm.google.com",                   # NotebookLM
             "clients6.google.com",                     # 各前端共用的批处理端点
-            "googleapis.com",
             "googleusercontent.com",                   # 头像 / 附件 / 上传
             "gstatic.com",                             # 静态资源
             "google.com",                              # 搜索、账号、Drive、Docs
@@ -675,9 +690,28 @@ _LAUNCHERS: tuple[tuple, ...] = (
             "gvt1.com",                                # 客户端更新下载
             "gvt2.com",
         ],
-        ["DOMAIN-KEYWORD,googleapis", "DOMAIN-SUFFIX,gvt1.com", "DOMAIN-SUFFIX,gvt2.com"],
+        # 1.3.0 起这里不再用 DOMAIN-KEYWORD：关键词 googleapis 会把
+        # services.googleapis.cn 这类国内可达服务一起抢到日本节点（真机撞过）。
+        # gvt1/gvt2 已在上面的域名表里，不必再写一条规则。
+        [],
     ),
 )
+
+
+# 模块宣告「这些子域我不管」：生成配置时会在该模块规则**之前**插 DIRECT 行。
+# 起因（1.3.0）：DOMAIN-SUFFIX,google.com 是一张很宽的网，把订阅本意直连的
+# dl.google.com（Chrome 更新走国内 CDN 更快）、mtalk.google.com（FCM 推送，
+# 绕日本一圈会掉线）一起抢走，规则表里那些 DIRECT 行成了永不命中的死规则。
+_EXCLUDE: dict[str, tuple[str, ...]] = {
+    "google": (
+        "dl.google.com",
+        "dl.l.google.com",
+        "mtalk.google.com",
+        "cache.pack.google.com",
+        "safebrowsing-cache.google.com",
+        "ssl-google-analytics.l.google.com",
+    ),
+}
 
 
 def _launcher_builtins() -> list[dict[str, Any]]:
@@ -690,6 +724,7 @@ def _launcher_builtins() -> list[dict[str, Any]]:
             "desc": desc,
             "kind": "scene",
             "builtin": True,
+            "builtin_rev": BUILTIN_REV,
             "icon": icon,
             "order": order,
             # 和 GitHub 一样带自动子组：节点池里总有死节点，钉死一个出口
@@ -705,7 +740,11 @@ def _launcher_builtins() -> list[dict[str, Any]]:
                 "timeout": 3000,
             },
             "prefer_regions": list(regions),
-            "match": {"domains": list(domains), "rules": list(rules)},
+            "match": {
+                "domains": list(domains),
+                "rules": list(rules),
+                "exclude": list(_EXCLUDE.get(key, ())),
+            },
         }))
     return out
 
@@ -724,6 +763,136 @@ def _write_mark(path: Path, keys: set[str]) -> None:
         path.write_text("\n".join(sorted(keys)) + "\n", encoding="utf-8")
     except OSError as e:
         log.warning("写内置模块清单失败 %s: %s", path, e)
+
+
+# 内置模块定义的版本（1.3.0 起）。
+# 内置模块是首次运行时物化成 json 的，之后改 _LAUNCHERS 只影响新装的机器；
+# 改过「语义」的模块要把 key 记进 REFRESH_KEYS 并抬高 BUILTIN_REV，
+# 老机器下次启动才吃得到新定义（1.3.0：Google 收掉 googleapis.com 宽域与
+# DOMAIN-KEYWORD，否则 services.googleapis.cn 这类国内服务会被一起抢到日本）。
+BUILTIN_REV = 2
+REFRESH_KEYS = ("google",)
+
+# 九个游戏启动器模块（2.5.9–1.2.x 出厂）。1.3.0 起合并成一个「游戏加速」。
+GAME_KEYS = ("xbox", "epic", "battlenet", "ea", "ubisoft", "gog", "riot",
+             "rockstar", "playstation")
+GAMES_KEY = "games"
+
+
+def merge_games() -> int:
+    """把游戏启动器模块合并成一个「游戏加速」模块（1.3.0）。返回被标记的个数。
+
+    为什么合并：每个启动器一个模块，就是每个模块一个 select 组 + 一个 auto 子组，
+    9 个模块 = 18 个组堆在面板里；而且域名两两重叠（login.live.com 同时属于 Xbox
+    与微软商店、EAC 同时属于 Epic 与 Apex），mihomo 按顺序求值，后建的那一组
+    永远是死组 —— 用户切了没反应，还找不到原因。
+
+    旧 json 不删：enabled 置 false 并写 merged_into，想拆回去改 enabled 即可。
+    幂等：重复调用不会重复合并，也不会覆盖用户后来改过的「游戏加速」。
+    """
+    mods = {m["key"]: m for m in load_all(force=True)}
+    olds = [mods[k] for k in GAME_KEYS if k in mods and not mods[k].get("merged_into")]
+    if len(olds) < 2:            # 只有一个启动器（或已合并过）时不折腾用户
+        return 0
+    if GAMES_KEY not in mods:
+        domains: list[str] = []
+        rules: list[str] = []
+        exclude: list[str] = []
+        regions: list[str] = []
+        for m in olds:
+            mt = m.get("match") or {}
+            domains += [d for d in (mt.get("domains") or []) if d not in domains]
+            rules += [r for r in (mt.get("rules") or []) if r not in rules]
+            exclude += [d for d in (mt.get("exclude") or []) if d not in exclude]
+            regions += [r for r in (m.get("prefer_regions") or []) if r not in regions]
+        probe = str(((olds[0].get("group") or {}).get("probe")) or
+                    "https://www.xbox.com/robots.txt")
+        titles = [m.get("title") or m["key"] for m in olds]
+        mod = normalize({
+            "key": GAMES_KEY,
+            "title": "游戏加速",
+            "desc": " / ".join(titles)[:80],
+            "kind": "scene",
+            "builtin": True,
+            "icon": "G",
+            # 排在所有场景之前：合并后的模块要先占域，否则被旧模块抢回去
+            "order": min(int(m.get("order") or 50) for m in olds) - 1,
+            "group": {
+                "type": "select",
+                "auto": True,
+                "auto_title": "游戏 自动",
+                "probe": probe,
+                "interval": 180,
+                "timeout": 3000,
+            },
+            "prefer_regions": regions[:12],
+            "match": {"domains": domains, "rules": rules, "exclude": exclude},
+        })
+        _write_file(mod)
+    marked = 0
+    for m in olds:
+        m["enabled"] = False
+        m["merged_into"] = GAMES_KEY
+        try:
+            _write_file(m)
+            marked += 1
+        except OSError as e:
+            log.warning("标记已合并模块 %s 失败: %s", m.get("key"), e)
+    with _lock:
+        _cache["sig"] = None
+    if marked:
+        log.info("已把 %d 个游戏模块并入「游戏加速」", marked)
+    return marked
+
+
+def refresh_builtins() -> int:
+    """把老机器上的内置模块规则刷新成当前定义（1.3.0）。返回被刷新的个数。
+
+    只碰 REFRESH_KEYS 里的 key，而且只在 builtin_rev 更低时动手：用户自己的
+    enabled / order / pinned / merged_into / 节点选择全部保留 —— 改的是「这个
+    模块该管哪些域名」，不是「用户想不想用它」。
+
+    已并进别的模块（merged_into 非空）的跳过，否则会把「游戏加速」合并掉的
+    死模块又刷活，配置里立刻多出一批重复组。
+    """
+    fresh = {m["key"]: m for m in _launcher_builtins()}
+    updated = 0
+    for key in REFRESH_KEYS:
+        b = fresh.get(key)
+        p = _path(key)
+        if not b or not p.exists():
+            continue
+        try:
+            cur = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            log.warning("读内置模块 %s 失败，跳过刷新: %s", key, e)
+            continue
+        if not isinstance(cur, dict) or cur.get("merged_into"):
+            continue
+        if _int(cur.get("builtin_rev"), 1, 0, 99999) >= BUILTIN_REV:
+            continue
+        for f in ("title", "desc", "icon", "prefer_regions"):
+            if b.get(f):
+                cur[f] = b[f]
+        cur["match"] = b["match"]
+        old_group = cur.get("group") if isinstance(cur.get("group"), dict) else {}
+        g = dict(old_group)
+        # 类型/自动开关/目标组归用户；探测地址与间隔属于定义（换了域名就得换探测）
+        for f in ("probe", "auto_title", "interval", "timeout"):
+            if b["group"].get(f):
+                g[f] = b["group"][f]
+        cur["group"] = g
+        cur["builtin_rev"] = BUILTIN_REV
+        try:
+            _write_file(cur)
+            updated += 1
+        except OSError as e:
+            log.warning("刷新内置模块 %s 失败: %s", key, e)
+    if updated:
+        with _lock:
+            _cache["sig"] = None
+        log.info("已把 %d 个内置模块的规则刷新到 rev %d", updated, BUILTIN_REV)
+    return updated
 
 
 def ensure_builtins(settings: Any = None) -> int:
@@ -825,5 +994,6 @@ def summary() -> list[dict[str, Any]]:
             "target": str((m.get("group") or {}).get("target") or ""),
             "prefer": list(m.get("prefer_regions") or []),
             "pinned": m.get("pinned", ""),
+            "merged_into": str(m.get("merged_into") or ""),
         })
     return out

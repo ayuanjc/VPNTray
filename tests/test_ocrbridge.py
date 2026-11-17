@@ -156,5 +156,27 @@ class WebuiRoutes(unittest.TestCase):
             self.assertIn(path, table)
 
 
+class ChildEnvTest(unittest.TestCase):
+    """OCR 桥拉 node 时必须摘掉代理变量（1.2.10）：否则 Node 24 的 fetch 会把
+    国内上游送去国外节点，TLS 在握手阶段被断，DSH 侧看到 502 ocr_bridge_upstream。"""
+
+    def test_proxy_vars_removed(self):
+        env = ocrbridge.child_env({"HTTPS_PROXY": "http://127.0.0.1:7891",
+                                   "NODE_USE_ENV_PROXY": "1", "PATH": "C:/x"})
+        self.assertNotIn("HTTPS_PROXY", env)
+        self.assertNotIn("NODE_USE_ENV_PROXY", env)
+        self.assertEqual(env["PATH"], "C:/x")
+
+    def test_no_proxy_keeps_old_and_adds_upstream(self):
+        env = ocrbridge.child_env({"NO_PROXY": "localhost,127.0.0.1"})
+        parts = env["NO_PROXY"].split(",")
+        self.assertIn("localhost", parts)
+        self.assertIn("aliyuncs.com", parts)
+        self.assertIn("dashscope.aliyuncs.com", parts)
+
+    def test_spawn_env_falls_back_to_none_on_failure(self):
+        with mock.patch.object(ocrbridge, "child_env", return_value={}):
+            self.assertIsNone(ocrbridge._spawn_env())
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

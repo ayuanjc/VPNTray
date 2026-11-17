@@ -91,6 +91,17 @@ AI_DOMAINS = [
     "featuregates.org",
     "sentry.io",
     "intercom.io",
+    # Google 的会话型 AI（1.3.0 补）：Gemini 网页 / AI Studio / 模型 API /
+    # IDE 补全。它们和 Claude 一样怕「自动组」中途换 IP（会话被判异地），
+    # 所以归 AI 稳定；Google 搜索 / Play / YouTube 不在这里，仍跟 Google 模块。
+    # ai_enabled=False 时这些域自然落回 Google 模块（AI 段整段不生成）。
+    "gemini.google.com",
+    "gemini.google",
+    "aistudio.google.com",
+    "generativelanguage.googleapis.com",
+    "cloudaicompanion.googleapis.com",
+    "alkalimakersuite-pa.clients6.google.com",
+    "makersuite.google.com",
     # 常见的中转/网关
     "packycode.com",
     "aihubmix.com",
@@ -363,6 +374,8 @@ def _scene_groups(node_names: list[str], settings, delays) -> tuple[list[dict[st
     for sc in scenes():
         if not bool(sc.get("enabled", True)):
             continue
+        if sc.get("merged_into"):      # 已并入「游戏加速」，不许再建第二个组
+            continue
         members, auto = _scene_layout(sc, node_names, settings, delays)
         if not members:
             log.info("模块 %s 没有可用成员，本轮不建组", sc.get("key"))
@@ -377,12 +390,16 @@ def _scene_groups(node_names: list[str], settings, delays) -> tuple[list[dict[st
         pinned = str(sc.get("pinned") or "")
         if grp.get("auto") and gtype == "select" and len(auto) >= 2:
             aname = auto_name(sc)
+            # 1.3.0：auto 子组从 fallback 改成 url-test。
+            # fallback 是「按成员顺序取第一个能通的」，而成员是按地区排的，
+            # 于是界面写着「自动」，实际是「按名单排队」，从不测谁最快。
             scene_groups.append({
                 "name": aname,
-                "type": "fallback",
+                "type": "url-test",
                 "url": probe,
                 "interval": interval,
                 "timeout": timeout,   # 3s 还没握手完的节点在 GitHub 上就是不可用
+                "tolerance": 50,
                 "lazy": False,
                 "proxies": auto,
             })
@@ -415,9 +432,28 @@ def _rules(sub: dict[str, Any], main_group: str, ai_on: bool,
     sub_rules = [r for r in sub["rules"] if not r.upper().startswith("MATCH")]
     out_rules: list[str] = []
     out_rules += LAN_RULES
+
+    # ── 域仲裁（1.3.0）──
+    # 同一个域只能属于一个组：先到先得，后来的丢弃并记日志。
+    # 以前靠「谁写在前面谁生效」，结果同一个 gemini.google.com 在规则表里
+    # 出现 3–4 次（Google 模块 / 订阅的 AI 网站 / 媒体解锁），后几条永远不会命中；
+    # 界面上看到的模块和实际出口对不上，排查时极难发现。
+    owner: dict[tuple[str, str], str] = {}
+
+    def _claim(kind: str, payload: str, tgt: str, src: str) -> bool:
+        key = (kind.strip().upper(), str(payload).strip().lower())
+        had = owner.get(key)
+        if had is None:
+            owner[key] = tgt
+            return True
+        if had != tgt:
+            log.info("规则 %s,%s 已归 %s，%s 的同一行跳过（域仲裁）", key[0], payload, had, src)
+        return False
     # AI 域名优先级高于订阅规则，避免被分到「国际媒体」之类的乱切组
     if ai_on:
-        out_rules += [f"DOMAIN-SUFFIX,{d},{AI_GROUP}" for d in AI_DOMAINS]
+        for d in AI_DOMAINS:
+            if _claim("DOMAIN-SUFFIX", d, AI_GROUP, "AI 通道"):
+                out_rules.append(f"DOMAIN-SUFFIX,{d},{AI_GROUP}")
     # 场景加速同样排在订阅规则前面：订阅把这些域名丢进「国际媒体」时，
     # 那条线按 Netflix 的落地点走，Steam 下载和 git clone 会慢到没法用。
     # 模块（场景 + 纯规则模块）：场景模块的目标就是自己的组名，纯规则模块
@@ -436,20 +472,33 @@ def _rules(sub: dict[str, Any], main_group: str, ai_on: bool,
     for sc in all_modules():
         if not bool(sc.get("enabled", True)):
             continue
+        if sc.get("merged_into"):      # 已并入「游戏加速」：域由它统一持有
+            continue
         match = sc.get("match") or {}
+        title = sc.get("title") or sc.get("key") or "?"
         if sc.get("kind") == "scene":
             if sc["title"] not in scene_on:
                 continue
             tgt = sc["title"]
         else:
             tgt = _target((sc.get("group") or {}).get("target") or "")
-        out_rules += [f"DOMAIN-SUFFIX,{d},{tgt}" for d in (match.get("domains") or [])]
+        # 排除域先插：模块自己声明「这些子域不管」，比让内核按关键词乱抢更可控
+        for d in (match.get("exclude") or []):
+            if _claim("DOMAIN-SUFFIX", d, "DIRECT", title + " 的排除表"):
+                out_rules.append(f"DOMAIN-SUFFIX,{d},DIRECT")
+        for d in (match.get("domains") or []):
+            if _claim("DOMAIN-SUFFIX", d, tgt, title):
+                out_rules.append(f"DOMAIN-SUFFIX,{d},{tgt}")
         # 模块自带的非后缀规则（Release 的 S3 直链用 KEYWORD 才盖得住）
-        out_rules += [f"{pat},{tgt}" for pat in (match.get("rules") or [])]
+        for pat in (match.get("rules") or []):
+            kind, _, payload = str(pat).partition(",")
+            if _claim(kind or "RAW", payload or str(pat), tgt, title):
+                out_rules.append(f"{pat},{tgt}")
         for cidr in match.get("cidrs") or []:
             kind = "IP-CIDR6" if ":" in str(cidr) else "IP-CIDR"
             # no-resolve：让内核按 IP 直接判定，不要为了匹配再去解析一次域名
-            out_rules.append(f"{kind},{cidr},{tgt},no-resolve")
+            if _claim(kind, str(cidr), tgt, title):
+                out_rules.append(f"{kind},{cidr},{tgt},no-resolve")
     out_rules += [r for r in CN_EXTRA_RULES if r not in sub_rules]
     out_rules += sub_rules
     # 国内兜底：geosite:cn 域名直连（fake-ip 下比 GEOIP 更可靠）
