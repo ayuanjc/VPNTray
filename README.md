@@ -473,6 +473,32 @@ python -m pytest tests -q           # 单元测试
 
 ## 11. 更新日志
 
+### 1.2.7 — TUN 真的能开了：补上 wintun.dll，修两个「假装成功」
+
+1.2.6 及以前点「TUN」会返回成功、状态也显示已开，但内核 `/configs` 里 `tun.enable` 一直是 false，
+网卡列表里没有 `Meta Tunnel`，游戏和命令行工具照旧不走代理。真机查下来是三个独立问题叠在一起：
+
+| 问题 | 表现 | 修法 |
+| --- | --- | --- |
+| `bin` 里没有 `wintun.dll` | mihomo 在 Windows 建 TUN 就靠这个 DLL，缺了只会在内核日志里静默失败 | 源码 `bin/` 与安装目录都补上，`release.ps1` 打包时一起带（缺文件时打印黄字而不是崩） |
+| `set_tun` 只改 settings，不重写 `config.yaml` | 内核重启读的仍是 `enable: false`，所以「设置改了、状态也变了、就是不生效」 | 重启内核前用当前订阅缓存重新生成并写入配置；没有缓存、没有 wintun.dll 都直接拒绝并回滚 |
+| `configgen` 给 `enable` 不给 `auto-route` | 网卡建出来但不往里导流，等于白开 | `auto-route` 跟 `enable` 同进同退 |
+
+**怎么用**：右键 `VPNTray.exe` →「以管理员身份运行」，再在页面上点 TUN。打包版没有独立 python，
+所以提权只能靠重开程序（托盘里退出 → 右键管理员运行），不会自己弹 UAC。
+
+**开成功的样子**（真机实测，2026-11-17）：
+
+- 网络适配器里多出 `Meta | Meta Tunnel`；
+- 默认路由多一条 `Meta metric=0 nexthop=198.18.0.2`；
+- `ping 223.5.5.5` 16ms，`www.baidu.com` 直接解析成 `198.18.0.21`（fake-ip），HTTP 200 / 65ms，`generate_204` 204 / 114ms；
+- 关掉 TUN 后这两条都消失，系统代理恢复可用。
+
+顺带提醒：TUN 和系统代理不要同时开（会变成流量进 TUN 又被系统代理指回 7891），
+所以 `set_tun(true)` 会顺手把系统代理关掉。
+
+测试 311 例（新增 `tests/test_tun_mode.py` 6 例：`enable`/`auto-route` 同步、重写配置、无缓存拒绝、缺 DLL 拒绝、非管理员拒绝）。
+
 ### 1.2.6 — hosts 也会让你「打不开」
 
 诊断卡加第五个按钮：**查 hosts**（`POST /api/doctor/hosts`，内核 `yuans_nd` 1.13.0 的 `nd hosts`）。

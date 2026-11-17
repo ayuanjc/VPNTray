@@ -56,9 +56,14 @@ Move-Item $raw $stage -Force
 Write-Host "[3/5] 放入内核与地理数据" -ForegroundColor Cyan
 $binDst = Join-Path $stage 'bin'
 New-Item -ItemType Directory -Force -Path $binDst | Out-Null
-foreach ($f in 'mihomo.exe', 'GeoIP.dat', 'GeoSite.dat', 'country.mmdb') {
-    Copy-Item (Join-Path $PSScriptRoot "bin\$f") $binDst -Force
-    $mb = [math]::Round((Get-Item (Join-Path $binDst $f)).Length / 1MB, 1)
+foreach ($f in 'mihomo.exe', 'GeoIP.dat', 'GeoSite.dat', 'country.mmdb', 'wintun.dll') {
+    $src = Join-Path $PSScriptRoot "bin\$f"
+    if (-not (Test-Path $src)) {
+        Write-Host ("    {0}  缺失（TUN 模式会不可用）" -f $f) -ForegroundColor Yellow
+        continue
+    }
+    Copy-Item $src $binDst -Force
+    $mb = [math]::Round((Get-Item (Join-Path $binDst $f)).Length / 1MB, 2)
     Write-Host ("    {0}  {1} MB" -f $f, $mb)
 }
 # NTFS 大小写不敏感，GeoIP.dat / geoip.dat 视为同一文件，无需额外复制

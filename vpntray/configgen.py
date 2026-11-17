@@ -595,9 +595,11 @@ def _assemble(sub: dict[str, Any], settings, dns: dict[str, Any],
         "dns": dns,
         "sniffer": SNIFFER,
         "tun": {
+            # enable 与 auto-route 必须同进同退：只给 enable 不给 auto-route，
+            # 内核会建出 wintun 网卡却不往里导流，表现是「开了 TUN 等于没开」。
             "enable": bool(settings.get("tun")),
+            "auto-route": bool(settings.get("tun")),
             "stack": "mixed",
-            "auto-route": False,
             "dns-hijack": ["any:53"],
         },
         "proxies": sub["proxies"],

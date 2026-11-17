@@ -20,7 +20,7 @@ from . import __version__ as _VERSION
 from . import autostart, campus, configgen, disguise, dnsguard, doctor, github_ops, hotspot, kernel as kernel_mod, modules as modules_mod, netguard, ocrbridge, okxguard, purity, subscription, sysproxy
 from .api import ApiError, MihomoAPI
 from .kernel import Kernel
-from .paths import CONFIG, DELAYS, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
+from .paths import BIN, CONFIG, DELAYS, LOGS, SUB_CACHE, UI_DIR, ensure_dirs
 from .settings import Settings
 
 
@@ -2920,6 +2920,20 @@ class App:
                     sysproxy.disable()
                 except Exception:  # noqa: BLE001
                     log.warning("关系统代理失败（继续开 TUN）", exc_info=True)
+            # 只改 settings 不重写 config.yaml 是没用的：内核启动读的是那个文件。
+            # 1.2.6 及以前漏了这一步，表现为 set_tun 返回成功、state.tun=true，
+            # 但内核 /configs 里 tun.enable 仍是 false（2026-11-17 真机确认）。
+            cached = subscription.load_cache()
+            if not cached:
+                self.settings["tun"] = old
+                self.settings.save()
+                return {"ok": False, "error": "没有订阅缓存，无法重写内核配置", "tun": old}
+            sub = subscription.normalize(cached)
+            configgen.write(configgen.build(sub, self.settings, self._delay_map()))
+            if want and not (BIN / "wintun.dll").is_file():
+                self.settings["tun"] = old
+                self.settings.save()
+                return {"ok": False, "error": "bin 目录缺 wintun.dll，TUN 起不来", "tun": old}
             ok = self.restart_kernel()
             if not ok:
                 self.settings["tun"] = old
