@@ -770,6 +770,30 @@ class App:
         ok2, err2 = self._rebuild_from_modules(f"模块已保存：{title}")
         return (True, "") if ok2 else (False, f"已保存，但重建配置失败：{err2}")
 
+    # ══════════ 直连白名单（1.3.1）══════════
+    # 一个固定 key 的 rule 型模块，不是另一套存储：改了数据照样走
+    # _rebuild_from_modules 重建配置，订阅更新/升级都带不走。
+    def direct_list(self) -> list[str]:
+        return modules_mod.direct_domains()
+
+    def direct_add(self, domain: Any) -> tuple[bool, str]:
+        before = len(self.direct_list())
+        ok, err = modules_mod.direct_add(domain)
+        if not ok:
+            return False, err
+        # 重复添加不重建配置：白名单没变，重建只会白白 reload 一次内核
+        if len(self.direct_list()) == before:
+            return True, ""
+        d = modules_mod._domain(domain) or ""
+        return self._rebuild_from_modules(f"已设为直连：{d}")
+
+    def direct_remove(self, domain: Any) -> tuple[bool, str]:
+        ok, err = modules_mod.direct_remove(domain)
+        if not ok:
+            return False, err
+        d = modules_mod._domain(domain) or ""
+        return self._rebuild_from_modules(f"已取消直连：{d}")
+
     def module_delete(self, key: str) -> tuple[bool, str]:
         key = (key or "").strip().lower()
         mod = modules_mod.load(key)

@@ -599,6 +599,18 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
           <div id="dgList" class="ndlist"></div>
           <div class="note" id="dgNote"></div>
         </section>
+
+      <section class="card">
+        <h2>直连白名单<span class="hint">某些站点被分流到海外节点才出问题：加到这里，它永远直连</span></h2>
+        <div class="zlabel">为什么不用手改 config.yaml：订阅更新、改模块、升级都会把配置重建一遍，手写的规则就没了</div>
+        <div class="cprow">
+          <input class="txt" id="dctHost" placeholder="example.com（要域名，不要整条网址）" spellcheck="false" autocomplete="off">
+          <button class="btn primary" data-act="dct-add">设为直连</button>
+        </div>
+        <div id="dctList" class="ndlist"></div>
+        <div class="note" id="dctNote"></div>
+      </section>
+
       <section class="card">
         <h2>断网急救<span class="hint" id="ndHint">13 项逐项检查：网卡 / 网关 / 解析 / 代理端口 / 内核</span></h2>
         <div class="gwrap" id="ndPills"></div>
@@ -856,7 +868,7 @@ html[data-theme="dark"] .empty{color:var(--ink2)}
 </div>
 
 <script>
-var UI_VER = '1.3.0';
+var UI_VER = '1.3.1';
 var $ = function (s, r) { return (r || document).querySelector(s); };
 /* 隐私模式 / 组策略会禁掉 localStorage，直接访问会抛异常并中断整段脚本的执行
    （连轮询都不会启动，页面永远停在空白骨架），所以统一走这层包装，坏了就用默认值。 */
@@ -2536,9 +2548,67 @@ function goProblem(kind) {
   }
 }
 
+/* ───── 直连白名单（1.3.1）─────
+   手改 config.yaml 那类「- DOMAIN-SUFFIX,x,DIRECT」是临时的：订阅更新、改模块、
+   升级都会重建整份配置。这里写的是 data/modules/direct-sites.json，重建时自然带上。*/
+function renderDirect() {
+  var box = document.getElementById('dctList');
+  if (!box) return;
+  var ds = (S && S.direct && S.direct.domains) || [];
+  if (!ds.length) {
+    box.innerHTML = '<div class="ndrow"><span class="ndk">还没有加过</span>'
+      + '<span class="ndv">某个站点打不开、又确认是被分流到海外节点害的：把它加进来</span></div>';
+    return;
+  }
+  box.innerHTML = ds.map(function (d) {
+    return '<div class="ndrow"><span class="ndk">直连</span><span class="ndv">' + esc(d)
+      + ' <button class="btn" data-act="dct-del" data-d="' + esc(d)
+      + '" title="以后让它重新按规则走">取消</button></span></div>';
+  }).join('');
+}
+
+function dctNote(txt, bad) {
+  var el = document.getElementById('dctNote');
+  if (!el) return;
+  el.textContent = txt || '';
+  el.className = 'note' + (bad ? ' bad' : '');
+}
+
+async function dctAdd() {
+  var el = document.getElementById('dctHost');
+  var d = el ? String(el.value || '').trim() : '';
+  if (!d) { toast('先填域名，例如 example.com', 'bad'); if (el) el.focus(); return; }
+  dctNote('正在写入并重建配置…');
+  var r = await api('/api/direct/add', { domain: d }, { timeout: API_SLOW });
+  if (!r || !r.ok) {
+    dctNote((r && r.error) || '加不进去', true);
+    toast('没加上，看提示', 'bad');
+    return;
+  }
+  if (el) el.value = '';
+  S.direct = { domains: r.domains || [] };
+  renderDirect();
+  dctNote('已加入直连：' + d + '（配置已重建，从下一条连接开始生效）');
+  toast('已设为直连：' + d, 'ok');
+}
+
+async function dctDel(d) {
+  dctNote('正在移除…');
+  var r = await api('/api/direct/remove', { domain: d }, { timeout: API_SLOW });
+  if (!r || !r.ok) {
+    dctNote((r && r.error) || '移除失败', true);
+    toast('没移除', 'bad');
+    return;
+  }
+  S.direct = { domains: r.domains || [] };
+  renderDirect();
+  dctNote('已取消直连：' + d);
+  toast('已取消直连', 'ok');
+}
+
 function renderView(v) {
   if (v === 'home') renderHome();
-  else if (v === 'fix') { renderDoctor(); renderNetDoc(); }
+  else if (v === 'fix') { renderDoctor(); renderDirect(); renderNetDoc(); }
   else if (v === 'speed') { renderChips(); renderNodes(); renderScenes(); }
   else if (v === 'ai') renderAIPage();
   else if (v === 'tools') { renderCampus(); renderDns(); renderGithub(); renderOcr(); }
@@ -2803,6 +2873,8 @@ document.addEventListener('click', function (e) {
   else if (a === 'dg-paste') dgPaste();
   else if (a === 'dg-fix') dgFix(el.dataset.a, !!el.dataset.el);
   else if (a === 'dg-undo') dgUndo(el.dataset.r);
+  else if (a === 'dct-add') dctAdd();
+  else if (a === 'dct-del') dctDel(el.dataset.d);
   else if (a === 'go-offline') goProblem('offline');
   else if (a === 'go-site') goProblem('site');
   else if (a === 'go-slow') goProblem('slow');

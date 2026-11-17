@@ -23,7 +23,7 @@ log = logging.getLogger("webui")
 
 WEB_PORT_DEFAULT = 7892
 # 前端界面版本；assets/index.html 里的 UI_VER 必须一致，不一致前端会自动刷新
-UI_VER = "1.3.0"
+UI_VER = "1.3.1"
 
 # 单页面板的 CSP：脚本/样式必须放行 inline —— assets/index.html 是单文件内联
 # 页面（拆出去就得多发几个请求，而且别人正在改这个文件）；其余一律只允许自身，
@@ -182,6 +182,15 @@ def _doctor_state(app) -> dict[str, Any]:
     return st
 
 
+def _direct_state(app) -> dict[str, Any]:
+    """直连白名单（1.3.1）。面板每秒读 state，读坏了也不能白屏。"""
+    try:
+        domains = app.direct_list()
+    except Exception as e:  # noqa: BLE001
+        return {"domains": [], "error": "%s: %s" % (type(e).__name__, e)}
+    return {"domains": domains}
+
+
 def build_state(app) -> dict[str, Any]:
     st = app.snapshot()
     proxies = st.get("proxies") or {}
@@ -274,7 +283,7 @@ def build_state(app) -> dict[str, Any]:
         "scenes": app.scenes_status(),
         # 模块清单（轻量版，给「模块」卡片和编辑入口用）
         "modules": app.modules_status(),
-        # AI 接口：开关 / 权限级别 / token 掩码（明文只走 POST /api/ai/api
+        "direct": _direct_state(app),        # AI 接口：开关 / 权限级别 / token 掩码（明文只走 POST /api/ai/api
         # {"action":"reveal"}，见 ai_api 处理函数的注释）
         "ai_api": aiops.state(app),
         # GitHub 特化：最近一次自检结果 + git 全局代理当前指向
@@ -654,6 +663,24 @@ class WebUI:
         def module_export(_body):
             return {"ok": True, "export": app.module_export()}
 
+        # ── 直连白名单（1.3.1）：用户点一下就把域名钉成直连，重建配置时带上 ──
+        def direct_list(_body=None):
+            return {"ok": True, "domains": app.direct_list()}
+
+        def direct_add(body):
+            d = str((body or {}).get("domain") or "").strip()
+            if not d:
+                return {"ok": False, "error": "要填域名，例如 example.com", "domains": app.direct_list()}
+            ok, err = app.direct_add(d)
+            return {"ok": ok, "error": err, "domains": app.direct_list()}
+
+        def direct_remove(body):
+            d = str((body or {}).get("domain") or "").strip()
+            if not d:
+                return {"ok": False, "error": "要填域名", "domains": app.direct_list()}
+            ok, err = app.direct_remove(d)
+            return {"ok": ok, "error": err, "domains": app.direct_list()}
+
         def ai_api(body):
             """AI 接口本身的管理：开关 / 权限上限 / 重置 token / 显式取明文。
 
@@ -903,6 +930,9 @@ class WebUI:
             "/api/module/reset": module_reset,
             "/api/module/import": module_import,
             "/api/module/export": module_export,
+            "/api/direct": direct_list,
+            "/api/direct/add": direct_add,
+            "/api/direct/remove": direct_remove,
             "/api/campus/save": campus_save,
             "/api/campus/login": campus_login,
             "/api/campus/detect": campus_detect,

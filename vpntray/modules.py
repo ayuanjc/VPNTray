@@ -46,6 +46,8 @@ MAX_MODULES = 64
 MAX_DOMAINS = 400
 MAX_RULES = 200
 MAX_EXCLUDE = 40
+# 直连白名单的上限：一条规则一个域，200 条已经够覆盖任何家庭/办公网的内部站点
+MAX_DIRECT = 200
 
 KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
 DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9_-]*[a-z0-9])?)+$")
@@ -386,6 +388,80 @@ def remove(key: str) -> tuple[bool, str]:
     with _lock:
         _cache["sig"] = None
     log.info("模块已删除 %s", key)
+    return True, ""
+
+
+# ────────────────────── 直连白名单（1.3.1）──────────────────────
+# 为什么把它做成一个固定 key 的模块，而不是「设置里存一份、生成时拼进去」：
+# 用户遇到的多数「打不开」不是网络坏了，而是某个站点被分流到了海外节点（校园门户、
+# 单位内网、内网 VPN 门户最常见）。手改生成的 config.yaml 只是临时的 —— 订阅更新、
+# 改模块、升级都会重建配置，那条手工规则就没了，过几天问题原样回来。
+# 变成 data/modules/direct-sites.json 之后，它和别的模块走同一条重建链路，永远不会丢。
+DIRECT_KEY = "direct-sites"
+DIRECT_TITLE = "直连白名单"
+DIRECT_DESC = "这些域名永远直连（订阅更新、重启、升级都不会丢）"
+
+
+def direct_domains() -> list[str]:
+    """当前白名单（停用状态视为空：用户关掉它就该彻底不生效）。"""
+    mod = load(DIRECT_KEY)
+    if not mod or not bool(mod.get("enabled", True)):
+        return []
+    return [str(d) for d in ((mod.get("match") or {}).get("domains") or [])]
+
+
+def _direct_write(domains: list[str]) -> dict[str, Any]:
+    mod = normalize({
+        "key": DIRECT_KEY,
+        "title": DIRECT_TITLE,
+        "desc": DIRECT_DESC,
+        "kind": "rule",
+        "enabled": True,
+        "icon": "🎯",
+        # 排最前：白名单要先占域，否则被别的模块的宽域抢走就又不直连了
+        "order": 1,
+        "group": {"target": "DIRECT"},
+        "match": {"domains": domains},
+    })
+    _write_file(mod)
+    with _lock:
+        _cache["sig"] = None
+    return mod
+
+
+def direct_add(domain: Any) -> tuple[bool, str]:
+    """往白名单加一个域名（后缀匹配）。已存在视为成功，幂等。"""
+    d = _domain(domain)
+    if not d or not DOMAIN_RE.match(d):
+        return False, "域名不合法：写 example.com 或 www.example.com（不要 *、路径、端口）"
+    cur = direct_domains()
+    if d in cur:
+        return True, ""
+    if len(cur) >= MAX_DIRECT:
+        return False, f"直连白名单最多 {MAX_DIRECT} 条，先删几个"
+    try:
+        _direct_write(cur + [d])
+    except OSError as e:
+        return False, f"写直连白名单失败：{e}"
+    log.info("直连白名单 +%s", d)
+    return True, ""
+
+
+def direct_remove(domain: Any) -> tuple[bool, str]:
+    """从白名单删一个域名；删空了就把文件一并删掉（配置里不留空模块）。"""
+    d = _domain(domain) or _s(domain, 253).lower()
+    cur = direct_domains()
+    if d not in cur:
+        return False, f"白名单里没有 {d}"
+    left = [x for x in cur if x != d]
+    try:
+        if left:
+            _direct_write(left)
+        else:
+            remove(DIRECT_KEY)
+    except OSError as e:
+        return False, f"写直连白名单失败：{e}"
+    log.info("直连白名单 -%s", d)
     return True, ""
 
 

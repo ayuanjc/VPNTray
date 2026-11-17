@@ -473,6 +473,43 @@ python -m pytest tests -q           # 单元测试
 
 ## 11. 更新日志
 
+### 1.3.1 — 直连白名单：让「这个网站永远直连」不再是一次性的
+
+起因很具体：某学校的门户 `zcstzhihui.icu` 被分流到海外节点，TLS 直接被重置，
+浏览器只报一句 `ERR_CONNECTION_CLOSED`，用户以为是自己网络坏了。当时是在
+`data/config.yaml` 里手插一行 `- DOMAIN-SUFFIX,zcstzhihui.icu,DIRECT` 解决的 ——
+但这份配置文件是**生成物**：订阅更新、改模块、升级都会重建一遍，那行规则下一次
+就没了，问题过几天原样回来，而且没人会记得当初为什么多那一行。
+
+**做法：白名单变成一个模块**
+
+| 层 | 位置 | 说明 |
+| --- | --- | --- |
+| 存储 | `data/modules/direct-sites.json` | 一个固定 key 的模块（`kind=rule`，`group.target=DIRECT`，`order=1` 排最前） |
+| 写入 | `modules.direct_add / direct_remove` | 域名归一（去掉 `*.`、前后点、转小写）、去重、上限 200 |
+| 生效 | `app.direct_add → _rebuild_from_modules` | 落盘后重建配置并热重载内核，不用重启、不断连接 |
+| 界面 | 修复页「直连白名单」卡 | 填域名 →「设为直连」；列表里每条都能「取消」 |
+| 路由 | `POST /api/direct`、`/api/direct/add`、`/api/direct/remove` | `/api/state` 里带 `direct.domains`，面板每秒跟着刷新 |
+
+三条硬规矩：
+
+1. **只加域名，不加通配**：`*.example.com` 会被归一成 `example.com`，客户端写路径、端口、
+   整条网址一律拒掉并给一句人话提示（`域名不合法：写 example.com 或 www.example.com`）。
+2. **重复添加不重建配置**：白名单没变就不 reload 内核 —— reload 会让所有连接重连一次，
+   不该为一次点到重试的点击付这个代价。
+3. **删空就删文件**：最后一条删掉时整个模块文件一起消失，配置里不留空模块组。
+
+**顺手修掉的一处真实误报**（`collect/kernel.py`）：内核 secret 配错时，原来把
+`kernel_alive` 置成 `False`，引擎据此报 `critical` 级「内核没在运行」，headline 直接写
+「内核没在运行」—— 而实际上内核活得好好的，只是拒绝了鉴权。现在这种情况只记
+`kernel_auth=False`，不再被误报成内核崩溃（回归测试在 `tests/test_engine.py`）。
+
+**测试**：新增 `tests/test_direct.py` 19 例（模块层 13 + 路由层 6），覆盖归一化、
+非法域名、幂等、上限、停用状态、删空删文件、重建触发时机，以及三条路由的参数校验。
+全量 358 例通过。
+
+---
+
 ### 1.3.0 — 三个模块 + 独立 AI 页：先说清「谁管哪个域」
 
 这一版不是堆功能，是把模块之间的逻辑收拾干净：一个域到底归谁、谁先谁后、
